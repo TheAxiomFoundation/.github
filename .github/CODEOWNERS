@@ -1,0 +1,4 @@
+# Provenance-critical shared validation. GitHub enforces this only after the
+# protected branch requires code-owner review with no administrator bypass.
+/.github/CODEOWNERS @MaxGhenis @hua7450
+/.github/workflows/ @MaxGhenis @hua7450

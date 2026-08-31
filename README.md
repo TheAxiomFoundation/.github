@@ -90,20 +90,19 @@ oracle coverage. New executable outputs must either have
 an exact PolicyEngine mapping or a harness-side `not_comparable` classification
 with a rationale.
 
-The guard also rejects a `backend: manual` apply manifest that introduces a
-*new* rule file unless it declares `manual_exception: composition | repair |
-fixtures | <issue-ref>`. Net-new statutory encoding must come from an encoder
-run; hand-authoring stays legal only for composition/oracle plumbing,
-validator-driven repairs, and fixtures, and only by declaring itself. Attest
-encoder output committed outside the `--apply` flow with `axiom-encode
-sign-applied-files` (add `--manual-exception` for new files, or `--all` to
-backfill a corpus that has no manifests). `axiom-encode manifest-census`
-reports each repo's encoder-generated / manual / unmanifested coverage.
+Changed protected RuleSpec must carry a signed model receipt from the pinned
+encoder agent (`axiom-encode encode --apply`, with an allowlisted model
+backend). A `backend: manual` receipt or retroactive `sign-applied-files`
+attestation does not authorize new or modified protected RuleSpec. The latter
+command remains only as historical inventory and specialized migration input;
+fresh replacement bytes still require a new encoder-agent receipt.
+`axiom-encode manifest-census` reports each repo's encoder-generated / manual /
+unmanifested legacy coverage.
 
 ### Durable generated-guard rollout
 
 Repositories can prevent a failed direct push from being hidden by a later
-unrelated push by introducing this immutable caller-owned anchor:
+unrelated push by introducing this immutable caller anchor:
 
 ```toml
 [generated_guard_anchor]
@@ -114,35 +113,51 @@ reviewed_known_good_sha = "<40-character-reviewed-commit-sha>"
 Store it at `.axiom/generated-guard-anchor.toml`, and grant the caller workflow
 both `actions: read` and `contents: read`. The reviewed SHA must predate the
 commit that first introduces the anchor and must be a known-good commit on the
-same ancestry chain. The file's first committed blob is permanent for this
-contract: changing, deleting, or deleting and re-adding it fails closed.
+same ancestry chain. It must also match the repository's bootstrap SHA in the
+reusable workflow's centrally reviewed `REVIEWED_SEEDS` registry. The caller
+path and the SHA-normalized digest of the entire caller workflow must likewise
+match `REVIEWED_CALLERS`; only the one exact reusable-workflow SHA in its
+`uses:` edge is normalized. A caller therefore cannot bless its own earlier
+commit, add a lookalike job, or forge the generated-guard step name. The file's
+first committed blob is permanent for this contract: changing it even
+temporarily, deleting it, or deleting and re-adding it fails closed.
 
 For an anchored repository, the reusable workflow never uses `event.before`,
 `origin/main`, or `HEAD~1` as the generated-guard base. It starts at the
 reviewed seed and may advance only to a successful default-branch run whose
-repository, commit and tree, caller-workflow blob, anchor blob, reusable
-workflow SHA, and completed generated-guard step all match the current
-contract. Missing or inconsistent Actions evidence fails the run. A caller
-workflow change or reusable-workflow SHA upgrade deliberately resets the next
-run to the reviewed seed; successes under an older workflow cannot bootstrap a
-new trust chain.
+repository, commit and tree, centrally reviewed caller-workflow contract,
+anchor blob, reusable workflow SHA, and completed generated-guard step all
+match the current contract. Missing or inconsistent Actions evidence fails the
+run. Any non-pin caller-workflow change fails closed until its normalized digest
+is added to the central registry. A reusable-workflow SHA upgrade deliberately
+resets the next run to the reviewed seed; successes under an older workflow
+cannot bootstrap a new trust chain.
 
 Roll this out in order:
 
-1. In a reviewed caller PR, add the anchor and `actions: read` permission while
+1. Add the repository and known-good SHA to `REVIEWED_SEEDS`, plus the exact
+   caller path and normalized digest of the caller bytes that will exist after
+   step 2 (including its `actions: read` permission) to `REVIEWED_CALLERS`;
+   then merge and validate that reviewed shared-workflow release.
+2. In a reviewed caller PR, add the anchor and `actions: read` permission while
    retaining the existing reusable-workflow pin. The old workflow ignores the
    new file, so no future shared-workflow SHA needs to be guessed.
-2. Merge and validate this shared-workflow change.
 3. In another reviewed caller PR, update the reusable-workflow pin to the exact
    merged commit. Its first run scans from the reviewed seed; later exact-
    contract successes can advance the durable base.
 4. Repeat the seed scan after every caller-workflow or shared-workflow change.
 
-This is defense in depth, not a substitute for branch protection. Enable
-required `validate / validate` checks for administrators and remove or tightly
-control bypass actors. An administrator who can bypass the check can also
-rewrite the caller workflow or anchor history, outside the trust boundary that
-repository code alone can enforce.
+This is defense in depth, not a substitute for repository policy. Protect both
+the caller repository and this shared-workflow repository with pull-request and
+code-owner review, dismiss stale approvals (or require approval of the latest
+push), block force pushes, and leave no administrator or other bypass actor.
+The current resolver is explicitly a local-caller identity mode: protect and
+require that reviewed caller workflow. Do not replace it with an organization
+required-workflow invocation until a dedicated required-workflow identity mode
+is implemented and tested. An app-bound status such as `validate / validate`
+alone is insufficient: another Actions workflow can emit the same check name,
+and an administrator who can bypass checks can rewrite the caller workflow or
+anchor history outside the trust boundary repository code can enforce.
 
 Set `guard-programs-root: true` on the caller to require manifests on the
 composed-pilot `programs/` root too (default `false`). Enable it per repo only

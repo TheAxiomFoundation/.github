@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -27,6 +28,17 @@ CURRENT_SHARED = "a" * 40
 OLD_SHARED = "b" * 40
 WORKFLOW_ID = 77
 CURRENT_RUN_ID = 900
+
+
+def normalized_caller_digest(source: str) -> str:
+    marker = f"{SHARED_PATH}@"
+    start = source.index(marker) + len(marker)
+    shared_sha = source[start : start + 40]
+    assert len(shared_sha) == 40
+    assert all(character in "0123456789abcdef" for character in shared_sha)
+    assert source.count(marker) == 1
+    normalized = source[:start] + "<shared-workflow-sha>" + source[start + 40 :]
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def git(root: Path, *args: str) -> str:
@@ -61,7 +73,13 @@ class Fixture:
         git(self.root, "config", "user.name", "Workflow Test")
         caller = self.root / CALLER_PATH
         caller.parent.mkdir(parents=True)
-        caller.write_text("name: Repository Checks\n")
+        caller.write_text(
+            "name: Repository Checks\n"
+            "jobs:\n"
+            "  validate:\n"
+            f"    uses: {SHARED_PATH}@{CURRENT_SHARED}\n"
+        )
+        self.reviewed_caller_digest = normalized_caller_digest(caller.read_text())
         (self.root / "README.md").write_text("reviewed base\n")
         self.seed = commit(self.root, "reviewed known-good seed")
         anchor = self.root / ".axiom/generated-guard-anchor.toml"
@@ -123,6 +141,8 @@ def successful_guard_jobs() -> dict[str, object]:
         "jobs": [
             {
                 "name": "validate / validate (__all__)",
+                "status": "completed",
+                "conclusion": "success",
                 "steps": [
                     {
                         "name": "Reject manual RuleSpec changes",
@@ -141,6 +161,8 @@ def successful_multishard_guard_jobs() -> dict[str, object]:
         steps.append(
             {
                 "name": "validate / validate (shard)",
+                "status": "completed",
+                "conclusion": "success",
                 "steps": [
                     {
                         "name": "Reject manual RuleSpec changes",
@@ -199,10 +221,7 @@ class ApiState:
                 return self.listing_pages[page]
             ordered = list(self.runs.values())
             start = (page - 1) * 100
-            page_runs = [
-                {"id": run["id"], "head_sha": run["head_sha"]}
-                for run in ordered[start : start + 100]
-            ]
+            page_runs = ordered[start : start + 100]
             return {"total_count": len(ordered), "workflow_runs": page_runs}
         raise KeyError(path)
 
@@ -246,6 +265,7 @@ def run_anchor(
     state: ApiState,
     *,
     checkout: str | None = None,
+    reviewed_seed: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     checkout_sha = checkout or fixture.head
     state.current["head_sha"] = checkout_sha
@@ -262,6 +282,9 @@ def run_anchor(
             "ANCHOR_RUN_HEAD_SHA": checkout_sha,
             "ANCHOR_RUN_ID": str(CURRENT_RUN_ID),
             "ANCHOR_TEST_ALLOW_HTTP": "true",
+            "ANCHOR_TEST_REVIEWED_CALLER_PATH": CALLER_PATH,
+            "ANCHOR_TEST_REVIEWED_CALLER_SHA256": fixture.reviewed_caller_digest,
+            "ANCHOR_TEST_REVIEWED_SEED": reviewed_seed or fixture.seed,
             "ANCHOR_TOKEN": "test-token",
         }
         return subprocess.run(
@@ -304,17 +327,32 @@ def test_no_matching_contract_falls_back_to_reviewed_seed(fixture: Fixture) -> N
     assert result["base_ref"] == fixture.seed
 
 
-def test_caller_workflow_drift_resets_to_seed() -> None:
+def test_anchor_bootstrap_uses_centrally_reviewed_seed(fixture: Fixture) -> None:
+    result = output(
+        run_anchor(fixture, ApiState(fixture), checkout=fixture.introduction)
+    )
+    assert result["base_ref"] == fixture.seed
+
+
+def test_caller_cannot_self_attest_a_different_seed(fixture: Fixture) -> None:
+    result = run_anchor(fixture, ApiState(fixture), reviewed_seed=fixture.good)
+    assert result.returncode != 0
+    assert "centrally reviewed bootstrap seed" in result.stderr
+
+
+def test_caller_workflow_drift_fails_closed() -> None:
     fixture = Fixture()
     try:
         state = ApiState(fixture)
         state.add_success(fixture, run_id=100, head=fixture.good)
         (fixture.root / CALLER_PATH).write_text(
-            "name: Repository Checks\n# reviewed caller update\n"
+            (fixture.root / CALLER_PATH).read_text()
+            + "# unreviewed caller update\n"
         )
         fixture.head = commit(fixture.root, "update caller workflow")
-        result = output(run_anchor(fixture, state))
-        assert result["base_ref"] == fixture.seed
+        result = run_anchor(fixture, state)
+        assert result.returncode != 0
+        assert "differs from the centrally reviewed contract" in result.stderr
     finally:
         fixture.close()
 
@@ -374,6 +412,17 @@ def test_run_tree_metadata_drift_fails_closed(fixture: Fixture) -> None:
     assert "resolved Git tree" in result.stderr
 
 
+def test_replayed_run_from_another_repository_fails_closed(
+    fixture: Fixture,
+) -> None:
+    state = ApiState(fixture)
+    state.add_success(fixture, run_id=100, head=fixture.good)
+    state.runs[100]["repository"] = {"full_name": "attacker/replay"}
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "not bound to the caller repository" in result.stderr
+
+
 def test_unavailable_actions_evidence_fails_closed(fixture: Fixture) -> None:
     state = ApiState(fixture)
     state.failure_prefix = f"/repos/{REPOSITORY}/actions/runs/{CURRENT_RUN_ID}"
@@ -399,6 +448,137 @@ def test_incomplete_pagination_fails_closed(fixture: Fixture) -> None:
     result = run_anchor(fixture, state)
     assert result.returncode != 0
     assert "pagination ended before its declared total" in result.stderr
+
+
+def test_complete_multi_page_evidence_advances_anchor(fixture: Fixture) -> None:
+    state = ApiState(fixture)
+    for run_id in range(100, 201):
+        state.add_success(fixture, run_id=run_id, head=fixture.good)
+    runs = list(state.runs.values())
+    state.listing_pages = {
+        1: {"total_count": 101, "workflow_runs": runs[:100]},
+        2: {"total_count": 101, "workflow_runs": runs[100:]},
+    }
+    result = output(run_anchor(fixture, state))
+    assert result["base_ref"] == fixture.good
+
+
+def test_changed_totals_and_duplicate_run_ids_fail_closed(fixture: Fixture) -> None:
+    state = ApiState(fixture)
+    for run_id in range(100, 201):
+        state.add_success(fixture, run_id=run_id, head=fixture.good)
+    runs = list(state.runs.values())
+    state.listing_pages = {
+        1: {"total_count": 101, "workflow_runs": runs[:100]},
+        2: {"total_count": 100, "workflow_runs": runs[100:]},
+    }
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "pagination is inconsistent" in result.stderr
+
+    state.listing_pages = {
+        1: {"total_count": 101, "workflow_runs": runs[:100]},
+        2: {"total_count": 101, "workflow_runs": [runs[0]]},
+    }
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "duplicate id" in result.stderr
+
+
+def test_more_than_one_thousand_runs_fails_closed(fixture: Fixture) -> None:
+    state = ApiState(fixture)
+    state.listing_pages = {
+        page: {
+            "total_count": 1001,
+            "workflow_runs": [{"id": page * 1000 + offset} for offset in range(100)],
+        }
+        for page in range(1, 11)
+    }
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "exceeds the 1,000-run audit bound" in result.stderr
+
+
+def test_truncated_or_oversized_job_evidence_fails_closed(fixture: Fixture) -> None:
+    state = ApiState(fixture)
+    state.add_success(fixture, run_id=100, head=fixture.good)
+    state.jobs[100] = {
+        "total_count": 2,
+        "jobs": successful_guard_jobs()["jobs"],
+    }
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "job evidence is malformed or incomplete" in result.stderr
+
+    state.jobs[100] = {"total_count": 101, "jobs": []}
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "job evidence is malformed or incomplete" in result.stderr
+
+
+def test_unrecognized_job_cannot_spoof_guard_step_name(fixture: Fixture) -> None:
+    state = ApiState(fixture)
+    state.add_success(fixture, run_id=100, head=fixture.good)
+    state.jobs[100] = {
+        "total_count": 1,
+        "jobs": [
+            {
+                "name": "caller-controlled-spoof",
+                "status": "completed",
+                "conclusion": "success",
+                "steps": [
+                    {
+                        "name": "Reject manual RuleSpec changes",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ],
+            }
+        ],
+    }
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "outside the reusable validate job" in result.stderr
+
+
+def test_matching_name_spoof_requires_unreviewed_caller_and_fails_closed() -> None:
+    fixture = Fixture()
+    try:
+        caller = fixture.root / CALLER_PATH
+        caller.write_text(
+            caller.read_text()
+            + "  forged:\n"
+            + "    name: attacker / validate (forged)\n"
+            + "    runs-on: ubuntu-latest\n"
+            + "    steps:\n"
+            + "      - name: Reject manual RuleSpec changes\n"
+            + "        run: true\n"
+        )
+        fixture.head = commit(fixture.root, "add forged caller guard job")
+        state = ApiState(fixture)
+        state.add_success(fixture, run_id=100, head=fixture.head)
+        state.jobs[100] = {
+            "total_count": 1,
+            "jobs": [
+                {
+                    "name": "attacker / validate (forged)",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "steps": [
+                        {
+                            "name": "Reject manual RuleSpec changes",
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                    ],
+                }
+            ],
+        }
+        result = run_anchor(fixture, state)
+        assert result.returncode != 0
+        assert "differs from the centrally reviewed contract" in result.stderr
+    finally:
+        fixture.close()
 
 
 def test_incomparable_successes_fail_closed() -> None:
@@ -454,6 +634,80 @@ def test_anchor_mutation_and_reintroduction_fail_closed() -> None:
         fixture.close()
 
 
+def test_divergent_anchor_additions_fail_closed() -> None:
+    fixture = Fixture()
+    try:
+        root = fixture.root
+        anchor = root / ".axiom/generated-guard-anchor.toml"
+        registered = anchor.read_text()
+        git(root, "switch", "-q", "main")
+        git(root, "reset", "--hard", fixture.seed)
+
+        git(root, "switch", "-qc", "anchor-a", fixture.seed)
+        anchor.parent.mkdir(parents=True, exist_ok=True)
+        anchor.write_text(registered)
+        side_a = commit(root, "add anchor on side a")
+
+        git(root, "switch", "-qc", "anchor-b", fixture.seed)
+        anchor.parent.mkdir(parents=True, exist_ok=True)
+        anchor.write_text(registered)
+        side_b = commit(root, "add anchor on side b")
+
+        git(root, "switch", "-q", "main")
+        git(root, "merge", "--no-ff", "-qm", "merge anchor side a", side_a)
+        git(root, "merge", "--no-ff", "-qm", "merge anchor side b", side_b)
+        fixture.head = git(root, "rev-parse", "HEAD")
+
+        result = run_anchor(fixture, ApiState(fixture))
+        assert result.returncode != 0
+        assert "exactly one introducing commit" in result.stderr
+    finally:
+        fixture.close()
+
+
+def test_transient_anchor_mutation_then_restoration_fails_closed() -> None:
+    fixture = Fixture()
+    try:
+        anchor = fixture.root / ".axiom/generated-guard-anchor.toml"
+        original = anchor.read_text()
+        anchor.write_text(original.replace(fixture.seed, fixture.good))
+        commit(fixture.root, "transient anchor mutation")
+        anchor.write_text(original)
+        fixture.head = commit(fixture.root, "restore original anchor bytes")
+        result = run_anchor(fixture, ApiState(fixture))
+        assert result.returncode != 0
+        assert "anchor history changed after its introduction" in result.stderr
+    finally:
+        fixture.close()
+
+
+def test_missing_and_malformed_anchor_fail_closed() -> None:
+    missing = Fixture()
+    try:
+        (missing.root / ".axiom/generated-guard-anchor.toml").unlink()
+        missing.head = commit(missing.root, "delete anchor")
+        result = run_anchor(missing, ApiState(missing))
+        assert result.returncode != 0
+        assert "does not contain .axiom/generated-guard-anchor.toml" in result.stderr
+    finally:
+        missing.close()
+
+    malformed = Fixture()
+    try:
+        git(malformed.root, "reset", "--hard", malformed.introduction)
+        anchor = malformed.root / ".axiom/generated-guard-anchor.toml"
+        anchor.write_text("[generated_guard_anchor\n")
+        git(malformed.root, "add", anchor.as_posix())
+        git(malformed.root, "commit", "--amend", "-qm", "malformed anchor")
+        malformed.introduction = git(malformed.root, "rev-parse", "HEAD")
+        malformed.head = malformed.introduction
+        result = run_anchor(malformed, ApiState(malformed))
+        assert result.returncode != 0
+        assert "is not strict UTF-8 TOML" in result.stderr
+    finally:
+        malformed.close()
+
+
 def test_static_workflow_contract() -> None:
     workflow = WORKFLOW.read_text()
     source = anchor_source()
@@ -465,8 +719,13 @@ def test_static_workflow_contract() -> None:
     assert "github.event.before" not in source
     assert "origin/main" not in source
     assert "reviewed_known_good_sha" in source
+    assert "REVIEWED_CALLERS" in source
+    assert "normalized_caller_digest" in source
     assert "referenced_workflows" in source
+    assert '"--full-history"' in source
     assert 'step.get("name") == "Reject manual RuleSpec changes"' in source
+    assert '"candidate generated-guard step is outside the "' in source
+    assert '"reusable validate job"' in source
 
 
 def main() -> None:
@@ -475,18 +734,30 @@ def main() -> None:
         test_two_push_laundering_uses_last_trusted_success(fixture)
         test_unconfigured_repository_retains_legacy_mode(fixture)
         test_no_matching_contract_falls_back_to_reviewed_seed(fixture)
+        test_anchor_bootstrap_uses_centrally_reviewed_seed(fixture)
+        test_caller_cannot_self_attest_a_different_seed(fixture)
         test_skipped_guard_does_not_advance_anchor(fixture)
         test_one_success_and_skipped_matrix_steps_advance_anchor(fixture)
         test_duplicate_successful_guard_steps_are_ambiguous(fixture)
         test_run_tree_metadata_drift_fails_closed(fixture)
+        test_replayed_run_from_another_repository_fails_closed(fixture)
         test_unavailable_actions_evidence_fails_closed(fixture)
         test_ambiguous_current_reusable_identity_fails_closed(fixture)
         test_incomplete_pagination_fails_closed(fixture)
+        test_complete_multi_page_evidence_advances_anchor(fixture)
+        test_changed_totals_and_duplicate_run_ids_fail_closed(fixture)
+        test_more_than_one_thousand_runs_fails_closed(fixture)
+        test_truncated_or_oversized_job_evidence_fails_closed(fixture)
+        test_unrecognized_job_cannot_spoof_guard_step_name(fixture)
     finally:
         fixture.close()
-    test_caller_workflow_drift_resets_to_seed()
+    test_caller_workflow_drift_fails_closed()
+    test_matching_name_spoof_requires_unreviewed_caller_and_fails_closed()
     test_incomparable_successes_fail_closed()
     test_anchor_mutation_and_reintroduction_fail_closed()
+    test_divergent_anchor_additions_fail_closed()
+    test_transient_anchor_mutation_then_restoration_fails_closed()
+    test_missing_and_malformed_anchor_fail_closed()
     test_static_workflow_contract()
     print("durable generated-guard anchor: ok")
 

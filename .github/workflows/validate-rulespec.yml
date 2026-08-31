@@ -545,6 +545,7 @@ jobs:
           set -euo pipefail
           # durable-generated-guard-anchor-start
           python - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib
           import json
           import os
           import re
@@ -561,7 +562,26 @@ jobs:
               "TheAxiomFoundation/.github/"
               ".github/workflows/validate-rulespec.yml"
           )
+          # Bootstrap identities live in the reusable workflow's immutable
+          # commit, not in the caller-controlled repository. Adding an anchor
+          # can therefore never bless an earlier unreviewed caller commit.
+          REVIEWED_SEEDS = {
+              "TheAxiomFoundation/rulespec-us": (
+                  "d58cc0ce67ad891fde4c9061c86a2091bfdd524f"
+              ),
+          }
+          # The caller is reviewed as a whole, except for the reusable
+          # workflow SHA embedded in its single `uses:` edge. Normalizing only
+          # that SHA avoids a self-referential release hash while preventing a
+          # caller from adding a lookalike job that forges the guard step name.
+          REVIEWED_CALLERS = {
+              "TheAxiomFoundation/rulespec-us": (
+                  ".github/workflows/repository-checks.yml",
+                  "7524d4aaed95cd55cbaefc0bc171e00882b71bc1a23cb23c145e0def886d8dda",
+              ),
+          }
           SHA = re.compile(r"[0-9a-f]{40}")
+          DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
           def fail(message: str) -> None:
@@ -633,6 +653,25 @@ jobs:
               return object_text, body
 
 
+          def normalized_caller_digest(body: bytes) -> str:
+              try:
+                  source = body.decode("utf-8")
+              except UnicodeDecodeError:
+                  fail("caller workflow is not strict UTF-8")
+              pattern = re.escape(SHARED_WORKFLOW) + r"@[0-9a-f]{40}"
+              normalized, replacements = re.subn(
+                  pattern,
+                  f"{SHARED_WORKFLOW}@<shared-workflow-sha>",
+                  source,
+              )
+              if replacements != 1:
+                  fail(
+                      "caller workflow must contain exactly one canonical "
+                      "reusable-validation edge"
+                  )
+              return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
           def parse_anchor(body: bytes) -> str:
               try:
                   source = body.decode("utf-8")
@@ -697,6 +736,7 @@ jobs:
 
           additions = git(
               "log",
+              "--full-history",
               "--format=%H",
               "--diff-filter=A",
               checkout_sha,
@@ -724,12 +764,34 @@ jobs:
           assert introduced_anchor is not None and current_anchor is not None
           if introduced_anchor != current_anchor:
               fail("anchor blob or file mode changed after its introduction")
+          later_anchor_changes = git(
+              "log",
+              "--full-history",
+              "--format=%H",
+              "--diff-filter=MDRT",
+              checkout_sha,
+              "--",
+              ANCHOR_PATH,
+          ).stdout.splitlines()
+          if later_anchor_changes:
+              fail("anchor history changed after its introduction")
           seed = parse_anchor(current_anchor[1])
+          reviewed_seed = REVIEWED_SEEDS.get(repository)
+          if test_http:
+              test_seed = os.environ.get("ANCHOR_TEST_REVIEWED_SEED", "")
+              if test_seed:
+                  if SHA.fullmatch(test_seed) is None:
+                      fail("test reviewed seed is malformed")
+                  reviewed_seed = test_seed
+          if reviewed_seed is None:
+              fail("caller repository has no centrally reviewed bootstrap seed")
+          if seed != reviewed_seed:
+              fail("caller anchor differs from the centrally reviewed bootstrap seed")
           commit_tree(seed)
-          if not is_ancestor(seed, introduction) or not is_ancestor(
+          if seed == introduction or not is_ancestor(seed, introduction) or not is_ancestor(
               introduction, checkout_sha
           ):
-              fail("reviewed seed, anchor introduction, and HEAD are not ordered ancestors")
+              fail("reviewed seed must strictly predate the anchor introduction and HEAD")
 
           token = os.environ["ANCHOR_TOKEN"]
           if not token:
@@ -849,6 +911,24 @@ jobs:
           current_reusable = reusable_identity(current)
           if current_reusable is None:
               fail("current run does not identify the reusable validation workflow")
+          reviewed_caller = REVIEWED_CALLERS.get(repository)
+          if test_http:
+              test_caller_path = os.environ.get("ANCHOR_TEST_REVIEWED_CALLER_PATH", "")
+              test_caller_digest = os.environ.get(
+                  "ANCHOR_TEST_REVIEWED_CALLER_SHA256", ""
+              )
+              if test_caller_path or test_caller_digest:
+                  reviewed_caller = (test_caller_path, test_caller_digest)
+          if reviewed_caller is None:
+              fail("caller repository has no centrally reviewed workflow contract")
+          reviewed_caller_path, reviewed_caller_digest = reviewed_caller
+          if (
+              reviewed_caller_path != caller_path
+              or DIGEST.fullmatch(reviewed_caller_digest) is None
+              or normalized_caller_digest(current_caller[1])
+              != reviewed_caller_digest
+          ):
+              fail("caller workflow differs from the centrally reviewed contract")
 
           repo = api_get(f"/repos/{repository_path}", context="caller repository")
           if (
@@ -920,18 +1000,31 @@ jobs:
               if (
                   type(payload) is not dict
                   or type(payload.get("total_count")) is not int
+                  or type(payload.get("total_count")) is bool
                   or type(payload.get("jobs")) is not list
                   or payload["total_count"] > 100
+                  or len(payload["jobs"]) != payload["total_count"]
               ):
                   fail("candidate Actions job evidence is malformed or incomplete")
               successes = 0
               for job in payload["jobs"]:
-                  if type(job) is not dict or type(job.get("steps")) is not list:
+                  if (
+                      type(job) is not dict
+                      or type(job.get("name")) is not str
+                      or type(job.get("steps")) is not list
+                  ):
                       fail("candidate Actions job evidence contains a malformed job")
                   for step in job["steps"]:
                       if type(step) is not dict:
                           fail("candidate Actions job evidence contains a malformed step")
                       if step.get("name") == "Reject manual RuleSpec changes":
+                          if re.fullmatch(
+                              r".+ / validate(?: \(.+\))?", job["name"]
+                          ) is None:
+                              fail(
+                                  "candidate generated-guard step is outside the "
+                                  "reusable validate job"
+                              )
                           if step.get("status") != "completed":
                               return False
                           if step.get("conclusion") == "success":
@@ -943,7 +1036,7 @@ jobs:
               return successes == 1
 
 
-          eligible: set[str] = set()
+          eligible_runs: dict[str, list[int]] = {}
           for summary in summaries:
               run_id = summary["id"]
               if run_id == current_run_id:
@@ -955,48 +1048,47 @@ jobs:
                   candidate_head, checkout_sha
               ):
                   continue
-              candidate = api_get(
-                  f"/repos/{repository_path}/actions/runs/{run_id}",
-                  context=f"candidate Actions run {run_id}",
-              )
-              if type(candidate) is not dict or candidate.get("id") != run_id:
-                  fail("candidate Actions run evidence is malformed")
-              require_repository(candidate, candidate=True)
-              require_run_tree(candidate, candidate_head)
+              require_repository(summary, candidate=True)
+              require_run_tree(summary, candidate_head)
               if (
-                  candidate.get("workflow_id") != workflow_id
-                  or candidate.get("path") != caller_path
-                  or candidate.get("head_branch") != default_branch
-                  or candidate.get("event") not in {"push", "schedule", "workflow_dispatch"}
-                  or candidate.get("status") != "completed"
-                  or candidate.get("conclusion") != "success"
+                  summary.get("workflow_id") != workflow_id
+                  or summary.get("path") != caller_path
+                  or summary.get("head_branch") != default_branch
+                  or summary.get("event") not in {"push", "schedule", "workflow_dispatch"}
+                  or summary.get("status") != "completed"
+                  or summary.get("conclusion") != "success"
               ):
                   fail("candidate run contradicts the successful main-workflow listing")
-              candidate_reusable = reusable_identity(candidate)
+              candidate_reusable = reusable_identity(summary)
               if candidate_reusable != current_reusable:
                   continue
               candidate_anchor = blob_at(candidate_head, ANCHOR_PATH, required=True)
               candidate_caller = blob_at(candidate_head, caller_path, required=True)
               if candidate_anchor != current_anchor or candidate_caller != current_caller:
                   continue
-              if not guard_step_succeeded(run_id):
-                  continue
-              eligible.add(candidate_head)
+              eligible_runs.setdefault(candidate_head, []).append(run_id)
 
-          if eligible:
+          remaining = set(eligible_runs)
+          base_ref = seed
+          while remaining:
               maxima = [
                   candidate
-                  for candidate in eligible
+                  for candidate in remaining
                   if not any(
                       candidate != other and is_ancestor(candidate, other)
-                      for other in eligible
+                      for other in remaining
                   )
               ]
               if len(maxima) != 1:
                   fail("successful generated-guard evidence has no unique maximal ancestor")
-              base_ref = maxima[0]
-          else:
-              base_ref = seed
+              candidate_head = maxima[0]
+              if any(
+                  guard_step_succeeded(run_id)
+                  for run_id in sorted(eligible_runs[candidate_head], reverse=True)
+              ):
+                  base_ref = candidate_head
+                  break
+              remaining.remove(candidate_head)
           if not is_ancestor(seed, base_ref) or not is_ancestor(base_ref, checkout_sha):
               fail("resolved generated-guard base is outside the reviewed ancestry chain")
           print("mode=durable")
