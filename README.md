@@ -100,6 +100,50 @@ sign-applied-files` (add `--manual-exception` for new files, or `--all` to
 backfill a corpus that has no manifests). `axiom-encode manifest-census`
 reports each repo's encoder-generated / manual / unmanifested coverage.
 
+### Durable generated-guard rollout
+
+Repositories can prevent a failed direct push from being hidden by a later
+unrelated push by introducing this immutable caller-owned anchor:
+
+```toml
+[generated_guard_anchor]
+contract = "axiom/generated-guard-anchor/v1"
+reviewed_known_good_sha = "<40-character-reviewed-commit-sha>"
+```
+
+Store it at `.axiom/generated-guard-anchor.toml`, and grant the caller workflow
+both `actions: read` and `contents: read`. The reviewed SHA must predate the
+commit that first introduces the anchor and must be a known-good commit on the
+same ancestry chain. The file's first committed blob is permanent for this
+contract: changing, deleting, or deleting and re-adding it fails closed.
+
+For an anchored repository, the reusable workflow never uses `event.before`,
+`origin/main`, or `HEAD~1` as the generated-guard base. It starts at the
+reviewed seed and may advance only to a successful default-branch run whose
+repository, commit and tree, caller-workflow blob, anchor blob, reusable
+workflow SHA, and completed generated-guard step all match the current
+contract. Missing or inconsistent Actions evidence fails the run. A caller
+workflow change or reusable-workflow SHA upgrade deliberately resets the next
+run to the reviewed seed; successes under an older workflow cannot bootstrap a
+new trust chain.
+
+Roll this out in order:
+
+1. In a reviewed caller PR, add the anchor and `actions: read` permission while
+   retaining the existing reusable-workflow pin. The old workflow ignores the
+   new file, so no future shared-workflow SHA needs to be guessed.
+2. Merge and validate this shared-workflow change.
+3. In another reviewed caller PR, update the reusable-workflow pin to the exact
+   merged commit. Its first run scans from the reviewed seed; later exact-
+   contract successes can advance the durable base.
+4. Repeat the seed scan after every caller-workflow or shared-workflow change.
+
+This is defense in depth, not a substitute for branch protection. Enable
+required `validate / validate` checks for administrators and remove or tightly
+control bypass actors. An administrator who can bypass the check can also
+rewrite the caller workflow or anchor history, outside the trust boundary that
+repository code alone can enforce.
+
 Set `guard-programs-root: true` on the caller to require manifests on the
 composed-pilot `programs/` root too (default `false`). Enable it per repo only
 after every existing `programs/` file has a manifest or manual attestation,
