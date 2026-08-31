@@ -133,6 +133,7 @@ on:
         default: true
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -528,6 +529,481 @@ jobs:
           print(f"candidate={candidate}")
           PY
           # reviewed-migration-authorization-end
+
+      - name: Resolve durable generated-guard anchor
+        id: generated_guard_anchor
+        if: ${{ inputs.run-generated-guard && matrix.shard == needs.shards.outputs.first }}
+        shell: bash
+        env:
+          ANCHOR_API_URL: ${{ github.api_url }}
+          ANCHOR_CHECKOUT_SHA: ${{ github.sha }}
+          ANCHOR_REPOSITORY: ${{ github.repository }}
+          ANCHOR_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ANCHOR_RUN_ID: ${{ github.run_id }}
+          ANCHOR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # durable-generated-guard-anchor-start
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import re
+          import subprocess
+          import tomllib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import PurePosixPath
+
+          ANCHOR_PATH = ".axiom/generated-guard-anchor.toml"
+          ANCHOR_CONTRACT = "axiom/generated-guard-anchor/v1"
+          SHARED_WORKFLOW = (
+              "TheAxiomFoundation/.github/"
+              ".github/workflows/validate-rulespec.yml"
+          )
+          SHA = re.compile(r"[0-9a-f]{40}")
+
+
+          def fail(message: str) -> None:
+              raise SystemExit(f"GeneratedGuardAnchorError: {message}")
+
+
+          def git(
+              *args: str, check: bool = True
+          ) -> subprocess.CompletedProcess[bytes]:
+              return subprocess.run(
+                  ["git", *args], check=check, capture_output=True
+              )
+
+
+          def is_ancestor(older: str, newer: str) -> bool:
+              return (
+                  git(
+                      "merge-base",
+                      "--is-ancestor",
+                      older,
+                      newer,
+                      check=False,
+                  ).returncode
+                  == 0
+              )
+
+
+          def commit_tree(commit: str) -> str:
+              if SHA.fullmatch(commit) is None:
+                  fail("commit identity is missing or malformed")
+              result = git("rev-parse", "--verify", f"{commit}^{{tree}}", check=False)
+              if result.returncode != 0:
+                  fail(f"commit {commit} is unavailable in the full checkout")
+              try:
+                  tree = result.stdout.decode("ascii").strip()
+              except UnicodeDecodeError:
+                  fail(f"commit {commit} has a non-ASCII tree identity")
+              if SHA.fullmatch(tree) is None:
+                  fail(f"commit {commit} has a malformed tree identity")
+              return tree
+
+
+          def blob_at(commit: str, path: str, *, required: bool) -> tuple[str, bytes] | None:
+              tree = git("ls-tree", "-z", commit, "--", path, check=False)
+              if tree.returncode != 0:
+                  fail(f"cannot resolve {path!r} at commit {commit}")
+              records = [record for record in tree.stdout.split(b"\0") if record]
+              if not records:
+                  if required:
+                      fail(f"commit {commit} does not contain {path}")
+                  return None
+              if len(records) != 1:
+                  fail(f"commit {commit} does not resolve exactly one {path}")
+              try:
+                  metadata, listed = records[0].split(b"\t", 1)
+                  mode, kind, object_id = metadata.split(b" ", 2)
+                  listed_path = listed.decode("utf-8")
+                  object_text = object_id.decode("ascii")
+              except (UnicodeDecodeError, ValueError):
+                  fail(f"commit {commit} has malformed tree metadata for {path}")
+              if (
+                  listed_path != path
+                  or mode != b"100644"
+                  or kind != b"blob"
+                  or SHA.fullmatch(object_text) is None
+              ):
+                  fail(f"commit {commit} does not contain {path} as a regular file")
+              body = git("cat-file", "blob", object_text).stdout
+              return object_text, body
+
+
+          def parse_anchor(body: bytes) -> str:
+              try:
+                  source = body.decode("utf-8")
+                  payload = tomllib.loads(source)
+              except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+                  fail(f"{ANCHOR_PATH} is not strict UTF-8 TOML: {exc}")
+              if type(payload) is not dict or set(payload) != {"generated_guard_anchor"}:
+                  fail("anchor must contain exactly [generated_guard_anchor]")
+              table = payload["generated_guard_anchor"]
+              if type(table) is not dict or set(table) != {
+                  "contract",
+                  "reviewed_known_good_sha",
+              }:
+                  fail("anchor table must contain exactly contract and reviewed_known_good_sha")
+              if table["contract"] != ANCHOR_CONTRACT:
+                  fail("anchor contract is unsupported")
+              seed = table["reviewed_known_good_sha"]
+              if type(seed) is not str or SHA.fullmatch(seed) is None:
+                  fail("reviewed known-good SHA must be 40 lowercase hexadecimal characters")
+              return seed
+
+
+          def strict_json(body: bytes, context: str) -> object:
+              def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                  result: dict[str, object] = {}
+                  for key, value in pairs:
+                      if key in result:
+                          fail(f"{context} contains duplicate key {key!r}")
+                      result[key] = value
+                  return result
+
+              try:
+                  return json.loads(
+                      body.decode("utf-8"),
+                      object_pairs_hook=unique_object,
+                      parse_constant=lambda value: fail(
+                          f"{context} contains invalid constant {value}"
+                      ),
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                  fail(f"{context} is not strict UTF-8 JSON: {exc}")
+
+
+          api_url = os.environ["ANCHOR_API_URL"].rstrip("/")
+          parsed_api_url = urllib.parse.urlparse(api_url)
+          test_http = (
+              os.environ.get("ANCHOR_TEST_ALLOW_HTTP") == "true"
+              and parsed_api_url.scheme == "http"
+              and parsed_api_url.hostname in {"127.0.0.1", "::1", "localhost"}
+          )
+          if parsed_api_url.scheme != "https" and not test_http:
+              fail("GitHub API URL must use HTTPS")
+          repository = os.environ["ANCHOR_REPOSITORY"]
+          if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
+              fail("caller repository identity is malformed")
+          checkout_sha = os.environ["ANCHOR_CHECKOUT_SHA"]
+          run_head_sha = os.environ["ANCHOR_RUN_HEAD_SHA"]
+          if SHA.fullmatch(checkout_sha) is None or SHA.fullmatch(run_head_sha) is None:
+              fail("current checkout or run head SHA is malformed")
+          commit_tree(checkout_sha)
+          commit_tree(run_head_sha)
+
+          additions = git(
+              "log",
+              "--format=%H",
+              "--diff-filter=A",
+              checkout_sha,
+              "--",
+              ANCHOR_PATH,
+          ).stdout.splitlines()
+          current_anchor = blob_at(
+              checkout_sha, ANCHOR_PATH, required=bool(additions)
+          )
+          if not additions and current_anchor is None:
+              # Backward-compatible rollout: callers become durable only by
+              # adding the fixed, immutable anchor file in reviewed history.
+              print("mode=legacy")
+              print("base_ref=")
+              raise SystemExit(0)
+          if len(additions) != 1:
+              fail("anchor must have exactly one introducing commit in HEAD history")
+          try:
+              introduction = additions[0].decode("ascii")
+          except UnicodeDecodeError:
+              fail("anchor introduction commit is not ASCII")
+          if SHA.fullmatch(introduction) is None:
+              fail("anchor introduction commit is malformed")
+          introduced_anchor = blob_at(introduction, ANCHOR_PATH, required=True)
+          assert introduced_anchor is not None and current_anchor is not None
+          if introduced_anchor != current_anchor:
+              fail("anchor blob or file mode changed after its introduction")
+          seed = parse_anchor(current_anchor[1])
+          commit_tree(seed)
+          if not is_ancestor(seed, introduction) or not is_ancestor(
+              introduction, checkout_sha
+          ):
+              fail("reviewed seed, anchor introduction, and HEAD are not ordered ancestors")
+
+          token = os.environ["ANCHOR_TOKEN"]
+          if not token:
+              fail("GitHub Actions token is unavailable")
+          try:
+              current_run_id = int(os.environ["ANCHOR_RUN_ID"])
+          except ValueError:
+              fail("current Actions run id is malformed")
+          if current_run_id <= 0:
+              fail("current Actions run id must be positive")
+
+
+          def api_get(path: str, *, context: str) -> object:
+              request = urllib.request.Request(
+                  f"{api_url}{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      if response.status != 200:
+                          fail(f"{context} returned HTTP {response.status}")
+                      body = response.read(8 * 1024 * 1024 + 1)
+              except (OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
+                  fail(f"{context} is unavailable: {exc}")
+              if len(body) > 8 * 1024 * 1024:
+                  fail(f"{context} response exceeds 8 MiB")
+              return strict_json(body, context)
+
+
+          repository_path = urllib.parse.quote(repository, safe="/")
+
+
+          def require_repository(run: dict[str, object], *, candidate: bool) -> None:
+              run_repository = run.get("repository")
+              if (
+                  type(run_repository) is not dict
+                  or run_repository.get("full_name") != repository
+              ):
+                  fail("Actions run is not bound to the caller repository")
+              if candidate:
+                  head_repository = run.get("head_repository")
+                  if (
+                      type(head_repository) is not dict
+                      or head_repository.get("full_name") != repository
+                  ):
+                      fail("candidate run head is not in the caller repository")
+
+
+          def require_run_tree(run: dict[str, object], expected_head: str) -> None:
+              if run.get("head_sha") != expected_head:
+                  fail("Actions run head differs from the resolved Git commit")
+              head_commit = run.get("head_commit")
+              if (
+                  type(head_commit) is not dict
+                  or head_commit.get("id") != expected_head
+                  or head_commit.get("tree_id") != commit_tree(expected_head)
+              ):
+                  fail("Actions run head metadata differs from the resolved Git tree")
+
+
+          def reusable_identity(run: dict[str, object]) -> tuple[str, str] | None:
+              references = run.get("referenced_workflows")
+              if type(references) is not list:
+                  fail("Actions run referenced_workflows evidence is unavailable")
+              matches: list[tuple[str, str]] = []
+              prefix = f"{SHARED_WORKFLOW}@"
+              for reference in references:
+                  if type(reference) is not dict:
+                      fail("Actions run contains malformed reusable-workflow evidence")
+                  path = reference.get("path")
+                  sha = reference.get("sha")
+                  if type(path) is not str or type(sha) is not str:
+                      fail("Actions run contains incomplete reusable-workflow evidence")
+                  if path.startswith(prefix):
+                      matches.append((path, sha))
+              if not matches:
+                  return None
+              if len(matches) != 1:
+                  fail("Actions run has ambiguous reusable-workflow evidence")
+              path, sha = matches[0]
+              if SHA.fullmatch(sha) is None or path != f"{SHARED_WORKFLOW}@{sha}":
+                  fail("Actions run reusable-workflow ref and SHA are not identical")
+              return path, sha
+
+
+          current = api_get(
+              f"/repos/{repository_path}/actions/runs/{current_run_id}",
+              context="current Actions run",
+          )
+          if type(current) is not dict or current.get("id") != current_run_id:
+              fail("current Actions run evidence is malformed")
+          require_repository(current, candidate=False)
+          require_run_tree(current, run_head_sha)
+          if current.get("status") not in {"queued", "in_progress"}:
+              fail("current Actions run is not active")
+          workflow_id = current.get("workflow_id")
+          caller_path = current.get("path")
+          if type(workflow_id) is not int or type(workflow_id) is bool or workflow_id <= 0:
+              fail("current caller workflow id is malformed")
+          if type(caller_path) is not str:
+              fail("current caller workflow path is unavailable")
+          caller = PurePosixPath(caller_path)
+          if (
+              caller.is_absolute()
+              or ".." in caller.parts
+              or caller.as_posix() != caller_path
+              or caller.parts[:2] != (".github", "workflows")
+              or caller.suffix not in {".yml", ".yaml"}
+          ):
+              fail("current caller workflow path is not canonical")
+          current_caller = blob_at(checkout_sha, caller_path, required=True)
+          assert current_caller is not None
+          current_reusable = reusable_identity(current)
+          if current_reusable is None:
+              fail("current run does not identify the reusable validation workflow")
+
+          repo = api_get(f"/repos/{repository_path}", context="caller repository")
+          if (
+              type(repo) is not dict
+              or repo.get("full_name") != repository
+              or type(repo.get("default_branch")) is not str
+              or not repo["default_branch"]
+          ):
+              fail("caller repository default-branch evidence is malformed")
+          default_branch = repo["default_branch"]
+
+          summaries: list[dict[str, object]] = []
+          seen_run_ids: set[int] = set()
+          expected_total: int | None = None
+          for page in range(1, 11):
+              query = urllib.parse.urlencode(
+                  {
+                      "branch": default_branch,
+                      "status": "success",
+                      "per_page": 100,
+                      "page": page,
+                  }
+              )
+              payload = api_get(
+                  f"/repos/{repository_path}/actions/workflows/"
+                  f"{workflow_id}/runs?{query}",
+                  context=f"successful caller runs page {page}",
+              )
+              if (
+                  type(payload) is not dict
+                  or type(payload.get("total_count")) is not int
+                  or type(payload.get("total_count")) is bool
+                  or type(payload.get("workflow_runs")) is not list
+              ):
+                  fail("successful caller-run listing is malformed")
+              total = payload["total_count"]
+              if total < 0 or (expected_total is not None and total != expected_total):
+                  fail("successful caller-run pagination is inconsistent")
+              expected_total = total
+              page_runs = payload["workflow_runs"]
+              for summary in page_runs:
+                  if type(summary) is not dict:
+                      fail("successful caller-run listing contains a malformed run")
+                  run_id = summary.get("id")
+                  if type(run_id) is not int or type(run_id) is bool or run_id <= 0:
+                      fail("successful caller-run listing contains a malformed id")
+                  if run_id in seen_run_ids:
+                      fail("successful caller-run pagination contains a duplicate id")
+                  seen_run_ids.add(run_id)
+                  summaries.append(summary)
+              if len(summaries) > total:
+                  fail("successful caller-run pagination exceeds its declared total")
+              if len(summaries) == total:
+                  break
+              if len(page_runs) < 100:
+                  fail("successful caller-run pagination ended before its declared total")
+          else:
+              fail("successful caller-run evidence exceeds the 1,000-run audit bound")
+
+
+          def guard_step_succeeded(run_id: int) -> bool:
+              query = urllib.parse.urlencode(
+                  {"filter": "latest", "per_page": 100, "page": 1}
+              )
+              payload = api_get(
+                  f"/repos/{repository_path}/actions/runs/{run_id}/jobs?{query}",
+                  context=f"candidate Actions jobs {run_id}",
+              )
+              if (
+                  type(payload) is not dict
+                  or type(payload.get("total_count")) is not int
+                  or type(payload.get("jobs")) is not list
+                  or payload["total_count"] > 100
+              ):
+                  fail("candidate Actions job evidence is malformed or incomplete")
+              successes = 0
+              for job in payload["jobs"]:
+                  if type(job) is not dict or type(job.get("steps")) is not list:
+                      fail("candidate Actions job evidence contains a malformed job")
+                  for step in job["steps"]:
+                      if type(step) is not dict:
+                          fail("candidate Actions job evidence contains a malformed step")
+                      if step.get("name") == "Reject manual RuleSpec changes":
+                          if step.get("status") != "completed":
+                              return False
+                          if step.get("conclusion") == "success":
+                              successes += 1
+                          elif step.get("conclusion") != "skipped":
+                              return False
+              if successes > 1:
+                  fail("candidate Actions run has ambiguous generated-guard steps")
+              return successes == 1
+
+
+          eligible: set[str] = set()
+          for summary in summaries:
+              run_id = summary["id"]
+              if run_id == current_run_id:
+                  continue
+              candidate_head = summary.get("head_sha")
+              if type(candidate_head) is not str or SHA.fullmatch(candidate_head) is None:
+                  fail("successful caller-run listing contains a malformed head SHA")
+              if not is_ancestor(introduction, candidate_head) or not is_ancestor(
+                  candidate_head, checkout_sha
+              ):
+                  continue
+              candidate = api_get(
+                  f"/repos/{repository_path}/actions/runs/{run_id}",
+                  context=f"candidate Actions run {run_id}",
+              )
+              if type(candidate) is not dict or candidate.get("id") != run_id:
+                  fail("candidate Actions run evidence is malformed")
+              require_repository(candidate, candidate=True)
+              require_run_tree(candidate, candidate_head)
+              if (
+                  candidate.get("workflow_id") != workflow_id
+                  or candidate.get("path") != caller_path
+                  or candidate.get("head_branch") != default_branch
+                  or candidate.get("event") not in {"push", "schedule", "workflow_dispatch"}
+                  or candidate.get("status") != "completed"
+                  or candidate.get("conclusion") != "success"
+              ):
+                  fail("candidate run contradicts the successful main-workflow listing")
+              candidate_reusable = reusable_identity(candidate)
+              if candidate_reusable != current_reusable:
+                  continue
+              candidate_anchor = blob_at(candidate_head, ANCHOR_PATH, required=True)
+              candidate_caller = blob_at(candidate_head, caller_path, required=True)
+              if candidate_anchor != current_anchor or candidate_caller != current_caller:
+                  continue
+              if not guard_step_succeeded(run_id):
+                  continue
+              eligible.add(candidate_head)
+
+          if eligible:
+              maxima = [
+                  candidate
+                  for candidate in eligible
+                  if not any(
+                      candidate != other and is_ancestor(candidate, other)
+                      for other in eligible
+                  )
+              ]
+              if len(maxima) != 1:
+                  fail("successful generated-guard evidence has no unique maximal ancestor")
+              base_ref = maxima[0]
+          else:
+              base_ref = seed
+          if not is_ancestor(seed, base_ref) or not is_ancestor(base_ref, checkout_sha):
+              fail("resolved generated-guard base is outside the reviewed ancestry chain")
+          print("mode=durable")
+          print(f"base_ref={base_ref}")
+          print(f"contract_sha={current_reusable[1]}")
+          PY
+          # durable-generated-guard-anchor-end
 
       - name: Resolve shard validation roots
         id: resolve_roots
@@ -1443,13 +1919,28 @@ jobs:
       - name: Reject manual RuleSpec changes
         if: ${{ inputs.run-generated-guard && matrix.shard == needs.shards.outputs.first }}
         shell: bash
+        env:
+          DURABLE_BASE_REF: ${{ steps.generated_guard_anchor.outputs.base_ref }}
+          DURABLE_MODE: ${{ steps.generated_guard_anchor.outputs.mode }}
+          EVENT_BEFORE: ${{ github.event.before || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base_ref="${{ github.event.pull_request.base.sha }}"
-          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            base_ref="${{ github.event.before }}"
+          if [ "$DURABLE_MODE" = "durable" ]; then
+            if [[ ! "$DURABLE_BASE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "GeneratedGuardAnchorError: durable base output is malformed" >&2
+              exit 1
+            fi
+            base_ref="$DURABLE_BASE_REF"
+          elif [ "$DURABLE_MODE" != "legacy" ]; then
+            echo "GeneratedGuardAnchorError: resolver mode is unavailable" >&2
+            exit 1
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="$PR_BASE_SHA"
+          elif [ -n "$EVENT_BEFORE" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            base_ref="$EVENT_BEFORE"
           else
             base_ref="HEAD~1"
           fi
