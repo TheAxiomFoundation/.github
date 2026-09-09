@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-09 — Merge pull request #82 from TheAxiomFoundation/axiom/signed-backfill-de-34373962529-1 | 10 | de-rulespec-2026-09-09-kindergeld-threshold | e7fbc6a0fadcc5bab369cd03929a2b3dc0a0743b | success |
+| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-09 — Merge pull request #86 from TheAxiomFoundation/de-eu-reference-runtime-pin | 10 | de-rulespec-2026-09-09-kindergeld-threshold | 9330c24b2909132aaed44952b477a81c4f635056 | in_progress |
 | [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-08 — Merge pull request #1347 from TheAxiomFoundation/axiom/signed-backfill-us-34204901922-1 | 83 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-09-05 — Merge pull request #309 from TheAxiomFoundation/rebind/uk-rulespec-2026-09-06 | 70 | uk-rulespec-2026-09-06 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-08-23 — Merge pull request #115 from TheAxiomFoundation/exit/rates-rebate-waiver | 5 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
