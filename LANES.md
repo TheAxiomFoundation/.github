@@ -4,20 +4,20 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-10 — Add signed encoding manifest for de/statute/bfdg/5 (#87) | 10 | de-rulespec-2026-09-09-kindergeld-threshold | 5d4562d822e6d4a53420f0f9cb0a5891a7edf6fe | success |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-08 — Merge pull request #1347 from TheAxiomFoundation/axiom/signed-backfill-us-34204901922-1 | 83 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
+| [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#3) | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#7) | 1 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-09-10 — Merge pull request #119 from TheAxiomFoundation/docs-axiom-org-host | 5 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
+| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-10 — Add signed encoding manifest for de/statute/bfdg/5 (#87) | 11 | de-rulespec-2026-09-09-kindergeld-threshold | 5d4562d822e6d4a53420f0f9cb0a5891a7edf6fe | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-08 — Merge pull request #1347 from TheAxiomFoundation/axiom/signed-backfill-us-34204901922-1 | 83 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-09-05 — Merge pull request #309 from TheAxiomFoundation/rebind/uk-rulespec-2026-09-06 | 70 | uk-rulespec-2026-09-06 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
-| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-08-23 — Merge pull request #115 from TheAxiomFoundation/exit/rates-rebate-waiver | 5 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-08-22 — Merge pull request #123 from TheAxiomFoundation/ledger/unemployment | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-08-19 — Merge pull request #45 from TheAxiomFoundation/axiom/signed-backfill-dk-32198868240-1 | 179 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
-| [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-08-01 — Merge pull request #20 from TheAxiomFoundation/docs/md-audit-rulespec-ug | 2 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-08-19 — Merge pull request #45 from TheAxiomFoundation/axiom/signed-backfill-dk-32198868240-1 | 180 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
 | [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-08-01 — Merge pull request #15 from TheAxiomFoundation/docs/md-audit-rulespec-ng | 0 | ng-rulespec-2026-07-22 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-08-01 — Merge pull request #34 from TheAxiomFoundation/docs/md-audit-rulespec-gh | 2 | gh-rulespec-2026-07-12 | f4b952b7ba83d8382d0074b64b27ba6ea9a7637b | failure |
-| [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-07-24 — Merge pull request #23 from TheAxiomFoundation/land/lane-verified-pn2008-cap256-act2023-25 | 1 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-07-24 — Merge pull request #15 from TheAxiomFoundation/land/lane-verified-dir-1021-2024 | 1 | et-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | failure |
-| [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-07-23 — Merge pull request #16 from TheAxiomFoundation/repair/cbhi-oracle-pending | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-07-24 — Merge pull request #15 from TheAxiomFoundation/land/lane-verified-dir-1021-2024 | 2 | et-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | failure |
+| [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-07-23 — Merge pull request #16 from TheAxiomFoundation/repair/cbhi-oracle-pending | 1 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 2 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-07-22 — Merge pull request #26 from TheAxiomFoundation/ci/reusable-caller-keyring | 9 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-07-22 — Merge pull request #26 from TheAxiomFoundation/ci/reusable-caller-keyring | 10 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 
 <!-- curated:start -->
 ## Lane ownership and standing constraints (curated — edit by PR only)
