@@ -4,8 +4,8 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-09 — Merge pull request #86 from TheAxiomFoundation/de-eu-reference-runtime-pin | 10 | de-rulespec-2026-09-09-kindergeld-threshold | 9330c24b2909132aaed44952b477a81c4f635056 | success |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-08 — Merge pull request #1347 from TheAxiomFoundation/axiom/signed-backfill-us-34204901922-1 | 83 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
+| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-10 — Add signed encoding manifest for de/statute/bfdg/5 (#87) | 10 | de-rulespec-2026-09-09-kindergeld-threshold | 5d4562d822e6d4a53420f0f9cb0a5891a7edf6fe | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-08 — Merge pull request #1347 from TheAxiomFoundation/axiom/signed-backfill-us-34204901922-1 | 83 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-09-05 — Merge pull request #309 from TheAxiomFoundation/rebind/uk-rulespec-2026-09-06 | 70 | uk-rulespec-2026-09-06 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-08-23 — Merge pull request #115 from TheAxiomFoundation/exit/rates-rebate-waiver | 5 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-08-22 — Merge pull request #123 from TheAxiomFoundation/ledger/unemployment | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
