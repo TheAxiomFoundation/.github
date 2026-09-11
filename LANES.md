@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-10 — Merge pull request #89 from TheAxiomFoundation/de-kindergeld-corpus-service-predecessors | 11 | de-rulespec-2026-09-10-kindergeld-eu-service-predecessors | 5d4562d822e6d4a53420f0f9cb0a5891a7edf6fe | success |
+| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-11 — Merge pull request #98 from TheAxiomFoundation/de-relation-engine-pin-2026-09-11 | 11 | de-rulespec-2026-09-11-kindergeld-illness-precedents | b041b6b5a0e39f2c05c93669f354f8a54e9a84c3 | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#3) | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#7) | 1 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-09-10 — Merge pull request #119 from TheAxiomFoundation/docs-axiom-org-host | 5 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
