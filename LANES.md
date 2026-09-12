@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-12 — Sync oracle coverage pending declarations (#1359) | 88 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-12 — Merge pull request #1357 from TheAxiomFoundation/fix/approve-encoder-0.2.1973-fingerprints | 88 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-11 — Merge pull request #100 from TheAxiomFoundation/de-kindergeld-corpus-bgh-disability | 11 | de-rulespec-2026-09-11-kindergeld-bgh-counterpart | b041b6b5a0e39f2c05c93669f354f8a54e9a84c3 | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#3) | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#7) | 1 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
