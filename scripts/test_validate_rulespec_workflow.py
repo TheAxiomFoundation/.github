@@ -155,6 +155,61 @@ def test_pending_waiver_requires_exact_digest_only_toolchain_companion() -> None
         assert run().returncode == 0
 
 
+def test_release_pin_companion_requires_strict_retirement() -> None:
+    import yaml
+
+    entry = {"active": {"fingerprint": "sha256:" + "a" * 64}}
+    base_entries = {"us/one.yaml": entry, "us/two.yaml": entry}
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        paths = [root / name for name in (
+            "base.yaml", "head.yaml", "base.toml", "head.toml", "changed", "audit"
+        )]
+        changed = "known-validation-gaps.yaml\n.axiom/toolchain.toml\nus/one.yaml\n"
+        paths[4].write_text(changed)
+
+        def run(entries=None, *, release="new-release", digest="b" * 64,
+                extra="", corrupt_pin=False):
+            if entries is None:
+                entries = {"us/two.yaml": entry}
+            for path, records in zip(paths[:2], (base_entries, entries)):
+                path.write_text(yaml.safe_dump({"validate_failures": records}))
+            for index, name, sha in ((0, "old-release", "a" * 64), (1, release, digest)):
+                pin = hashlib.sha256(paths[index].read_bytes()).hexdigest()
+                if index == 1 and corrupt_pin:
+                    pin = "0" * 64
+                paths[index + 2].write_text(
+                    '[toolchain]\n'
+                    f'axiom_corpus_release = "{name}"\n'
+                    f'axiom_corpus_release_content_sha256 = "{sha}"\n'
+                    f'validation_waiver_set_sha256 = "{pin}"\n'
+                    + (extra if index == 1 else "")
+                )
+            return subprocess.run(
+                ["python", "-c", waiver_ratchet_source(), *map(str, paths)],
+                capture_output=True, text=True,
+            )
+
+        result = run()
+        assert result.returncode == 0, result.stderr
+        assert paths[5].read_text() == changed
+        # Even a two-file retirement must retain the release pin in the audit.
+        paths[4].write_text("known-validation-gaps.yaml\n.axiom/toolchain.toml\n")
+        assert run().returncode == 0
+        assert paths[5].read_text() == paths[4].read_text()
+        assert run({}).returncode == 0
+        assert run(base_entries).returncode != 0  # No retirement.
+        assert run({"us/new.yaml": entry}).returncode != 0
+        assert run({"us/two.yaml": {"pending": entry["active"]}}).returncode != 0
+        assert run({"us/two.yaml": {**entry, "pending": entry["active"]}}).returncode != 0
+        assert run({"us/two.yaml": {"active": {"fingerprint": "changed"}}}).returncode != 0
+        assert run(extra='axiom_encode_ref = "changed"\n').returncode != 0
+        assert run(extra='[other]\nsetting = true\n').returncode != 0
+        assert run(corrupt_pin=True).returncode != 0
+        assert run(release="../unsigned").returncode != 0
+        assert run(digest="invalid").returncode != 0
+
+
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Enforce validation waiver ratchet")
@@ -336,6 +391,7 @@ def test_conflicted_merge_is_rejected() -> None:
 
 
 def main() -> None:
+    test_release_pin_companion_requires_strict_retirement()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_pending_waiver_requires_exact_digest_only_toolchain_companion()
     test_waiver_bootstrap_uses_authenticated_head_toolchain()

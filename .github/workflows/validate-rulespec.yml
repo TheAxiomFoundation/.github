@@ -1758,6 +1758,7 @@ jobs:
           import hashlib
           import re
           import sys
+          import tomllib
           from pathlib import Path
 
           import yaml
@@ -1808,10 +1809,45 @@ jobs:
                   + base_toolchain[base_matches[0].end("digest") :]
               )
               if head_toolchain != expected_head_toolchain:
-                  raise SystemExit(
-                      "ValidationWaiverPinCompanionScope: toolchain companion may change only the waiver-set digest"
+                  # A signed release correction can resolve an existing failure.
+                  # Allow its pin to travel with strict waiver retirements only;
+                  # release authentication and the supervised audit remain required.
+                  base_config = tomllib.loads(base_toolchain.decode())
+                  head_config = tomllib.loads(head_toolchain.decode())
+                  base_pins = base_config.get("toolchain", {})
+                  head_pins = head_config.get("toolchain", {})
+                  release_keys = (
+                      "axiom_corpus_release",
+                      "axiom_corpus_release_content_sha256",
                   )
-              pin_companion_verified = True
+                  base_release = tuple(base_pins.get(key) for key in release_keys)
+                  head_release = tuple(head_pins.get(key) for key in release_keys)
+                  for key in (*release_keys, "validation_waiver_set_sha256"):
+                      base_pins.pop(key, None)
+                      head_pins.pop(key, None)
+                  strict_retirement = (
+                      len(head_entries) < len(base_entries)
+                      and all(
+                          module in base_entries and states == base_entries[module]
+                          for module, states in head_entries.items()
+                      )
+                  )
+                  if not (
+                      strict_retirement
+                      and base_config == head_config
+                      and base_release != head_release
+                      and isinstance(head_release[0], str)
+                      and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", head_release[0])
+                      and isinstance(head_release[1], str)
+                      and re.fullmatch(r"[0-9a-f]{64}", head_release[1])
+                  ):
+                      raise SystemExit(
+                          "ValidationWaiverPinCompanionScope: only a corpus release pin "
+                          "with strict waiver retirements may accompany the waiver-set digest"
+                      )
+                  # Keep full changed paths and do not enable pending approvals.
+              else:
+                  pin_companion_verified = True
           growth = []
           for module, head_states in head_entries.items():
               base_states = base_entries.get(module)
