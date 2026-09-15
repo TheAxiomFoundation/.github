@@ -4,8 +4,8 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-15 — Merge pull request #103 from TheAxiomFoundation/de-kindergeld-dakg2025-release-2026-09-14 | 11 | de-rulespec-2026-09-14-kindergeld-dakg2025-sections | 809dde9d0977da7880ce52f1d3432b06bcf00e69 | success |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-14 — Refresh signed manifest for us/statute/7/2015/f without changing RuleSpec (#1364) | 92 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
+| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-15 — Merge pull request #104 from TheAxiomFoundation/de-kindergeld-preface-toolchain-2026-09-15 | 11 | de-rulespec-2026-09-15-kindergeld-dakg2025-preface | d965e5239ca47b0c54fc7e83213f813fa6a75f27 | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-15 — Add signed encoding manifest for us/guidance/irs/rev-proc-2025-32/page-15 (#1366) | 91 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-09-13 — Merge pull request #343 from TheAxiomFoundation/rebind/uk-rulespec-2026-09-07 | 70 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#3) | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#7) | 1 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
