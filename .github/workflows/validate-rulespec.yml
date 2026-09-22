@@ -1809,9 +1809,17 @@ jobs:
                   + base_toolchain[base_matches[0].end("digest") :]
               )
               if head_toolchain != expected_head_toolchain:
-                  # A signed release correction can resolve an existing failure.
-                  # Allow its pin to travel with strict waiver retirements only;
-                  # release authentication and the supervised audit remain required.
+                  # A signed corpus release re-pin can resolve existing failures
+                  # and can move other validator fingerprints. Its pin may travel
+                  # with the waiver-set digest only when every protected-base
+                  # ledger entry is (i) kept exactly, (ii) removed (strict
+                  # retirement), or (iii) replaced by exactly
+                  # {active: <protected-base pending record>}, consuming an
+                  # approval staged on the protected base. No entry, state, or
+                  # pending record may be added or changed any other way. Release
+                  # authentication and the supervised audit, which re-fingerprints
+                  # every head active record under the new release and rejects
+                  # expired approvals, remain required.
                   base_config = tomllib.loads(base_toolchain.decode())
                   head_config = tomllib.loads(head_toolchain.decode())
                   base_pins = base_config.get("toolchain", {})
@@ -1825,16 +1833,8 @@ jobs:
                   for key in (*release_keys, "validation_waiver_set_sha256"):
                       base_pins.pop(key, None)
                       head_pins.pop(key, None)
-                  strict_retirement = (
-                      len(head_entries) < len(base_entries)
-                      and all(
-                          module in base_entries and states == base_entries[module]
-                          for module, states in head_entries.items()
-                      )
-                  )
                   if not (
-                      strict_retirement
-                      and base_config == head_config
+                      base_config == head_config
                       and base_release != head_release
                       and isinstance(head_release[0], str)
                       and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", head_release[0])
@@ -1842,9 +1842,66 @@ jobs:
                       and re.fullmatch(r"[0-9a-f]{64}", head_release[1])
                   ):
                       raise SystemExit(
-                          "ValidationWaiverPinCompanionScope: only a corpus release pin "
-                          "with strict waiver retirements may accompany the waiver-set digest"
+                          "ValidationWaiverPinCompanionScope: only a well-formed corpus "
+                          "release pin may accompany the waiver-set digest; every other "
+                          "toolchain key must stay unchanged"
                       )
+
+                  def exactly_equal(left, right):
+                      # Type-strict: 1, 1.0, and True must not stand in for
+                      # one another when matching a staged approval.
+                      if type(left) is not type(right):
+                          return False
+                      if isinstance(left, dict):
+                          return set(left) == set(right) and all(
+                              exactly_equal(left[key], right[key]) for key in left
+                          )
+                      if isinstance(left, list):
+                          return len(left) == len(right) and all(
+                              exactly_equal(a, b) for a, b in zip(left, right)
+                          )
+                      return left == right
+
+                  retired = [module for module in base_entries if module not in head_entries]
+                  consumed = []
+                  unsanctioned = []
+                  for module, head_states in head_entries.items():
+                      if module not in base_entries:
+                          unsanctioned.append(f"{module} (new entry)")
+                          continue
+                      base_states = base_entries[module]
+                      if exactly_equal(head_states, base_states):
+                          continue
+                      if (
+                          isinstance(base_states, dict)
+                          and set(base_states) in ({"pending"}, {"active", "pending"})
+                          and isinstance(head_states, dict)
+                          and set(head_states) == {"active"}
+                          and exactly_equal(head_states["active"], base_states["pending"])
+                      ):
+                          consumed.append(module)
+                          continue
+                      unsanctioned.append(
+                          f"{module} (changed without exactly consuming a "
+                          "protected-base pending record)"
+                      )
+                  if unsanctioned:
+                      raise SystemExit(
+                          "ValidationWaiverPinCompanionScope: a corpus release pin may "
+                          "accompany only exact retirements and exact consumption of "
+                          "protected-base pending records: "
+                          + ", ".join(sorted(unsanctioned))
+                      )
+                  if not (retired or consumed):
+                      raise SystemExit(
+                          "ValidationWaiverPinCompanionScope: a corpus release pin that "
+                          "rewrites the waiver ledger must retire or consume at least "
+                          "one protected-base entry"
+                      )
+                  print(
+                      "Corpus release re-pin ledger transition: "
+                      f"{len(retired)} retired, {len(consumed)} staged approval(s) consumed."
+                  )
                   # Keep full changed paths and do not enable pending approvals.
               else:
                   pin_companion_verified = True
@@ -1916,13 +1973,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          # generated-guard-base-ref-start
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base_ref="${{ github.event.pull_request.base.sha }}"
           elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
             base_ref="${{ github.event.before }}"
           else
-            base_ref="HEAD~1"
+            # schedule and workflow_dispatch carry no base SHA. The supervised
+            # guard's trusted git wrapper accepts only HEAD, main, origin/main,
+            # or a full 40-hex commit (never HEAD~1), so resolve the parent to
+            # its exact commit here. Checkout uses fetch-depth: 0.
+            base_ref="$(git rev-parse --verify 'HEAD~1^{commit}')"
           fi
+          if [[ ! "$base_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GeneratedGuardBaseRef: base ref must be an exact 40-hex commit, got '$base_ref'" >&2
+            exit 1
+          fi
+          # generated-guard-base-ref-end
 
           /opt/axiom-verification/axiom-encode-signing-supervisor \
             --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
