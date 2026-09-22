@@ -27,11 +27,11 @@ fi
 exit "$LEGACY_STATUS"
 ''')
         stub.chmod(0o755)
-        script = step['run'].replace('/opt/axiom-verification/axiom-encode-signing-supervisor', str(stub)).replace('${{ inputs.python-version }}', '3.13')
+        script = step['run'].replace('/opt/axiom-verification/axiom-encode-signing-supervisor', str(stub)).replace('${{ inputs.python-version }}', '3.13').replace('${{ github.event_name }}', 'pull_request').replace('${{ github.event.pull_request.base.sha }}', 'a' * 40).replace('${{ github.event.before }}', '')
         for status, legacy, expected, count in [(0, 1, 0, 1), (78, 0, 0, 2), (78, 1, 1, 2), (1, 0, 1, 1), (2, 0, 2, 1)]:
             log = root / 'calls'
             log.unlink(missing_ok=True)
-            env = os.environ | {'RUNNER_TEMP': directory, 'GITHUB_WORKSPACE': directory, 'GUARD_BASE_SHA': 'a'*40, 'GUARD_HEAD_SHA': 'b'*40, 'GUARD_PR_NUMBER': '42', 'GUARD_LANE': 'TheAxiomFoundation/rulespec-nz', 'GITHUB_TOKEN': 'fixture', 'CALL_LOG': str(log), 'NOTARY_STATUS': str(status), 'LEGACY_STATUS': str(legacy)}
+            env = os.environ | {'RUNNER_TEMP': directory, 'GITHUB_WORKSPACE': directory, 'GUARD_HEAD_SHA': 'b'*40, 'GUARD_PR_NUMBER': '42', 'GUARD_LANE': 'TheAxiomFoundation/rulespec-nz', 'GITHUB_TOKEN': 'fixture', 'CALL_LOG': str(log), 'NOTARY_STATUS': str(status), 'LEGACY_STATUS': str(legacy)}
             result = subprocess.run(['bash', '-c', script], env=env, capture_output=True)
             assert result.returncode == expected, result.stderr
             calls = log.read_text().splitlines()

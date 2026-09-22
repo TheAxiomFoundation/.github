@@ -210,6 +210,237 @@ def test_release_pin_companion_requires_strict_retirement() -> None:
         assert run(digest="invalid").returncode != 0
 
 
+def waiver_record(fingerprint: str, *, expires: str = "2026-11-01") -> dict:
+    return {
+        "fingerprint": "sha256:" + fingerprint * 64,
+        "owner": "@owner",
+        "issue": "https://github.com/TheAxiomFoundation/rulespec-us/issues/1",
+        "expires": expires,
+    }
+
+
+def run_release_repin(
+    base_entries: dict,
+    head_entries: dict,
+    *,
+    changed: str = "known-validation-gaps.yaml\n.axiom/toolchain.toml\n",
+    release: str = "new-release",
+    release_sha: str = "b" * 64,
+    extra: str = "",
+    head_ledger_suffix: str = "",
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run the extracted ratchet over a corpus re-pin; return (result, audit)."""
+    import yaml
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        base_ledger, head_ledger, base_toml, head_toml, changed_path, audit = (
+            root / name
+            for name in (
+                "base.yaml", "head.yaml", "base.toml", "head.toml", "changed", "audit"
+            )
+        )
+        base_ledger.write_text(yaml.safe_dump({"validate_failures": base_entries}))
+        head_ledger.write_text(
+            yaml.safe_dump({"validate_failures": head_entries}) + head_ledger_suffix
+        )
+        for ledger, toml, name, sha, suffix in (
+            (base_ledger, base_toml, "old-release", "a" * 64, ""),
+            (head_ledger, head_toml, release, release_sha, extra),
+        ):
+            toml.write_text(
+                "[toolchain]\n"
+                f'axiom_corpus_release = "{name}"\n'
+                f'axiom_corpus_release_content_sha256 = "{sha}"\n'
+                'validation_waiver_set_sha256 = '
+                f'"{hashlib.sha256(ledger.read_bytes()).hexdigest()}"\n'
+                + suffix
+            )
+        changed_path.write_text(changed)
+        result = subprocess.run(
+            [
+                "python",
+                "-c",
+                waiver_ratchet_source(),
+                *map(
+                    str,
+                    (base_ledger, head_ledger, base_toml, head_toml, changed_path, audit),
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result, audit.read_text() if audit.exists() else ""
+
+
+def test_release_pin_companion_accepts_exact_staged_consumption() -> None:
+    old, new, other = waiver_record("a"), waiver_record("b"), waiver_record("c")
+    kept = {"active": other}
+    staged = {"active": old, "pending": new}
+    pending_only = {"pending": new}
+    base = {"us/kept.yaml": kept, "us/staged.yaml": staged, "us/fixed.yaml": kept}
+    changed = "known-validation-gaps.yaml\n.axiom/toolchain.toml\n"
+
+    def accepted(head: dict, base_entries: dict = base, **kwargs) -> None:
+        result, audit = run_release_repin(base_entries, head, **kwargs)
+        assert result.returncode == 0, result.stderr
+        # The re-pin never narrows the audit to the ledger alone.
+        assert audit == kwargs.get("changed", changed)
+
+    def rejected(head: dict, base_entries: dict = base, **kwargs) -> str:
+        result, _ = run_release_repin(base_entries, head, **kwargs)
+        assert result.returncode != 0, result.stdout
+        return result.stderr
+
+    consumed = {"us/kept.yaml": kept, "us/staged.yaml": {"active": new}}
+
+    # Positive: {active, pending} -> {active: base.pending} with the re-pin.
+    accepted({**consumed, "us/fixed.yaml": kept})
+    # Positive: consumption and strict retirement travel together.
+    accepted(consumed)
+    # Positive: strict retirement alone (the #111 path) still passes.
+    accepted({"us/kept.yaml": kept, "us/staged.yaml": staged})
+    # Positive: pending-only {pending} -> {active: base.pending}.
+    accepted(
+        {"us/new-failure.yaml": {"active": new}, "us/kept.yaml": kept},
+        {"us/new-failure.yaml": pending_only, "us/kept.yaml": kept},
+    )
+    # Positive: several staged approvals may be consumed by one re-pin.
+    accepted(
+        {"us/one.yaml": {"active": new}, "us/two.yaml": {"active": other}},
+        {
+            "us/one.yaml": {"active": old, "pending": new},
+            "us/two.yaml": {"active": old, "pending": other},
+        },
+    )
+    # Positive: the audit keeps every changed path of a wider re-pin PR.
+    accepted(consumed, changed=changed + "us/kept.yaml\n")
+
+    # Negative: an active fingerprint change with no staged base pending.
+    assert "us/kept.yaml" in rejected(
+        {**consumed, "us/kept.yaml": {"active": new}}
+    )
+    # Negative: a new pending record, on its own or next to a consumption.
+    rejected({**consumed, "us/kept.yaml": {"active": other, "pending": new}})
+    rejected(
+        {**base, "us/kept.yaml": {"active": other, "pending": new}},
+    )
+    # Negative: any other toolchain key changes with the re-pin.
+    assert "toolchain key" in rejected(consumed, extra='axiom_encode_ref = "x"\n')
+    rejected(consumed, extra="[other]\nsetting = true\n")
+    # Negative: a new ledger entry, even a pending-only one.
+    assert "new entry" in rejected({**consumed, "us/new.yaml": {"active": new}})
+    rejected({**consumed, "us/new.yaml": pending_only})
+    # Negative: consumption that does not match the base pending exactly.
+    rejected({**consumed, "us/staged.yaml": {"active": other}})
+    rejected(
+        {**consumed, "us/staged.yaml": {"active": {**new, "expires": "2026-12-01"}}}
+    )
+    rejected({**consumed, "us/staged.yaml": {"active": {**new, "owner": "@other"}}})
+    rejected(
+        {**consumed, "us/staged.yaml": {"active": {**new, "extra": "field"}}}
+    )
+    # Type-strict: an int may not stand in for a float in a staged record.
+    rejected(
+        {"us/staged.yaml": {"active": {**new, "rank": 1}}},
+        {"us/staged.yaml": {"active": old, "pending": {**new, "rank": 1.0}}},
+    )
+    # Negative: consumption must drop pending, not keep it beside active.
+    rejected({**consumed, "us/staged.yaml": {"active": new, "pending": new}})
+    # Negative: dropping pending while keeping the old active is not consumption.
+    rejected({**consumed, "us/staged.yaml": {"active": old}})
+    # Negative: a pending record from one module cannot activate another.
+    rejected(
+        {"us/one.yaml": {"active": new}, "us/two.yaml": {"active": old, "pending": new}},
+        {"us/one.yaml": {"active": old}, "us/two.yaml": {"active": old, "pending": new}},
+    )
+    # Negative: a re-pin whose rewritten ledger records no transition at all.
+    assert "at least one" in rejected(base, head_ledger_suffix="# comment\n")
+    # Negative: a non-digest toolchain rewrite must actually move the release,
+    # and the new release must stay well-formed.
+    rejected(consumed, release="old-release", release_sha="a" * 64, extra="# x\n")
+    rejected(consumed, release="../unsigned")
+    rejected(consumed, release_sha="invalid")
+
+
+def guard_base_ref_source() -> str:
+    workflow = WORKFLOW.read_text()
+    start = workflow.index("      - name: Reject manual RuleSpec changes")
+    end = workflow.index("      - name: Select RuleSpec validation targets")
+    step = workflow[start:end]
+    block_start = step.index("# generated-guard-base-ref-start")
+    block_end = step.index("# generated-guard-base-ref-end")
+    return textwrap.dedent(step[block_start:block_end].split("\n", 1)[1])
+
+
+# Mirrors safe_ref in axiom-encode scripts/provision_verification_supervisor.py,
+# the trusted git wrapper the supervised generated guard runs under.
+TRUSTED_GIT_SAFE_REF = r"(?:HEAD|main|origin/main|[0-9a-f]{40})(?:\^\{commit\})?"
+
+
+def test_generated_guard_resolves_scheduled_base_to_exact_commit() -> None:
+    import re
+
+    workflow = WORKFLOW.read_text()
+    start = workflow.index("      - name: Reject manual RuleSpec changes")
+    end = workflow.index("      - name: Select RuleSpec validation targets")
+    step = workflow[start:end]
+    assert 'base_ref="HEAD~1"' not in step
+    assert '--base-ref "$base_ref"' in step
+    # HEAD~1 must exist in the validate job's clone for rev-parse to resolve it.
+    validate_job = workflow.index("    name: validate\n")
+    checkout = workflow.index("      - name: Checkout rules repository", validate_job)
+    checkout_step = workflow[checkout : workflow.index("      - name:", checkout + 1)]
+    assert "fetch-depth: 0" in checkout_step
+    assert checkout < start
+
+    def resolve(root: Path, *, event: str, pr_base: str = "", before: str = ""):
+        source = (
+            guard_base_ref_source()
+            .replace("${{ github.event_name }}", event)
+            .replace("${{ github.event.pull_request.base.sha }}", pr_base)
+            .replace("${{ github.event.before }}", before)
+        )
+        assert "${{" not in source
+        return subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + source + 'printf %s "$base_ref"\n'],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        (root / "file.txt").write_text("one\n")
+        first = commit(root, "first")
+
+        # A root commit has no parent: fail closed instead of passing HEAD~1.
+        assert resolve(root, event="schedule").returncode != 0
+
+        (root / "file.txt").write_text("two\n")
+        second = commit(root, "second")
+        for event in ("schedule", "workflow_dispatch"):
+            result = resolve(root, event=event)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout == first
+            assert re.fullmatch(TRUSTED_GIT_SAFE_REF, result.stdout)
+            assert not re.fullmatch(TRUSTED_GIT_SAFE_REF, "HEAD~1")
+        # A push that created the branch reports an all-zero before SHA.
+        result = resolve(root, event="push", before="0" * 40)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == first
+        result = resolve(root, event="push", before=first)
+        assert result.returncode == 0 and result.stdout == first
+        result = resolve(root, event="pull_request", pr_base=second)
+        assert result.returncode == 0 and result.stdout == second
+        # Anything that is not an exact commit identity is refused up front.
+        assert resolve(root, event="pull_request", pr_base="main").returncode != 0
+        assert resolve(root, event="push", before="HEAD~1").returncode != 0
+
+
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Enforce validation waiver ratchet")
@@ -392,6 +623,8 @@ def test_conflicted_merge_is_rejected() -> None:
 
 def main() -> None:
     test_release_pin_companion_requires_strict_retirement()
+    test_release_pin_companion_accepts_exact_staged_consumption()
+    test_generated_guard_resolves_scheduled_base_to_exact_commit()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_pending_waiver_requires_exact_digest_only_toolchain_companion()
     test_waiver_bootstrap_uses_authenticated_head_toolchain()
