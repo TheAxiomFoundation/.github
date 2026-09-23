@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-18 — Activate approved SNAP immigration validator fingerprints (#1382) | 103 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-22 — Merge pull request #1384 from TheAxiomFoundation/waivers/renew-2026-12-21-stage | 102 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#88) | 10 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#28) | 9 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#17) | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
@@ -17,7 +17,7 @@
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-08-22 — Merge pull request #123 from TheAxiomFoundation/ledger/unemployment | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-08-01 — Merge pull request #15 from TheAxiomFoundation/docs/md-audit-rulespec-ng | 0 | ng-rulespec-2026-07-22 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-08-01 — Merge pull request #34 from TheAxiomFoundation/docs/md-audit-rulespec-gh | 2 | gh-rulespec-2026-07-12 | f4b952b7ba83d8382d0074b64b27ba6ea9a7637b | failure |
-| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 2 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 3 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 
 <!-- curated:start -->
 ## Lane ownership and standing constraints (curated — edit by PR only)
