@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-23 — Merge pull request #1387 from TheAxiomFoundation/waivers/renew-2026-12-21-activate | 102 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-24 — Merge pull request #1386 from TheAxiomFoundation/ci/bump-org-validation-6f11be26 | 103 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#88) | 10 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#28) | 9 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#17) | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
