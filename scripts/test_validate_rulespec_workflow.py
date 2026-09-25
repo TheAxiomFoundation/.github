@@ -842,6 +842,8 @@ def main() -> None:
     workflow = WORKFLOW.read_text()
     assert "migration-authorization-path" in workflow
     assert "bootstrap is not bound to an exact protected authorization" in workflow
+    from test_notary_guard_workflow import main as test_notary_guard
+    test_notary_guard()
     print("exact reviewed-migration authorization: ok")
 
 

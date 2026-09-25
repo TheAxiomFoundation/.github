@@ -6,12 +6,14 @@ on:
       - ".github/workflows/**"
       - "scripts/test_legacy_oracle_coverage_workflow.py"
       - "scripts/test_validate_rulespec_workflow.py"
+      - "scripts/test_notary_guard_workflow.py"
   push:
     branches: [main]
     paths:
       - ".github/workflows/**"
       - "scripts/test_legacy_oracle_coverage_workflow.py"
       - "scripts/test_validate_rulespec_workflow.py"
+      - "scripts/test_notary_guard_workflow.py"
 
 permissions:
   contents: read

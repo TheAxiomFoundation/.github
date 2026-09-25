@@ -69,10 +69,8 @@ on:
         default: true
       run-generated-guard:
         description: >-
-          Whether to run the manual-RuleSpec-change guard. Disable ONLY for
-          history-preserving migration PRs (e.g. repo consolidation) where
-          every file arrives from an already-validated repo; re-enable
-          immediately after.
+          Compatibility input retained for existing callers. Must be true;
+          this workflow no longer allows a caller to disable generated evidence.
         required: false
         type: boolean
         default: true
@@ -407,60 +405,17 @@ jobs:
           if guard_input not in {"true", "false"}:
               fail(f"run-generated-guard must be true or false, got {guard_input!r}")
 
-          if guard_input == "false":
-              if EXCEPTION_PATH not in tracked_set:
-                  fail(
-                      "run-generated-guard=false without "
-                      ".axiom/generated-guard-exception.md",
-                      "",
-                      "Disabling the generated-content guard is a reviewed, "
-                      "time-boxed migration decision, not a repository "
-                      "setting. Commit the exception file or set "
-                      "run-generated-guard: true.",
-                      EXCEPTION_CONTRACT,
-                      REMEDY,
-                  )
-              try:
-                  raw = Path(EXCEPTION_PATH).read_text(encoding="utf-8")
-              except (OSError, UnicodeDecodeError) as error:
-                  fail(f"{EXCEPTION_PATH} is not readable UTF-8: {error}")
-              lines = raw.splitlines()
-              if len(lines) < 2:
-                  fail(f"{EXCEPTION_PATH} has fewer than two lines", EXCEPTION_CONTRACT)
-              if EXCEPTION_URL.fullmatch(lines[0].strip()) is None:
-                  fail(
-                      f"{EXCEPTION_PATH} line 1 is not a GitHub issue or "
-                      f"pull-request URL: {lines[0].strip()!r}",
-                      EXCEPTION_CONTRACT,
-                  )
-              expires_match = EXCEPTION_EXPIRES.fullmatch(lines[1].strip())
-              if expires_match is None:
-                  fail(
-                      f"{EXCEPTION_PATH} line 2 is not "
-                      f"`expires: YYYY-MM-DD`: {lines[1].strip()!r}",
-                      EXCEPTION_CONTRACT,
-                  )
-              try:
-                  expires = datetime.strptime(
-                      expires_match.group(1), "%Y-%m-%d"
-                  ).date()
-              except ValueError:
-                  fail(
-                      f"{EXCEPTION_PATH} line 2 is not a real calendar date: "
-                      f"{expires_match.group(1)}"
-                  )
-              today = datetime.now(timezone.utc).date()
-              if expires < today:
-                  fail(
-                      f"{EXCEPTION_PATH} expired on {expires.isoformat()} "
-                      f"(today is {today.isoformat()} UTC); renew the "
-                      "authorization or set run-generated-guard: true.",
-                      REMEDY,
-                  )
-              print(
-                  "run-generated-guard=false honored under "
-                  f"{lines[0].strip()} (expires {expires.isoformat()})."
-              )
+          if guard_input != "true":
+              fail("run-generated-guard=false is retired; use the mandatory evidence guard")
+          # Presence at the protected BASE only defers the legacy precheck.
+          # The supervised guard below verifies the full consumer/chain and
+          # rejects malformed or unauthenticated activation. Head-only files
+          # never select this path.
+          if os.environ.get("BASE_SHA") and subprocess.run(
+              ["git", "cat-file", "-e", os.environ["BASE_SHA"] + ":.axiom/notary/consumer.json"],
+              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+          ).returncode == 0:
+              print("Base has a notary consumer; mandatory supervised evidence guard adjudicates it.")
               raise SystemExit(0)
 
           scan_mode = os.environ["SCAN_MODE"]
@@ -1968,11 +1923,15 @@ jobs:
             --axiom-rules-engine-path "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine"
 
       - name: Reject manual RuleSpec changes
-        if: ${{ inputs.run-generated-guard && matrix.shard == needs.shards.outputs.first }}
+        if: ${{ matrix.shard == needs.shards.outputs.first }}
         shell: bash
+        env:
+          GUARD_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          GUARD_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GUARD_LANE: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           # generated-guard-base-ref-start
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base_ref="${{ github.event.pull_request.base.sha }}"
@@ -1990,16 +1949,38 @@ jobs:
             exit 1
           fi
           # generated-guard-base-ref-end
-
-          /opt/axiom-verification/axiom-encode-signing-supervisor \
-            --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
-            --trusted-python-runtime-root /opt/axiom-verification/python \
-            --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
-            --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
-            -- /opt/axiom-verification/axiom-encode guard-generated \
-            --repo "$GITHUB_WORKSPACE" \
-            --base-ref "$base_ref" \
-            --head-ref "$GITHUB_SHA" \
+          # The protected supervisor strips ambient tokens. Pass only this
+          # contents-read job credential through a private temporary file.
+          token_file="$(mktemp "$RUNNER_TEMP/notary-guard-token.XXXXXX")"
+          trap 'rm -f "$token_file"' EXIT
+          chmod 600 "$token_file"
+          printf '%s' "$GITHUB_TOKEN" > "$token_file"
+          unset GITHUB_TOKEN
+          supervisor=(
+            /opt/axiom-verification/axiom-encode-signing-supervisor
+            --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json
+            --trusted-python-runtime-root /opt/axiom-verification/python
+            --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages
+            --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode
+            -- /opt/axiom-verification/axiom-encode
+          )
+          pr_args=()
+          if [ -n "$GUARD_PR_NUMBER" ]; then
+            pr_args=(--pr-number "$GUARD_PR_NUMBER")
+          fi
+          status=0
+          "${supervisor[@]}" notary-guard \
+            --repo "$GITHUB_WORKSPACE" --base-ref "$base_ref" \
+            --head-ref "$GUARD_HEAD_SHA" --lane "$GUARD_LANE" \
+            --github-token-file "$token_file" "${pr_args[@]}" || status=$?
+          case "$status" in
+            0) exit 0 ;;
+            78) ;; # Trusted base has no consumer: mandatory legacy guard.
+            *) exit "$status" ;; # Includes unsupported encoder and malformed consumer.
+          esac
+          "${supervisor[@]}" guard-generated \
+            --repo "$GITHUB_WORKSPACE" --base-ref "$base_ref" \
+            --head-ref "$GUARD_HEAD_SHA" \
             --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
             --expected-encoder-checkout "$GITHUB_WORKSPACE/_axiom/axiom-encode"
 
