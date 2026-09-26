@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-25 — Update SNAP immigration status requirements for OBBBA (#1392) | 91 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-25 — Update SNAP immigration status requirements for OBBBA (#1392) | 91 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-09-25 — Merge pull request #306 from TheAxiomFoundation/enc/uk-isle-of-wight-ctr | 70 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#88) | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#28) | 1 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
