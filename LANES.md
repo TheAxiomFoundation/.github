@@ -4,19 +4,19 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-28 — Stage engine-upgrade validation fingerprints (#1435) | 102 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | queued |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-09-29 — Stage engine-pin semantic migration fingerprints (#1441) | 102 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-09-27 — Merge pull request #350 from TheAxiomFoundation/pe-uk-budget-2026-parity | 71 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-09-27 — Merge pull request #120 from TheAxiomFoundation/verify/nz-super-waiver-exit-20260922 | 4 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#88) | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#28) | 1 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#17) | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#17) | 0 | et-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | failure |
+| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#17) | 1 | et-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | failure |
 | [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 178 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#3) | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-09-10 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#7) | 0 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-08-22 — Merge pull request #123 from TheAxiomFoundation/ledger/unemployment | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-08-01 — Merge pull request #15 from TheAxiomFoundation/docs/md-audit-rulespec-ng | 0 | ng-rulespec-2026-07-22 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-08-01 — Merge pull request #34 from TheAxiomFoundation/docs/md-audit-rulespec-gh | 1 | gh-rulespec-2026-07-12 | f4b952b7ba83d8382d0074b64b27ba6ea9a7637b | failure |
+| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-08-01 — Merge pull request #34 from TheAxiomFoundation/docs/md-audit-rulespec-gh | 3 | gh-rulespec-2026-07-12 | f4b952b7ba83d8382d0074b64b27ba6ea9a7637b | failure |
 | [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 3 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 
 <!-- curated:start -->
