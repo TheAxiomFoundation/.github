@@ -7,6 +7,7 @@ import json
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 from pathlib import Path
@@ -98,7 +99,7 @@ def test_pending_waiver_requires_exact_digest_only_toolchain_companion() -> None
         def run() -> subprocess.CompletedProcess[str]:
             return subprocess.run(
                 [
-                    "python",
+                    sys.executable,
                     "-c",
                     waiver_ratchet_source(),
                     *(str(path) for path in paths.values()),
@@ -186,7 +187,7 @@ def test_release_pin_companion_requires_strict_retirement() -> None:
                     + (extra if index == 1 else "")
                 )
             return subprocess.run(
-                ["python", "-c", waiver_ratchet_source(), *map(str, paths)],
+                [sys.executable, "-c", waiver_ratchet_source(), *map(str, paths)],
                 capture_output=True, text=True,
             )
 
@@ -259,7 +260,7 @@ def run_release_repin(
         changed_path.write_text(changed)
         result = subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-c",
                 waiver_ratchet_source(),
                 *map(
@@ -490,33 +491,49 @@ def test_validation_jobs_are_bounded_in_time_and_parallelism() -> None:
 
     runner_default_minutes = 360
     org_concurrent_jobs = 60
-    workflow = yaml.safe_load(WORKFLOW.read_text())
-    for name, job in workflow["jobs"].items():
-        timeout = job.get("timeout-minutes")
-        assert type(timeout) is int, f"{name} needs an integer timeout-minutes"
-        assert 0 < timeout < runner_default_minutes, (name, timeout)
-
+    # Minutes a leg spends before a long step starts (checkouts, toolchains,
+    # engine build).
+    setup_allowance_minutes = 20
     legacy = WORKFLOW.with_name("validate-rulespec-legacy-pending-safe.yml")
     for path in (WORKFLOW, legacy):
-        validate = yaml.safe_load(path.read_text())["jobs"]["validate"]
+        jobs = yaml.safe_load(path.read_text())["jobs"]
+        for name, job in jobs.items():
+            timeout = job.get("timeout-minutes")
+            assert type(timeout) is int, f"{path.name}:{name} needs timeout-minutes"
+            assert 0 < timeout < runner_default_minutes, (path.name, name, timeout)
+
+        validate = jobs["validate"]
         strategy = validate["strategy"]
         assert validate["timeout-minutes"] == 180, path.name
         assert strategy["fail-fast"] is False, path.name
-        # Two concurrent runs of one repo must leave hosted runners for
+        assert strategy["max-parallel"] == 20, path.name
+        # Two concurrent runs of one repository must leave hosted runners for
         # every other repository in the org.
-        assert type(strategy["max-parallel"]) is int, path.name
-        assert 0 < 2 * strategy["max-parallel"] < org_concurrent_jobs, path.name
+        assert 2 * strategy["max-parallel"] < org_concurrent_jobs, path.name
 
-    validate = workflow["jobs"]["validate"]
+        step_limits = {
+            step["name"]: step["timeout-minutes"]
+            for step in validate["steps"]
+            if "timeout-minutes" in step
+        }
+        assert step_limits["Validate RuleSpec YAML"] == 120, path.name
+        assert step_limits["Execute RuleSpec companion tests"] == 60, path.name
+        for name, limit in step_limits.items():
+            assert type(limit) is int, (path.name, name)
+            assert 0 < limit + setup_allowance_minutes <= validate["timeout-minutes"], (
+                path.name,
+                name,
+                limit,
+            )
+
+    validate = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]
     ratchet = [
         step
         for step in validate["steps"]
         if step.get("name") == "Enforce validation waiver ratchet"
     ]
     assert len(ratchet) == 1
-    step_timeout = ratchet[0].get("timeout-minutes")
-    assert type(step_timeout) is int
-    assert 0 < step_timeout < validate["timeout-minutes"]
+    assert ratchet[0]["timeout-minutes"] == 150
 
 
 def test_parallel_validation_workers_are_bounded_and_fail_closed() -> None:
@@ -604,7 +621,7 @@ def run_authorization(
         "GITHUB_SHA": github_sha or pr_head,
     }
     return subprocess.run(
-        ["python", "-c", authorization_source()],
+        [sys.executable, "-c", authorization_source()],
         cwd=root,
         env=env,
         capture_output=True,

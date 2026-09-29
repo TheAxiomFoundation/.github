@@ -142,14 +142,17 @@ path_rules:
 
 ### Run bounds
 
-Each `validate` matrix leg stops after 180 minutes, and the "Enforce
-validation waiver ratchet" step stops after 150. One run starts at most 20
-legs at a time. The org plan allows 60 concurrent hosted jobs, so two runs
-of one repository still leave runners for the rest of the org. A leg that
-reaches a limit fails with a timeout. Treat that as a hang to fix, not a
-limit to raise: green rulespec-us legs took at most 153 minutes in
-September 2026. A caller gets these bounds only when it moves its pin to a
-workflow commit that has them.
+Each `validate` matrix leg stops after 180 minutes. Within a leg, "Validate
+RuleSpec YAML" stops after 120 minutes, "Enforce validation waiver ratchet"
+after 150, and "Execute RuleSpec companion tests" after 60. One run starts
+at most 20 legs at a time. The org plan allows 60 concurrent hosted jobs, so
+two runs of one repository still leave runners for the rest of the org.
+
+A leg that reaches a limit is stopped, and the aggregate `validate` check
+fails. Treat that as a hang to fix, not a limit to raise. In September 2026,
+green rulespec-us legs took at most 153 minutes; those steps took at most
+76, 124, and 33 minutes. A caller gets these bounds only when it moves its
+pin to a workflow commit that has them.
 
 ## Links
 
