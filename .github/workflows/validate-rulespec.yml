@@ -144,6 +144,8 @@ jobs:
   shards:
     name: shards
     runs-on: ubuntu-latest
+    # Observed 7-9 s. The runner default is 360 minutes.
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.compute.outputs.matrix }}
       first: ${{ steps.compute.outputs.first }}
@@ -710,8 +712,17 @@ jobs:
     name: validate
     needs: shards
     runs-on: ubuntu-latest
+    # Hosted runners default to 360 minutes. From 2026-09-12 to 09-29,
+    # 1,298 green rulespec-us legs took p50 23, p99 131, max 153 minutes.
+    # A hung leg must not hold its runner for six hours: rulespec-us#1431
+    # held 52 runners for 3.5-6 hours in three runs and starved the org.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
+      # The org plan runs at most 60 hosted jobs at once, and rulespec-us
+      # fans out 52 legs (rulespec-uk 101). Cap one run at a third of the
+      # pool so two concurrent runs still leave room for every other repo.
+      max-parallel: 20
       matrix:
         shard: ${{ fromJSON(needs.shards.outputs.matrix) }}
 
@@ -1777,6 +1788,9 @@ jobs:
 
       - name: Enforce validation waiver ratchet
         shell: bash
+        # Green rulespec-us legs, September 2026: p50 13, at most 125
+        # minutes. Fail here, naming the step, before the job limit.
+        timeout-minutes: 150
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
           # The matrix already partitions the audit across 52 runners. Avoid
@@ -2291,6 +2305,8 @@ jobs:
 
       - name: Validate RuleSpec YAML
         shell: bash
+        # Green rulespec-us legs, September 2026: at most 85 minutes.
+        timeout-minutes: 120
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
@@ -2414,6 +2430,8 @@ jobs:
 
       - name: Execute RuleSpec companion tests
         shell: bash
+        # Green rulespec-us legs, September 2026: at most 33 minutes.
+        timeout-minutes: 60
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
@@ -2742,6 +2760,7 @@ jobs:
     needs: validate
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check validation matrix result
         shell: bash
