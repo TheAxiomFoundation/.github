@@ -1788,8 +1788,8 @@ jobs:
 
       - name: Enforce validation waiver ratchet
         shell: bash
-        # Observed p50 13, max 124 minutes on green rulespec-us legs. Fail
-        # here, naming the step, before the 180-minute job limit cancels it.
+        # Green rulespec-us legs, September 2026: p50 13, at most 125
+        # minutes. Fail here, naming the step, before the job limit.
         timeout-minutes: 150
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
@@ -2305,7 +2305,7 @@ jobs:
 
       - name: Validate RuleSpec YAML
         shell: bash
-        # Observed max 76 minutes on green rulespec-us legs.
+        # Green rulespec-us legs, September 2026: at most 85 minutes.
         timeout-minutes: 120
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
@@ -2430,7 +2430,7 @@ jobs:
 
       - name: Execute RuleSpec companion tests
         shell: bash
-        # Observed max 33 minutes on green rulespec-us legs.
+        # Green rulespec-us legs, September 2026: at most 33 minutes.
         timeout-minutes: 60
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}

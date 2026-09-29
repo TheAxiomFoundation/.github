@@ -1396,7 +1396,7 @@ jobs:
 
       - name: Validate RuleSpec YAML
         shell: bash
-        # Observed max 76 minutes on green rulespec-us legs.
+        # Same limit as validate-rulespec.yml.
         timeout-minutes: 120
         env:
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
@@ -2339,7 +2339,7 @@ jobs:
 
       - name: Execute RuleSpec companion tests
         shell: bash
-        # Observed max 33 minutes on green rulespec-us legs.
+        # Same limit as validate-rulespec.yml.
         timeout-minutes: 60
         env:
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}

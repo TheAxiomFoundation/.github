@@ -151,7 +151,7 @@ two runs of one repository still leave runners for the rest of the org.
 A leg that reaches a limit is stopped, and the aggregate `validate` check
 fails. Treat that as a hang to fix, not a limit to raise. In September 2026,
 green rulespec-us legs took at most 153 minutes; those steps took at most
-76, 124, and 33 minutes. A caller gets these bounds only when it moves its
+85, 125, and 33 minutes. A caller gets these bounds only when it moves its
 pin to a workflow commit that has them.
 
 ## Links
