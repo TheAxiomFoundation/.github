@@ -647,8 +647,13 @@ jobs:
     name: validate
     needs: [shards, waiver-change-guard]
     runs-on: ubuntu-latest
+    # Same bounds as validate-rulespec.yml: a hung leg must not hold a
+    # runner for the 360-minute default, and one run must not take most of
+    # the org's 60 concurrent hosted jobs.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
         shard: ${{ fromJSON(needs.shards.outputs.matrix) }}
 

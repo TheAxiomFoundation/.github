@@ -485,6 +485,40 @@ def test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix() -> 
     assert 'AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: "1"' in audit_step
 
 
+def test_validation_jobs_are_bounded_in_time_and_parallelism() -> None:
+    import yaml
+
+    runner_default_minutes = 360
+    org_concurrent_jobs = 60
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    for name, job in workflow["jobs"].items():
+        timeout = job.get("timeout-minutes")
+        assert type(timeout) is int, f"{name} needs an integer timeout-minutes"
+        assert 0 < timeout < runner_default_minutes, (name, timeout)
+
+    legacy = WORKFLOW.with_name("validate-rulespec-legacy-pending-safe.yml")
+    for path in (WORKFLOW, legacy):
+        validate = yaml.safe_load(path.read_text())["jobs"]["validate"]
+        strategy = validate["strategy"]
+        assert validate["timeout-minutes"] == 180, path.name
+        assert strategy["fail-fast"] is False, path.name
+        # Two concurrent runs of one repo must leave hosted runners for
+        # every other repository in the org.
+        assert type(strategy["max-parallel"]) is int, path.name
+        assert 0 < 2 * strategy["max-parallel"] < org_concurrent_jobs, path.name
+
+    validate = workflow["jobs"]["validate"]
+    ratchet = [
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Enforce validation waiver ratchet"
+    ]
+    assert len(ratchet) == 1
+    step_timeout = ratchet[0].get("timeout-minutes")
+    assert type(step_timeout) is int
+    assert 0 < step_timeout < validate["timeout-minutes"]
+
+
 def test_parallel_validation_workers_are_bounded_and_fail_closed() -> None:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Validate RuleSpec YAML")
@@ -626,6 +660,10 @@ def main() -> None:
     test_release_pin_companion_accepts_exact_staged_consumption()
     test_generated_guard_resolves_scheduled_base_to_exact_commit()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
+    test_validation_jobs_are_bounded_in_time_and_parallelism()
+    test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix()
+    test_retired_schema_freeze_classifies_only_plural_citations()
+    test_retired_schema_prefreeze_bridge_is_fail_closed()
     test_pending_waiver_requires_exact_digest_only_toolchain_companion()
     test_waiver_bootstrap_uses_authenticated_head_toolchain()
     temp, root, base, topic = fixture()
