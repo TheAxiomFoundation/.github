@@ -2068,6 +2068,7 @@ jobs:
             --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
             --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
             -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" \
+            --json \
             --root "$GITHUB_WORKSPACE" \
             --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
             --protected-base "$protected_base" \
