@@ -483,7 +483,11 @@ def test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix() -> 
     assert "matrix.shard == needs.shards.outputs.first" not in audit_step
     assert '--partition-key "${{ matrix.shard }}"' in audit_step
     assert "--partition-keys-json '${{ needs.shards.outputs.matrix }}'" in audit_step
-    assert 'AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: "1"' in audit_step
+    assert (
+        "AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: "
+        "${{ github.repository == 'TheAxiomFoundation/rulespec-us' "
+        "&& matrix.shard == 'us-wa' && '2' || '1' }}"
+    ) in audit_step
 
 
 def test_validation_jobs_are_bounded_in_time_and_parallelism() -> None:

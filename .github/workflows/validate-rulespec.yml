@@ -1793,10 +1793,13 @@ jobs:
         timeout-minutes: 150
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
-          # The matrix already partitions the audit across 52 runners. Avoid
-          # nested process fan-out, which overloads engine subprocesses and
-          # can make otherwise stable fingerprints disagree under load.
-          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: "1"
+          # The matrix already partitions the audit across 52 runners, so
+          # keep each leg serial except us-wa. Its two adjacent expensive
+          # tariff chapters exceeded the unchanged 150-minute step limit in
+          # rulespec-us#1431 run 36741794354. Two interleaved encoder workers
+          # separate their first-pass work; all discrepancies still receive
+          # the encoder's isolated serial recheck before any accusation.
+          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: ${{ github.repository == 'TheAxiomFoundation/rulespec-us' && matrix.shard == 'us-wa' && '2' || '1' }}
           BOOTSTRAP_SHA256: ${{ inputs.validation-waiver-bootstrap-sha256 }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
