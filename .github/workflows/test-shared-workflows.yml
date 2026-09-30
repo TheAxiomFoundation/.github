@@ -7,6 +7,7 @@ on:
       - "scripts/test_legacy_oracle_coverage_workflow.py"
       - "scripts/test_validate_rulespec_workflow.py"
       - "scripts/test_composer_verification_workflow.py"
+      - "scripts/test_changed_oracle_coverage_workflow.py"
   push:
     branches: [main]
     paths:
@@ -14,6 +15,7 @@ on:
       - "scripts/test_legacy_oracle_coverage_workflow.py"
       - "scripts/test_validate_rulespec_workflow.py"
       - "scripts/test_composer_verification_workflow.py"
+      - "scripts/test_changed_oracle_coverage_workflow.py"
 
 permissions:
   contents: read
@@ -27,10 +29,12 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install workflow test dependencies
-        run: python -m pip install --disable-pip-version-check pyyaml==6.0.3
+        run: python -m pip install --disable-pip-version-check pyyaml==6.0.3 hypothesis==6.168.3
       - name: Test validation-waiver bootstrap authorization
         run: python scripts/test_validate_rulespec_workflow.py
       - name: Test legacy oracle coverage overlay
         run: python scripts/test_legacy_oracle_coverage_workflow.py
       - name: Test protected composer verification
         run: python scripts/test_composer_verification_workflow.py
+      - name: Test changed-file oracle coverage gate
+        run: python scripts/test_changed_oracle_coverage_workflow.py

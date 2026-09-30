@@ -2702,27 +2702,104 @@ jobs:
           import json
           import os
           import sys
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
+
+          import yaml
+
+          # Mirrors the classifier's executable-output test (axiom-oracles
+          # bridges/coverage.py: EXECUTABLE_RULE_KINDS, _load_rulespec_payload).
+          EXECUTABLE_RULE_KINDS = {"parameter", "derived", "derived_relation"}
 
           coverage_path = Path(sys.argv[1])
           rulespec_file_list = Path(sys.argv[2])
-          repo = Path(os.environ["GITHUB_WORKSPACE"]).name
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          repo = workspace.name
           if repo.startswith("rulespec-be"):
               print(
                   "Changed PolicyEngine oracle coverage skipped for Belgium; "
                   "rulespec-be uses the EUROMOD household-level oracle surface."
               )
               raise SystemExit
-          changed = {
-              f"{repo}/{line.strip()}"
-              for line in rulespec_file_list.read_text().splitlines()
-              if line.strip()
-          }
+
+
+          def fail(lines: list[str]) -> None:
+              print("Changed PolicyEngine oracle coverage is incomplete.", file=sys.stderr)
+              for line in lines[:50]:
+                  print(f"- {line}", file=sys.stderr)
+              if len(lines) > 50:
+                  print(f"- ... {len(lines) - 50} more", file=sys.stderr)
+              sys.exit(1)
+
+
           payload = json.loads(coverage_path.read_text())
-          items = [
-              item for item in payload.get("items", [])
-              if item.get("file") in changed
-          ]
+          report_root = payload.get("root")
+          if not isinstance(report_root, str) or not report_root:
+              fail(["coverage report has no root; cannot map items to changed files"])
+          # Item paths are relative to the classifier's --root: repo-relative
+          # when that root is this checkout, "<repo>/..." when it is the parent
+          # workspace (the nested rulespec-us/rulespec-us layout). Anchor on the
+          # root the report states instead of assuming one layout.
+          try:
+              prefix = workspace.relative_to(Path(report_root).resolve()).parts
+          except ValueError:
+              fail([f"coverage report root {report_root} does not contain {workspace}"])
+
+
+          def workspace_path(value: object) -> str | None:
+              if not isinstance(value, str) or not value:
+                  return None
+              parts = PurePosixPath(value).parts
+              if parts[: len(prefix)] != prefix or len(parts) == len(prefix):
+                  return None
+              return PurePosixPath(*parts[len(prefix) :]).as_posix()
+
+
+          def executable_outputs(path: str) -> int:
+              try:
+                  module = yaml.safe_load((workspace / path).read_text(encoding="utf-8")) or {}
+              except (OSError, UnicodeError, yaml.YAMLError) as error:
+                  fail([f"{path}: cannot read changed RuleSpec file: {error}"])
+              if not isinstance(module, dict) or module.get("format") != "rulespec/v1":
+                  return 0
+              rules = module.get("rules")
+              if not isinstance(rules, list):
+                  return 0
+              return sum(
+                  1
+                  for rule in rules
+                  if isinstance(rule, dict)
+                  and str(rule.get("kind") or "").strip() in EXECUTABLE_RULE_KINDS
+                  and str(rule.get("name") or "").strip()
+              )
+
+
+          changed = sorted(
+              {
+                  PurePosixPath(line.strip()).as_posix()
+                  for line in rulespec_file_list.read_text().splitlines()
+                  if line.strip()
+              }
+          )
+          items_by_file: dict[str, list[dict]] = {path: [] for path in changed}
+          for item in payload.get("items", []):
+              path = workspace_path(item.get("file"))
+              if path in items_by_file:
+                  items_by_file[path].append(item)
+
+          # A changed module that defines executable outputs but matched no
+          # report item means the gate cannot see it; never pass vacuously.
+          unmatched = []
+          for path in changed:
+              expected = executable_outputs(path)
+              if expected and not items_by_file[path]:
+                  unmatched.append(
+                      f"{path}: defines {expected} executable output(s) but matched "
+                      f"no oracle coverage item (report root {report_root})"
+                  )
+          if unmatched:
+              fail(unmatched)
+
+          items = [item for path in changed for item in items_by_file[path]]
           failures = []
           for item in items:
               legal_id = item.get("legal_id")
@@ -2732,14 +2809,12 @@ jobs:
                   failures.append(f"{legal_id}: comparable but not covered by companion tests")
 
           if failures:
-              print("Changed PolicyEngine oracle coverage is incomplete.", file=sys.stderr)
-              for failure in failures[:50]:
-                  print(f"- {failure}", file=sys.stderr)
-              if len(failures) > 50:
-                  print(f"- ... {len(failures) - 50} more", file=sys.stderr)
-              sys.exit(1)
+              fail(failures)
 
-          print(f"Changed PolicyEngine oracle coverage passed for {len(items)} output(s).")
+          print(
+              f"Changed PolicyEngine oracle coverage passed for {len(items)} output(s) "
+              f"in {len(changed)} changed RuleSpec file(s)."
+          )
           PY
 
       # Repository-controlled tests run only after every trusted validation
