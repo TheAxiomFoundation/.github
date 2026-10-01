@@ -95,6 +95,7 @@ jobs:
   shards:
     name: shards
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.compute.outputs.matrix }}
       first: ${{ steps.compute.outputs.first }}
@@ -303,6 +304,7 @@ jobs:
     name: waiver-change-guard
     needs: shards
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout rules repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -494,6 +496,7 @@ jobs:
     name: generated-guard
     needs: [shards, waiver-change-guard]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout rules repository
         if: ${{ inputs.run-generated-guard }}
@@ -647,8 +650,13 @@ jobs:
     name: validate
     needs: [shards, waiver-change-guard]
     runs-on: ubuntu-latest
+    # Same bounds as validate-rulespec.yml: a hung leg must not hold a
+    # runner for the 360-minute default, and one run must not take most of
+    # the org's 60 concurrent hosted jobs.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
         shard: ${{ fromJSON(needs.shards.outputs.matrix) }}
 
@@ -1388,6 +1396,8 @@ jobs:
 
       - name: Validate RuleSpec YAML
         shell: bash
+        # Same limit as validate-rulespec.yml.
+        timeout-minutes: 120
         env:
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           GH_TOKEN: ${{ github.token }}
@@ -2329,6 +2339,8 @@ jobs:
 
       - name: Execute RuleSpec companion tests
         shell: bash
+        # Same limit as validate-rulespec.yml.
+        timeout-minutes: 60
         env:
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ github.workspace }}/_axiom/rulespec-us
@@ -2724,6 +2736,7 @@ jobs:
     needs: [generated-guard, waiver-change-guard, validate]
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check validation matrix result
         shell: bash

@@ -12,6 +12,11 @@ on:
         description: Full commit SHA for TheAxiomFoundation/axiom-encode.
         required: true
         type: string
+      axiom-compose-ref:
+        description: Optional exact composer commit; requires a composer-aware encoder and matching workflow toolchain pin.
+        required: false
+        type: string
+        default: ""
       axiom-rules-engine-ref:
         description: Full commit SHA for TheAxiomFoundation/axiom-rules-engine.
         required: true
@@ -137,6 +142,8 @@ jobs:
   shards:
     name: shards
     runs-on: ubuntu-latest
+    # Observed 7-9 s. The runner default is 360 minutes.
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.compute.outputs.matrix }}
       first: ${{ steps.compute.outputs.first }}
@@ -660,8 +667,17 @@ jobs:
     name: validate
     needs: shards
     runs-on: ubuntu-latest
+    # Hosted runners default to 360 minutes. From 2026-09-12 to 09-29,
+    # 1,298 green rulespec-us legs took p50 23, p99 131, max 153 minutes.
+    # A hung leg must not hold its runner for six hours: rulespec-us#1431
+    # held 52 runners for 3.5-6 hours in three runs and starved the org.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
+      # The org plan runs at most 60 hosted jobs at once, and rulespec-us
+      # fans out 52 legs (rulespec-uk 101). Cap one run at a third of the
+      # pool so two concurrent runs still leave room for every other repo.
+      max-parallel: 20
       matrix:
         shard: ${{ fromJSON(needs.shards.outputs.matrix) }}
 
@@ -1069,6 +1085,60 @@ jobs:
           verify_ancestor _axiom/axiom-corpus "$AXIOM_CORPUS_SHA"
           verify_ancestor _axiom/rulespec-us "$RULESPEC_US_SHA"
 
+      - name: Validate composer pin
+        if: ${{ inputs.axiom-compose-ref != '' }}
+        env:
+          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+        run: |
+          set -euo pipefail
+          # composer-pin-validation-start
+          python - <<'PYCOMPOSE'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          ref = os.environ["AXIOM_COMPOSE_REF"]
+          if re.fullmatch(r"[0-9a-f]{40}", ref) is None:
+              raise SystemExit("axiom-compose-ref must be a full lowercase commit SHA")
+          path = Path(".axiom/workflow-toolchain.toml")
+          if path.is_symlink() or not path.is_file() or path.parent.is_symlink():
+              raise SystemExit("a regular workflow-toolchain.toml is required for composer")
+          config = tomllib.loads(path.read_text()).get("workflow_toolchain", {})
+          if not isinstance(config, dict) or config.get("axiom_compose_ref") != ref:
+              raise SystemExit("composer input must match workflow-toolchain.toml")
+          PYCOMPOSE
+          # composer-pin-validation-end
+
+      - name: Checkout axiom-compose
+        if: ${{ inputs.axiom-compose-ref != '' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: TheAxiomFoundation/axiom-compose
+          ref: ${{ inputs.axiom-compose-ref }}
+          path: _axiom/axiom-compose
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Authenticate composer commit
+        if: ${{ inputs.axiom-compose-ref != '' }}
+        env:
+          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+        run: |
+          set -euo pipefail
+          repo=_axiom/axiom-compose
+          test "$(git -C "$repo" rev-parse HEAD)" = "$AXIOM_COMPOSE_REF"
+          test -z "$(git -C "$repo" status --porcelain)"
+          test "$(git -C "$repo" remote get-url origin)" = "https://github.com/TheAxiomFoundation/axiom-compose"
+          git -C "$repo" fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git -C "$repo" merge-base --is-ancestor "$AXIOM_COMPOSE_REF" refs/remotes/origin/main
+
+      - name: Install uv for composer runtime
+        if: ${{ inputs.axiom-compose-ref != '' }}
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.7"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
 
@@ -1442,6 +1512,36 @@ jobs:
           sudo chown root:root /opt
           sudo chmod go-w /opt
 
+      - name: Build protected axiom-compose runtime
+        if: ${{ inputs.axiom-compose-ref != '' }}
+        env:
+          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+        run: |
+          set -euo pipefail
+          uv python install 3.14
+          uv venv --python 3.14 "$RUNNER_TEMP/axiom-compose-build"
+          uv export \
+            --project ./_axiom/axiom-compose \
+            --locked \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file "$RUNNER_TEMP/axiom-compose-requirements.txt"
+          uv pip install \
+            --python "$RUNNER_TEMP/axiom-compose-build/bin/python" \
+            --target "$RUNNER_TEMP/axiom-compose-site-packages" \
+            --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"
+          sudo rm -rf /opt/axiom-compose-verification
+          sudo "$RUNNER_TEMP/axiom-compose-build/bin/python" \
+            _axiom/axiom-encode/scripts/provision_axiom_compose_runtime.py \
+            --destination /opt/axiom-compose-verification \
+            --site-packages "$RUNNER_TEMP/axiom-compose-site-packages" \
+            --compose-checkout _axiom/axiom-compose \
+            --compose-ref "$AXIOM_COMPOSE_REF"
+          sudo chown -R 0:0 /opt/axiom-compose-verification
+          sudo chmod -R go-w /opt/axiom-compose-verification
+          /opt/axiom-compose-verification/axiom-compose --help > /dev/null
+
       - name: Build axiom-rules-engine
         working-directory: _axiom/axiom-rules-engine
         run: cargo build --verbose
@@ -1643,11 +1743,18 @@ jobs:
 
       - name: Enforce validation waiver ratchet
         shell: bash
+        # Green rulespec-us legs, September 2026: p50 13, at most 125
+        # minutes. Fail here, naming the step, before the job limit.
+        timeout-minutes: 150
         env:
-          # The matrix already partitions the audit across 52 runners. Avoid
-          # nested process fan-out, which overloads engine subprocesses and
-          # can make otherwise stable fingerprints disagree under load.
-          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: "1"
+          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          # The matrix already partitions the audit across 52 runners, so
+          # keep each leg serial except us-wa. Its two adjacent expensive
+          # tariff chapters exceeded the unchanged 150-minute step limit in
+          # rulespec-us#1431 run 36741794354. Two interleaved encoder workers
+          # separate their first-pass work; all discrepancies still receive
+          # the encoder's isolated serial recheck before any accusation.
+          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: ${{ github.repository == 'TheAxiomFoundation/rulespec-us' && matrix.shard == 'us-wa' && '2' || '1' }}
           BOOTSTRAP_SHA256: ${{ inputs.validation-waiver-bootstrap-sha256 }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -1908,12 +2015,18 @@ jobs:
           )
           PY
           # waiver-ratchet-python-end
+          composer_args=()
+          if [ -n "$AXIOM_COMPOSE_REF" ]; then
+            test -x /opt/axiom-compose-verification/axiom-compose
+            composer_args=(--axiom-compose-path /opt/axiom-compose-verification/axiom-compose)
+          fi
           /opt/axiom-verification/axiom-encode-signing-supervisor \
             --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
             --trusted-python-runtime-root /opt/axiom-verification/python \
             --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
             --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
-            -- /opt/axiom-verification/axiom-encode validation-waivers audit \
+            -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" \
+            --json \
             --root "$GITHUB_WORKSPACE" \
             --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
             --protected-base "$protected_base" \
@@ -2177,7 +2290,10 @@ jobs:
 
       - name: Validate RuleSpec YAML
         shell: bash
+        # Green rulespec-us legs, September 2026: at most 85 minutes.
+        timeout-minutes: 120
         env:
+          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           VALIDATION_WORKERS: ${{ inputs.validation-workers }}
           AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ github.workspace }}/_axiom/rulespec-us
@@ -2238,6 +2354,11 @@ jobs:
             worker_count="${#selected[@]}"
           fi
 
+          composer_args=()
+          if [ -n "$AXIOM_COMPOSE_REF" ]; then
+            test -x /opt/axiom-compose-verification/axiom-compose
+            composer_args=(--axiom-compose-path /opt/axiom-compose-verification/axiom-compose)
+          fi
           run_validation() {
             local log_path="$1"
             shift
@@ -2247,7 +2368,7 @@ jobs:
               --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
               --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
               -- /opt/axiom-verification/axiom-encode validate "$@" \
-              --skip-reviewers \
+              --skip-reviewers "${composer_args[@]}" \
               --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
               --axiom-rules-engine-path "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine" \
               > "$log_path" 2>&1
@@ -2294,7 +2415,10 @@ jobs:
 
       - name: Execute RuleSpec companion tests
         shell: bash
+        # Green rulespec-us legs, September 2026: at most 33 minutes.
+        timeout-minutes: 60
         env:
+          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ github.workspace }}/_axiom/rulespec-us
         run: |
@@ -2336,9 +2460,14 @@ jobs:
             # jurisdiction prefix or they double up (<root>/dk/dk/...).
             by_root[$jurisdiction]+="${test_file#"$jurisdiction"/}"$'\n'
           done
+          composer_args=()
+          if [ -n "$AXIOM_COMPOSE_REF" ]; then
+            test -x /opt/axiom-compose-verification/axiom-compose
+            composer_args=(--axiom-compose-path /opt/axiom-compose-verification/axiom-compose)
+          fi
           for jurisdiction in "${!by_root[@]}"; do
             mapfile -t group <<< "${by_root[$jurisdiction]%$'\n'}"
-            axiom-encode test \
+            axiom-encode test "${composer_args[@]}" \
               --root "$GITHUB_WORKSPACE/$jurisdiction" \
               --axiom-rules-engine-path "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine" \
               "${group[@]}"
@@ -2616,6 +2745,7 @@ jobs:
     needs: validate
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check validation matrix result
         shell: bash
