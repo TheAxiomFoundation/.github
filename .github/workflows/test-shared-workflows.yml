@@ -7,6 +7,7 @@ on:
       - "scripts/test_legacy_oracle_coverage_workflow.py"
       - "scripts/test_validate_rulespec_workflow.py"
       - "scripts/test_composer_verification_workflow.py"
+      - "scripts/test_external_dependency_layout.py"
   push:
     branches: [main]
     paths:
@@ -14,6 +15,7 @@ on:
       - "scripts/test_legacy_oracle_coverage_workflow.py"
       - "scripts/test_validate_rulespec_workflow.py"
       - "scripts/test_composer_verification_workflow.py"
+      - "scripts/test_external_dependency_layout.py"
 
 permissions:
   contents: read
@@ -34,3 +36,5 @@ jobs:
         run: python scripts/test_legacy_oracle_coverage_workflow.py
       - name: Test protected composer verification
         run: python scripts/test_composer_verification_workflow.py
+      - name: Test external dependency layout
+        run: python scripts/test_external_dependency_layout.py
