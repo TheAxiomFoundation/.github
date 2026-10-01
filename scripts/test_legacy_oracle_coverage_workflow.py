@@ -51,6 +51,7 @@ def run_dependency_parser(source: str, dependency: str) -> subprocess.CompletedP
         return subprocess.run(
             [sys.executable, "-c", source],
             cwd=root,
+            env={**os.environ, "AXIOM_DEPENDENCY_ROOT": str(root / "_axiom")},
             capture_output=True,
             text=True,
         )

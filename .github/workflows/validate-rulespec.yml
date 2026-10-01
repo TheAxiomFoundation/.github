@@ -1072,37 +1072,106 @@ jobs:
             esac
           fi
 
+      - name: Reserve isolated dependency directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          # checkout requires a workspace child; use an exclusively created
+          # staging directory, never a caller-owned path such as _axiom.
+          stage="$(mktemp -d "$GITHUB_WORKSPACE/.axiom-dependency-stage.XXXXXXXX")"
+          tools="$(mktemp -d "$RUNNER_TEMP/axiom-dependencies.XXXXXXXX")"
+          export stage tools
+          python - <<'PYLAYOUT'
+          import os
+          from pathlib import Path
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
+          external = Path(os.environ["tools"]).resolve(strict=True)
+          if external == workspace or workspace in external.parents:
+              raise SystemExit("dependency directory must be outside the RuleSpec checkout")
+          PYLAYOUT
+          chmod 755 "$tools"
+          printf 'AXIOM_DEPENDENCY_STAGE=%s\n' "${stage#"$GITHUB_WORKSPACE/"}" >> "$GITHUB_ENV"
+          printf 'AXIOM_DEPENDENCY_ROOT=%s\n' "$tools" >> "$GITHUB_ENV"
+
       - name: Checkout axiom-encode
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-encode
           ref: ${{ inputs.axiom-encode-ref }}
-          path: _axiom/axiom-encode
+          path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-encode
           persist-credentials: false
+
+      - name: Relocate dependency axiom-encode
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE/axiom-encode"
+          destination="$AXIOM_DEPENDENCY_ROOT/axiom-encode"
+          test -d "$source"
+          test ! -L "$source"
+          test ! -e "$destination"
+          test ! -L "$destination"
+          mv "$source" "$destination"
 
       - name: Checkout axiom-rules-engine
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-rules-engine
           ref: ${{ inputs.axiom-rules-engine-ref }}
-          path: _axiom/axiom-rules-engine
+          path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-rules-engine
           persist-credentials: false
+
+      - name: Relocate dependency axiom-rules-engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE/axiom-rules-engine"
+          destination="$AXIOM_DEPENDENCY_ROOT/axiom-rules-engine"
+          test -d "$source"
+          test ! -L "$source"
+          test ! -e "$destination"
+          test ! -L "$destination"
+          mv "$source" "$destination"
 
       - name: Checkout axiom-corpus
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-corpus
           ref: ${{ inputs.axiom-corpus-ref }}
-          path: _axiom/axiom-corpus
+          path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-corpus
           persist-credentials: false
+
+      - name: Relocate dependency axiom-corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE/axiom-corpus"
+          destination="$AXIOM_DEPENDENCY_ROOT/axiom-corpus"
+          test -d "$source"
+          test ! -L "$source"
+          test ! -e "$destination"
+          test ! -L "$destination"
+          mv "$source" "$destination"
 
       - name: Checkout rulespec-us canonical targets
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/rulespec-us
           ref: ${{ inputs.rulespec-us-ref }}
-          path: _axiom/rulespec-us
+          path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/rulespec-us
           persist-credentials: false
+
+      - name: Relocate dependency rulespec-us
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE/rulespec-us"
+          destination="$AXIOM_DEPENDENCY_ROOT/rulespec-us"
+          test -d "$source"
+          test ! -L "$source"
+          test ! -e "$destination"
+          test ! -L "$destination"
+          mv "$source" "$destination"
 
       - name: Authenticate dependency commits
         shell: bash
@@ -1125,10 +1194,10 @@ jobs:
               echo "$repo SHA $expected is not an ancestor of protected default branch $default_branch" >&2; return 1;
             }
           }
-          verify_ancestor _axiom/axiom-encode "$AXIOM_ENCODE_SHA"
-          verify_ancestor _axiom/axiom-rules-engine "$AXIOM_RULES_ENGINE_SHA"
-          verify_ancestor _axiom/axiom-corpus "$AXIOM_CORPUS_SHA"
-          verify_ancestor _axiom/rulespec-us "$RULESPEC_US_SHA"
+          verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/axiom-encode" "$AXIOM_ENCODE_SHA"
+          verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine" "$AXIOM_RULES_ENGINE_SHA"
+          verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" "$AXIOM_CORPUS_SHA"
+          verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/rulespec-us" "$RULESPEC_US_SHA"
 
       - name: Validate composer pin
         if: ${{ inputs.axiom-compose-ref != '' }}
@@ -1161,9 +1230,22 @@ jobs:
         with:
           repository: TheAxiomFoundation/axiom-compose
           ref: ${{ inputs.axiom-compose-ref }}
-          path: _axiom/axiom-compose
+          path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-compose
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Relocate dependency axiom-compose
+        if: ${{ inputs.axiom-compose-ref != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE/axiom-compose"
+          destination="$AXIOM_DEPENDENCY_ROOT/axiom-compose"
+          test -d "$source"
+          test ! -L "$source"
+          test ! -e "$destination"
+          test ! -L "$destination"
+          mv "$source" "$destination"
 
       - name: Authenticate composer commit
         if: ${{ inputs.axiom-compose-ref != '' }}
@@ -1171,7 +1253,7 @@ jobs:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
         run: |
           set -euo pipefail
-          repo=_axiom/axiom-compose
+          repo="${AXIOM_DEPENDENCY_ROOT}/axiom-compose"
           test "$(git -C "$repo" rev-parse HEAD)" = "$AXIOM_COMPOSE_REF"
           test -z "$(git -C "$repo" status --porcelain)"
           test "$(git -C "$repo" remote get-url origin)" = "https://github.com/TheAxiomFoundation/axiom-compose"
@@ -1197,11 +1279,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pytest pyyaml
-          python -m pip install -e _axiom/axiom-encode
+          python -m pip install -e "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
           rm -rf "$RUNNER_TEMP/axiom-verification-site-packages"
           python -m pip install \
             --target "$RUNNER_TEMP/axiom-verification-site-packages" \
-            ./_axiom/axiom-encode
+            "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
 
       - name: Verify immutable retired-schema freeze
         shell: bash
@@ -1428,7 +1510,7 @@ jobs:
           RELEASE_CONTENT_SHA256: ${{ steps.toolchain.outputs.axiom_corpus_release_content_sha256 }}
         run: |
           set -euo pipefail
-          destination="$GITHUB_WORKSPACE/_axiom/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
+          destination="${AXIOM_DEPENDENCY_ROOT}/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
           mkdir -p "$(dirname "$destination")"
           if [ -n "$RELEASE_REGISTRY_URL" ]; then
             acquisition=registry
@@ -1496,7 +1578,7 @@ jobs:
           AXIOM_CORPUS_SHA: ${{ inputs.axiom-corpus-ref }}
         run: |
           set -euo pipefail
-          object="_axiom/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
+          object="${AXIOM_DEPENDENCY_ROOT}/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
           release_commit="$(python - "$object" <<'PY'
           import json
           import sys
@@ -1507,22 +1589,22 @@ jobs:
             echo "Signed release provenance is not a full lowercase commit SHA" >&2
             exit 1
           fi
-          default_branch="$(git -C _axiom/axiom-corpus ls-remote --symref origin HEAD | sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p')"
-          git -C _axiom/axiom-corpus fetch --no-tags origin \
+          default_branch="$(git -C "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" ls-remote --symref origin HEAD | sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p')"
+          git -C "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" fetch --no-tags origin \
             "+refs/heads/$default_branch:refs/remotes/origin/$default_branch"
-          git -C _axiom/axiom-corpus merge-base --is-ancestor \
+          git -C "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" merge-base --is-ancestor \
             "$release_commit" "refs/remotes/origin/$default_branch" || {
               echo "Signed release provenance $release_commit is not on the corpus default branch" >&2
               exit 1
             }
-          git -C _axiom/axiom-corpus merge-base --is-ancestor \
+          git -C "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" merge-base --is-ancestor \
             "$release_commit" "$AXIOM_CORPUS_SHA" || {
               echo "Corpus checkout $AXIOM_CORPUS_SHA predates signed release provenance $release_commit" >&2
               exit 1
             }
 
       - name: Provision protected verification supervisor
-        working-directory: _axiom/axiom-encode
+        working-directory: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-encode
         env:
           TRUST_APPLY_ROOT: ${{ vars.AXIOM_ENCODE_APPLY_SIGNING_PUBLIC_KEY }}
           TRUST_EVAL_ROOT: ${{ vars.AXIOM_ENCODE_EVAL_SIGNING_PUBLIC_KEY }}
@@ -1566,7 +1648,7 @@ jobs:
           uv python install 3.14
           uv venv --python 3.14 "$RUNNER_TEMP/axiom-compose-build"
           uv export \
-            --project ./_axiom/axiom-compose \
+            --project "${AXIOM_DEPENDENCY_ROOT}/axiom-compose" \
             --locked \
             --no-dev \
             --no-emit-project \
@@ -1578,30 +1660,30 @@ jobs:
             --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"
           sudo rm -rf /opt/axiom-compose-verification
           sudo "$RUNNER_TEMP/axiom-compose-build/bin/python" \
-            _axiom/axiom-encode/scripts/provision_axiom_compose_runtime.py \
+            "${AXIOM_DEPENDENCY_ROOT}/axiom-encode/scripts/provision_axiom_compose_runtime.py" \
             --destination /opt/axiom-compose-verification \
             --site-packages "$RUNNER_TEMP/axiom-compose-site-packages" \
-            --compose-checkout _axiom/axiom-compose \
+            --compose-checkout "${AXIOM_DEPENDENCY_ROOT}/axiom-compose" \
             --compose-ref "$AXIOM_COMPOSE_REF"
           sudo chown -R 0:0 /opt/axiom-compose-verification
           sudo chmod -R go-w /opt/axiom-compose-verification
           /opt/axiom-compose-verification/axiom-compose --help > /dev/null
 
       - name: Build axiom-rules-engine
-        working-directory: _axiom/axiom-rules-engine
+        working-directory: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-rules-engine
         run: cargo build --verbose
 
       - name: Expose axiom-rules-engine on PATH
-        run: echo "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine/target/debug" >> "$GITHUB_PATH"
+        run: echo "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine/target/debug" >> "$GITHUB_PATH"
 
       - name: Link axiom-rules-engine as sibling checkout
         shell: bash
         run: |
           set -euo pipefail
-          ln -sfn "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine" "$GITHUB_WORKSPACE/../axiom-rules-engine"
-          ln -sfn "$GITHUB_WORKSPACE/_axiom/axiom-corpus" "$GITHUB_WORKSPACE/../axiom-corpus"
+          ln -sfn "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine" "$GITHUB_WORKSPACE/../axiom-rules-engine"
+          ln -sfn "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" "$GITHUB_WORKSPACE/../axiom-corpus"
           if [ "$(basename "$GITHUB_WORKSPACE")" != "rulespec-us" ]; then
-            ln -sfn "$GITHUB_WORKSPACE/_axiom/rulespec-us" "$GITHUB_WORKSPACE/../rulespec-us"
+            ln -sfn "${AXIOM_DEPENDENCY_ROOT}/rulespec-us" "$GITHUB_WORKSPACE/../rulespec-us"
           fi
 
       - name: Reject obsolete generated files
@@ -2060,6 +2142,12 @@ jobs:
           )
           PY
           # waiver-ratchet-python-end
+          # Protected runtimes discard ambient root variables. Route the
+          # authenticated canonical checkout explicitly for foreign callers.
+          dependency_args=()
+          if [ -n "$AXIOM_COMPOSE_REF" ] && [ "$(basename "$GITHUB_WORKSPACE")" != "rulespec-us" ]; then
+            dependency_args=(--rulespec-dependency-root "$AXIOM_DEPENDENCY_ROOT/rulespec-us")
+          fi
           composer_args=()
           if [ -n "$AXIOM_COMPOSE_REF" ]; then
             test -x /opt/axiom-compose-verification/axiom-compose
@@ -2070,15 +2158,15 @@ jobs:
             --trusted-python-runtime-root /opt/axiom-verification/python \
             --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
             --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
-            -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" \
+            -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" "${dependency_args[@]}" \
             --json \
             --root "$GITHUB_WORKSPACE" \
-            --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
+            --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
             --protected-base "$protected_base" \
             --changed-paths "$audit_changed_paths" \
             --partition-key "${{ matrix.shard }}" \
             --partition-keys-json '${{ needs.shards.outputs.matrix }}' \
-            --axiom-rules-engine-path "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine"
+            --axiom-rules-engine-path "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine"
 
       - name: Reject manual RuleSpec changes
         if: ${{ inputs.run-generated-guard && matrix.shard == needs.shards.outputs.first }}
@@ -2113,8 +2201,8 @@ jobs:
             --repo "$GITHUB_WORKSPACE" \
             --base-ref "$base_ref" \
             --head-ref "$GITHUB_SHA" \
-            --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
-            --expected-encoder-checkout "$GITHUB_WORKSPACE/_axiom/axiom-encode"
+            --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
+            --expected-encoder-checkout "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
 
       - name: Select RuleSpec validation targets
         id: validation_targets
@@ -2315,9 +2403,9 @@ jobs:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           VALIDATION_WORKERS: ${{ inputs.validation-workers }}
-          AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ github.workspace }}/_axiom/rulespec-us
+          AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ env.AXIOM_DEPENDENCY_ROOT }}/rulespec-us
           AXIOM_CORPUS_ARTIFACT_ROOT: ${{ github.workspace }}/data/corpus
-          AXIOM_CORPUS_REPO: ${{ github.workspace }}/_axiom/axiom-corpus
+          AXIOM_CORPUS_REPO: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus
         run: |
           set -euo pipefail
 
@@ -2373,6 +2461,12 @@ jobs:
             worker_count="${#selected[@]}"
           fi
 
+          # Protected runtimes discard ambient root variables. Route the
+          # authenticated canonical checkout explicitly for foreign callers.
+          dependency_args=()
+          if [ -n "$AXIOM_COMPOSE_REF" ] && [ "$(basename "$GITHUB_WORKSPACE")" != "rulespec-us" ]; then
+            dependency_args=(--rulespec-dependency-root "$AXIOM_DEPENDENCY_ROOT/rulespec-us")
+          fi
           composer_args=()
           if [ -n "$AXIOM_COMPOSE_REF" ]; then
             test -x /opt/axiom-compose-verification/axiom-compose
@@ -2387,9 +2481,9 @@ jobs:
               --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
               --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
               -- /opt/axiom-verification/axiom-encode validate "$@" \
-              --skip-reviewers "${composer_args[@]}" \
-              --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
-              --axiom-rules-engine-path "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine" \
+              --skip-reviewers "${composer_args[@]}" "${dependency_args[@]}" \
+              --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
+              --axiom-rules-engine-path "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine" \
               > "$log_path" 2>&1
           }
 
@@ -2439,7 +2533,7 @@ jobs:
         env:
           AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
-          AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ github.workspace }}/_axiom/rulespec-us
+          AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ env.AXIOM_DEPENDENCY_ROOT }}/rulespec-us
         run: |
           set -euo pipefail
 
@@ -2479,6 +2573,12 @@ jobs:
             # jurisdiction prefix or they double up (<root>/dk/dk/...).
             by_root[$jurisdiction]+="${test_file#"$jurisdiction"/}"$'\n'
           done
+          # Protected runtimes discard ambient root variables. Route the
+          # authenticated canonical checkout explicitly for foreign callers.
+          dependency_args=()
+          if [ -n "$AXIOM_COMPOSE_REF" ] && [ "$(basename "$GITHUB_WORKSPACE")" != "rulespec-us" ]; then
+            dependency_args=(--rulespec-dependency-root "$AXIOM_DEPENDENCY_ROOT/rulespec-us")
+          fi
           composer_args=()
           if [ -n "$AXIOM_COMPOSE_REF" ]; then
             test -x /opt/axiom-compose-verification/axiom-compose
@@ -2486,9 +2586,9 @@ jobs:
           fi
           for jurisdiction in "${!by_root[@]}"; do
             mapfile -t group <<< "${by_root[$jurisdiction]%$'\n'}"
-            axiom-encode test "${composer_args[@]}" \
+            axiom-encode test "${composer_args[@]}" "${dependency_args[@]}" \
               --root "$GITHUB_WORKSPACE/$jurisdiction" \
-              --axiom-rules-engine-path "$GITHUB_WORKSPACE/_axiom/axiom-rules-engine" \
+              --axiom-rules-engine-path "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine" \
               "${group[@]}"
           done
 
@@ -2497,7 +2597,7 @@ jobs:
         env:
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           AXIOM_CORPUS_ARTIFACT_ROOT: ${{ github.workspace }}/data/corpus
-          AXIOM_CORPUS_REPO: ${{ github.workspace }}/_axiom/axiom-corpus
+          AXIOM_CORPUS_REPO: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus
         run: |
           set -euo pipefail
 
@@ -2557,7 +2657,7 @@ jobs:
             --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
             --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
             -- /opt/axiom-verification/axiom-encode proof-validate "${prefixed[@]}" \
-            --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus"
+            --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus"
 
       - name: Require money proof atoms
         # Scan the whole repository (not just changed files) on the first
@@ -2625,7 +2725,7 @@ jobs:
             -- /opt/axiom-verification/axiom-encode proof-validate \
             "${money_atom_files[@]}" \
             --money-atoms-only \
-            --corpus-path "$GITHUB_WORKSPACE/_axiom/axiom-corpus" \
+            --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
             "${ratchet_args[@]}"
 
       - name: Validate PolicyEngine oracle coverage classification
@@ -2645,15 +2745,28 @@ jobs:
         with:
           repository: TheAxiomFoundation/axiom-encode
           ref: ${{ inputs.axiom-encode-ref }}
-          path: _axiom/axiom-encode-oracle-coverage
+          path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-encode-oracle-coverage
           persist-credentials: false
+
+      - name: Relocate dependency axiom-encode-oracle-coverage
+        if: ${{ github.event_name == 'pull_request' && steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE/axiom-encode-oracle-coverage"
+          destination="$AXIOM_DEPENDENCY_ROOT/axiom-encode-oracle-coverage"
+          test -d "$source"
+          test ! -L "$source"
+          test ! -e "$destination"
+          test ! -L "$destination"
+          mv "$source" "$destination"
 
       - name: Install changed-file oracle coverage classifier
         if: ${{ github.event_name == 'pull_request' && steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -e _axiom/axiom-encode-oracle-coverage
+          python -m pip install -e "${AXIOM_DEPENDENCY_ROOT}/axiom-encode-oracle-coverage"
           # The changed-file classifier checkout may pin an axiom-oracles commit
           # step installed. axiom-oracles is a git dependency whose version string
           # does not change per commit, so pip treats the pinned SHA as "already
@@ -2665,8 +2778,9 @@ jobs:
             python - <<'PY'
           import pathlib
           import re
+          import os
 
-          text = pathlib.Path("_axiom/axiom-encode-oracle-coverage/pyproject.toml").read_text()
+          text = (pathlib.Path(os.environ["AXIOM_DEPENDENCY_ROOT"]) / "axiom-encode-oracle-coverage/pyproject.toml").read_text()
           match = re.search(
               r'"(axiom-oracles @ git\+https://github\.com/[^"]+)"', text
           )
