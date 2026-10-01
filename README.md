@@ -90,15 +90,20 @@ oracle coverage. New executable outputs must either have
 an exact PolicyEngine mapping or a harness-side `not_comparable` classification
 with a rationale.
 
-The guard also rejects a `backend: manual` apply manifest that introduces a
-*new* rule file unless it declares `manual_exception: composition | repair |
-fixtures | <issue-ref>`. Net-new statutory encoding must come from an encoder
-run; hand-authoring stays legal only for composition/oracle plumbing,
-validator-driven repairs, and fixtures, and only by declaring itself. Attest
-encoder output committed outside the `--apply` flow with `axiom-encode
-sign-applied-files` (add `--manual-exception` for new files, or `--all` to
-backfill a corpus that has no manifests). `axiom-encode manifest-census`
-reports each repo's encoder-generated / manual / unmanifested coverage.
+The generated-file guard is mandatory in this workflow revision. The retained
+`run-generated-guard` compatibility input must be true. A consumer present only
+in the PR head cannot opt into notary admission. A valid activated consumer on
+the protected base selects the encoder's `notary-guard`; an absent consumer
+selects mandatory `guard-generated`, while malformed consumers or unsupported
+encoder versions fail. This revision therefore requires an encoder containing
+`notary-guard` (the implementation is proposed in axiom-encode#1662).
+
+For activated lanes, authenticated exact-byte producer lineage, current enrolled
+writer eligibility and full chain verification replace legacy apply manifests.
+The independently required, source-App-bound notary admission check must also
+pass before merge. The workflow never enrolls a producer, signs an old draft,
+or grants admission based only on author/version. Adopt this workflow only in
+a dedicated reviewed lane rollout after v33 custody and NZ pilot prerequisites.
 
 Set `guard-programs-root: true` on the caller to require manifests on the
 composed-pilot `programs/` root too (default `false`). Enable it per repo only
