@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-01 — Merge pull request #1431 from TheAxiomFoundation/codex/snap-waiver-verification | 104 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-02 — Merge pull request #1470 from TheAxiomFoundation/axiom/signed-backfill-us-36924316695-1 | 104 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-01 — Merge pull request #408 from TheAxiomFoundation/pe-parity-uc-sch4-para10-young-person-bedroom | 72 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-09-27 — Merge pull request #120 from TheAxiomFoundation/verify/nz-super-waiver-exit-20260922 | 4 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#88) | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
