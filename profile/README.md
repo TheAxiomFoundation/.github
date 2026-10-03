@@ -93,10 +93,10 @@ US state rules moved into `rulespec-us`; the old per-state repos
 | [axiom-local](https://github.com/TheAxiomFoundation/axiom-local) | RuleSpec executing in your browser — no data leaves the page. |
 | [axiom-reg-demo](https://github.com/TheAxiomFoundation/axiom-reg-demo) | UK regulation computed in the browser on the wasm engine. |
 | [dashboard-builder](https://github.com/TheAxiomFoundation/dashboard-builder) | Wizard that composes benefit-rule dashboards from selected inputs and outputs. |
-| [axiom-demo-shell](https://github.com/TheAxiomFoundation/axiom-demo-shell) | Unified shell for the source, assistant, and builder demos. |
+| [axiom-demo-shell](https://github.com/TheAxiomFoundation/axiom-demo-shell) | Demo gallery, served at axiom.org/demos. |
 | [co-snap-cliffs](https://github.com/TheAxiomFoundation/co-snap-cliffs) | Colorado SNAP cliff explorer. |
 | [co-snap-workflow-checker](https://github.com/TheAxiomFoundation/co-snap-workflow-checker) | Colorado SNAP workflow checker. |
-| [finbot-snap-demo](https://github.com/TheAxiomFoundation/finbot-snap-demo) | Grounded-chat comparison on Colorado SNAP rules. |
+| [finbot-snap-demo](https://github.com/TheAxiomFoundation/finbot-snap-demo) | Chat demo at axiom.org/chatbot: an OpenAI model with tool access to the Axiom rules engine, for US benefit and tax estimates. |
 | [encodebench.org](https://github.com/TheAxiomFoundation/encodebench.org) | EncodeBench site: how well AI models encode law. |
 
 ## Archived repos
