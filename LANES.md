@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-03 — Advance validation engine for nested compositions (#1434) | 104 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-04 — Align validation encoder with reviewed 2087 producer (#1489) | 103 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | in_progress |
 | [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-03 — Merge pull request #35 from TheAxiomFoundation/chore/model-pins-2026-09-28 | 1 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-03 — Merge pull request #18 from TheAxiomFoundation/fix/oracle-coverage-pending-dir-1021 | 0 | et-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-01 — Merge pull request #408 from TheAxiomFoundation/pe-parity-uc-sch4-para10-young-person-bedroom | 72 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
