@@ -27,7 +27,8 @@ documents RuleSpec;
 [axiom-corpus](https://github.com/TheAxiomFoundation/axiom-corpus) holds the
 legal sources every encoding cites; and
 [axiom-encode](https://github.com/TheAxiomFoundation/axiom-encode) is the
-pipeline that turns sources into RuleSpec.
+AI-assisted pipeline that turns sources into RuleSpec; it also signs in files
+built by other means, such as the generated US tariff schedule.
 
 ## The pipeline
 
@@ -47,14 +48,15 @@ Sources in, executable programs out:
 | [axiom-mcp](https://github.com/TheAxiomFoundation/axiom-mcp) | MCP server so agents and assistants can query encoded rules. |
 | [axiom.org](https://github.com/TheAxiomFoundation/axiom.org) | The Axiom Foundation website and the Axiom App. |
 
-In September 2026, 20,780 of the 34,810 rules in rulespec-us had no comparison
-with another calculator or dataset
-([rule_verification_summary.json](https://github.com/TheAxiomFoundation/axiom-oracles/blob/main/dashboard/public/data/rule_verification_summary.json)).
-The other 14,030 sit in programs that at least one comparison covers, and a
-comparison of a program need not exercise every rule in it.
+In September 2026, our comparison register placed 14,030 of the 34,810 rules in
+rulespec-us in programs that at least one comparison with another calculator or
+dataset covers ([rule_verification_summary.json](https://github.com/TheAxiomFoundation/axiom-oracles/blob/d1e9d5ad859d16179eef732acc3b8efc1747214b/dashboard/public/data/rule_verification_summary.json)).
+A comparison of a program need not exercise every rule in it. The register
+counted the other 20,780 as uncompared; that figure runs high, because the
+register lags some published comparisons.
 
 Two of the calculators named above are tied to Axiom.
-Max Ghenis is CEO of both the Axiom Foundation and PolicyEngine,
+Max Ghenis is CEO of both the Axiom Foundation and PolicyEngine, the calculator we compare against most,
 and our TAXSIM runs use the TAXSIM executable that PolicyEngine packages.
 
 ## Encodings
