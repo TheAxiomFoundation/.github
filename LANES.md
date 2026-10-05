@@ -4,8 +4,8 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
+| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-04 — Merge pull request #38 from TheAxiomFoundation/southmod-licence-tripwire | 0 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-04 — Merge pull request #1427 from TheAxiomFoundation/ci/engine-root-load-check | 101 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
-| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-03 — Merge pull request #35 from TheAxiomFoundation/chore/model-pins-2026-09-28 | 2 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-03 — Merge pull request #18 from TheAxiomFoundation/fix/oracle-coverage-pending-dir-1021 | 0 | et-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-01 — Merge pull request #408 from TheAxiomFoundation/pe-parity-uc-sch4-para10-young-person-bedroom | 72 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-09-27 — Merge pull request #120 from TheAxiomFoundation/verify/nz-super-waiver-exit-20260922 | 4 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
