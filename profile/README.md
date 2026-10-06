@@ -27,8 +27,8 @@ documents RuleSpec;
 [axiom-corpus](https://github.com/TheAxiomFoundation/axiom-corpus) holds the
 legal sources every encoding cites; and
 [axiom-encode](https://github.com/TheAxiomFoundation/axiom-encode) is the
-pipeline that turns sources into RuleSpec under compile, proof, and oracle
-gates.
+AI-assisted pipeline that turns sources into RuleSpec; it also signs in files
+built by other means, such as the generated US tariff schedule.
 
 ## The pipeline
 
@@ -39,20 +39,29 @@ Sources in, executable programs out:
 | [axiom-scrapers](https://github.com/TheAxiomFoundation/axiom-scrapers) | Source scrapers for statutes, regulations, guidance, bills, and rulemaking; feeds corpus ingest. |
 | [axiom-corpus](https://github.com/TheAxiomFoundation/axiom-corpus) | Legal source corpus: statutes, regulations, guidance, manuals, and policy documents with canonical citation paths. |
 | [axiom-bills](https://github.com/TheAxiomFoundation/axiom-bills) | Live bill tracker for federal and state legislatures. |
-| [axiom-encode](https://github.com/TheAxiomFoundation/axiom-encode) | AI-assisted RuleSpec encoding infrastructure with compile, proof, and oracle gates. |
+| [axiom-encode](https://github.com/TheAxiomFoundation/axiom-encode) | AI-assisted RuleSpec encoding infrastructure. |
 | [axiom-rules-engine](https://github.com/TheAxiomFoundation/axiom-rules-engine) | RuleSpec compiler and runtime for executable law (Rust; wasm and Python bindings). |
 | [axiom-compose](https://github.com/TheAxiomFoundation/axiom-compose) | Deterministic program composer: spec + encodings → runnable program. |
-| [axiom-oracles](https://github.com/TheAxiomFoundation/axiom-oracles) | Oracle adapters and cross-engine validation comparisons (PolicyEngine, TAXSIM, EUROMOD-family models, and more). |
+| [axiom-oracles](https://github.com/TheAxiomFoundation/axiom-oracles) | Adapters and comparison runs against other calculators and datasets (PolicyEngine, TAXSIM, EUROMOD-family models, and more). |
 | [axiom-microsim](https://github.com/TheAxiomFoundation/axiom-microsim) | Population-scale microsimulation running on the Axiom engine. |
 | [receipt](https://github.com/TheAxiomFoundation/receipt) | Verifiable custody of agent-produced records: chained manifests, timestamp witnesses, offline verification. |
 | [axiom-mcp](https://github.com/TheAxiomFoundation/axiom-mcp) | MCP server so agents and assistants can query encoded rules. |
 | [axiom.org](https://github.com/TheAxiomFoundation/axiom.org) | The Axiom Foundation website and the Axiom App. |
 
+In September 2026, our comparison register placed 14,030 of the 34,810 rules in
+rulespec-us in programs that at least one comparison with another calculator or
+dataset covers ([rule_verification_summary.json](https://github.com/TheAxiomFoundation/axiom-oracles/blob/d1e9d5ad859d16179eef732acc3b8efc1747214b/dashboard/public/data/rule_verification_summary.json)).
+A comparison of a program need not exercise every rule in it. The register
+counted the other 20,780 as uncompared; that figure runs high, because the
+register lags some published comparisons.
+
+Two of the calculators named above are tied to Axiom.
+Max Ghenis is CEO of both the Axiom Foundation and PolicyEngine, the calculator we compare against most,
+and our TAXSIM runs use the TAXSIM executable that PolicyEngine packages.
+
 ## Encodings
 
-RuleSpec corpora live in per-country repositories. The two groups below
-differ in coverage depth, not in kind — every lane carries encodings with
-companion tests as it grows.
+RuleSpec corpora live in per-country repositories.
 
 Broad country corpora:
 [rulespec-us](https://github.com/TheAxiomFoundation/rulespec-us) (federal
@@ -64,8 +73,8 @@ plus state law as `us-XX/` directories),
 [rulespec-gh](https://github.com/TheAxiomFoundation/rulespec-gh),
 [rulespec-nz](https://github.com/TheAxiomFoundation/rulespec-nz).
 
-Earlier-stage lanes (self-described source registries, building toward
-oracle parity):
+Earlier-stage repositories (self-described source registries; on October 3,
+2026, eight of these 14 held no encodings yet):
 [rulespec-bo](https://github.com/TheAxiomFoundation/rulespec-bo),
 [rulespec-co](https://github.com/TheAxiomFoundation/rulespec-co),
 [rulespec-dk](https://github.com/TheAxiomFoundation/rulespec-dk),
