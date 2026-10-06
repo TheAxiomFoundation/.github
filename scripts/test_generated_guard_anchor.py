@@ -199,10 +199,7 @@ class ApiState:
                 return self.listing_pages[page]
             ordered = list(self.runs.values())
             start = (page - 1) * 100
-            page_runs = [
-                {"id": run["id"], "head_sha": run["head_sha"]}
-                for run in ordered[start : start + 100]
-            ]
+            page_runs = ordered[start : start + 100]
             return {"total_count": len(ordered), "workflow_runs": page_runs}
         raise KeyError(path)
 
@@ -246,6 +243,7 @@ def run_anchor(
     state: ApiState,
     *,
     checkout: str | None = None,
+    reviewed_seed: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     checkout_sha = checkout or fixture.head
     state.current["head_sha"] = checkout_sha
@@ -262,6 +260,7 @@ def run_anchor(
             "ANCHOR_RUN_HEAD_SHA": checkout_sha,
             "ANCHOR_RUN_ID": str(CURRENT_RUN_ID),
             "ANCHOR_TEST_ALLOW_HTTP": "true",
+            "ANCHOR_TEST_REVIEWED_SEED": reviewed_seed or fixture.seed,
             "ANCHOR_TOKEN": "test-token",
         }
         return subprocess.run(
@@ -302,6 +301,19 @@ def test_no_matching_contract_falls_back_to_reviewed_seed(fixture: Fixture) -> N
     )
     result = output(run_anchor(fixture, state))
     assert result["base_ref"] == fixture.seed
+
+
+def test_anchor_bootstrap_uses_centrally_reviewed_seed(fixture: Fixture) -> None:
+    result = output(
+        run_anchor(fixture, ApiState(fixture), checkout=fixture.introduction)
+    )
+    assert result["base_ref"] == fixture.seed
+
+
+def test_caller_cannot_self_attest_a_different_seed(fixture: Fixture) -> None:
+    result = run_anchor(fixture, ApiState(fixture), reviewed_seed=fixture.good)
+    assert result.returncode != 0
+    assert "centrally reviewed bootstrap seed" in result.stderr
 
 
 def test_caller_workflow_drift_resets_to_seed() -> None:
@@ -372,6 +384,17 @@ def test_run_tree_metadata_drift_fails_closed(fixture: Fixture) -> None:
     result = run_anchor(fixture, state)
     assert result.returncode != 0
     assert "resolved Git tree" in result.stderr
+
+
+def test_replayed_run_from_another_repository_fails_closed(
+    fixture: Fixture,
+) -> None:
+    state = ApiState(fixture)
+    state.add_success(fixture, run_id=100, head=fixture.good)
+    state.runs[100]["repository"] = {"full_name": "attacker/replay"}
+    result = run_anchor(fixture, state)
+    assert result.returncode != 0
+    assert "not bound to the caller repository" in result.stderr
 
 
 def test_unavailable_actions_evidence_fails_closed(fixture: Fixture) -> None:
@@ -454,6 +477,33 @@ def test_anchor_mutation_and_reintroduction_fail_closed() -> None:
         fixture.close()
 
 
+def test_missing_and_malformed_anchor_fail_closed() -> None:
+    missing = Fixture()
+    try:
+        (missing.root / ".axiom/generated-guard-anchor.toml").unlink()
+        missing.head = commit(missing.root, "delete anchor")
+        result = run_anchor(missing, ApiState(missing))
+        assert result.returncode != 0
+        assert "does not contain .axiom/generated-guard-anchor.toml" in result.stderr
+    finally:
+        missing.close()
+
+    malformed = Fixture()
+    try:
+        git(malformed.root, "reset", "--hard", malformed.introduction)
+        anchor = malformed.root / ".axiom/generated-guard-anchor.toml"
+        anchor.write_text("[generated_guard_anchor\n")
+        git(malformed.root, "add", anchor.as_posix())
+        git(malformed.root, "commit", "--amend", "-qm", "malformed anchor")
+        malformed.introduction = git(malformed.root, "rev-parse", "HEAD")
+        malformed.head = malformed.introduction
+        result = run_anchor(malformed, ApiState(malformed))
+        assert result.returncode != 0
+        assert "is not strict UTF-8 TOML" in result.stderr
+    finally:
+        malformed.close()
+
+
 def test_static_workflow_contract() -> None:
     workflow = WORKFLOW.read_text()
     source = anchor_source()
@@ -475,10 +525,13 @@ def main() -> None:
         test_two_push_laundering_uses_last_trusted_success(fixture)
         test_unconfigured_repository_retains_legacy_mode(fixture)
         test_no_matching_contract_falls_back_to_reviewed_seed(fixture)
+        test_anchor_bootstrap_uses_centrally_reviewed_seed(fixture)
+        test_caller_cannot_self_attest_a_different_seed(fixture)
         test_skipped_guard_does_not_advance_anchor(fixture)
         test_one_success_and_skipped_matrix_steps_advance_anchor(fixture)
         test_duplicate_successful_guard_steps_are_ambiguous(fixture)
         test_run_tree_metadata_drift_fails_closed(fixture)
+        test_replayed_run_from_another_repository_fails_closed(fixture)
         test_unavailable_actions_evidence_fails_closed(fixture)
         test_ambiguous_current_reusable_identity_fails_closed(fixture)
         test_incomplete_pagination_fails_closed(fixture)
@@ -487,6 +540,7 @@ def main() -> None:
     test_caller_workflow_drift_resets_to_seed()
     test_incomparable_successes_fail_closed()
     test_anchor_mutation_and_reintroduction_fail_closed()
+    test_missing_and_malformed_anchor_fail_closed()
     test_static_workflow_contract()
     print("durable generated-guard anchor: ok")
 

@@ -561,6 +561,14 @@ jobs:
               "TheAxiomFoundation/.github/"
               ".github/workflows/validate-rulespec.yml"
           )
+          # Bootstrap identities live in the reusable workflow's immutable
+          # commit, not in the caller-controlled repository. Adding an anchor
+          # can therefore never bless an earlier unreviewed caller commit.
+          REVIEWED_SEEDS = {
+              "TheAxiomFoundation/rulespec-us": (
+                  "d58cc0ce67ad891fde4c9061c86a2091bfdd524f"
+              ),
+          }
           SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -725,11 +733,22 @@ jobs:
           if introduced_anchor != current_anchor:
               fail("anchor blob or file mode changed after its introduction")
           seed = parse_anchor(current_anchor[1])
+          reviewed_seed = REVIEWED_SEEDS.get(repository)
+          if test_http:
+              test_seed = os.environ.get("ANCHOR_TEST_REVIEWED_SEED", "")
+              if test_seed:
+                  if SHA.fullmatch(test_seed) is None:
+                      fail("test reviewed seed is malformed")
+                  reviewed_seed = test_seed
+          if reviewed_seed is None:
+              fail("caller repository has no centrally reviewed bootstrap seed")
+          if seed != reviewed_seed:
+              fail("caller anchor differs from the centrally reviewed bootstrap seed")
           commit_tree(seed)
-          if not is_ancestor(seed, introduction) or not is_ancestor(
+          if seed == introduction or not is_ancestor(seed, introduction) or not is_ancestor(
               introduction, checkout_sha
           ):
-              fail("reviewed seed, anchor introduction, and HEAD are not ordered ancestors")
+              fail("reviewed seed must strictly predate the anchor introduction and HEAD")
 
           token = os.environ["ANCHOR_TOKEN"]
           if not token:
@@ -920,8 +939,10 @@ jobs:
               if (
                   type(payload) is not dict
                   or type(payload.get("total_count")) is not int
+                  or type(payload.get("total_count")) is bool
                   or type(payload.get("jobs")) is not list
                   or payload["total_count"] > 100
+                  or len(payload["jobs"]) != payload["total_count"]
               ):
                   fail("candidate Actions job evidence is malformed or incomplete")
               successes = 0
@@ -943,7 +964,7 @@ jobs:
               return successes == 1
 
 
-          eligible: set[str] = set()
+          eligible_runs: dict[str, list[int]] = {}
           for summary in summaries:
               run_id = summary["id"]
               if run_id == current_run_id:
@@ -955,48 +976,47 @@ jobs:
                   candidate_head, checkout_sha
               ):
                   continue
-              candidate = api_get(
-                  f"/repos/{repository_path}/actions/runs/{run_id}",
-                  context=f"candidate Actions run {run_id}",
-              )
-              if type(candidate) is not dict or candidate.get("id") != run_id:
-                  fail("candidate Actions run evidence is malformed")
-              require_repository(candidate, candidate=True)
-              require_run_tree(candidate, candidate_head)
+              require_repository(summary, candidate=True)
+              require_run_tree(summary, candidate_head)
               if (
-                  candidate.get("workflow_id") != workflow_id
-                  or candidate.get("path") != caller_path
-                  or candidate.get("head_branch") != default_branch
-                  or candidate.get("event") not in {"push", "schedule", "workflow_dispatch"}
-                  or candidate.get("status") != "completed"
-                  or candidate.get("conclusion") != "success"
+                  summary.get("workflow_id") != workflow_id
+                  or summary.get("path") != caller_path
+                  or summary.get("head_branch") != default_branch
+                  or summary.get("event") not in {"push", "schedule", "workflow_dispatch"}
+                  or summary.get("status") != "completed"
+                  or summary.get("conclusion") != "success"
               ):
                   fail("candidate run contradicts the successful main-workflow listing")
-              candidate_reusable = reusable_identity(candidate)
+              candidate_reusable = reusable_identity(summary)
               if candidate_reusable != current_reusable:
                   continue
               candidate_anchor = blob_at(candidate_head, ANCHOR_PATH, required=True)
               candidate_caller = blob_at(candidate_head, caller_path, required=True)
               if candidate_anchor != current_anchor or candidate_caller != current_caller:
                   continue
-              if not guard_step_succeeded(run_id):
-                  continue
-              eligible.add(candidate_head)
+              eligible_runs.setdefault(candidate_head, []).append(run_id)
 
-          if eligible:
+          remaining = set(eligible_runs)
+          base_ref = seed
+          while remaining:
               maxima = [
                   candidate
-                  for candidate in eligible
+                  for candidate in remaining
                   if not any(
                       candidate != other and is_ancestor(candidate, other)
-                      for other in eligible
+                      for other in remaining
                   )
               ]
               if len(maxima) != 1:
                   fail("successful generated-guard evidence has no unique maximal ancestor")
-              base_ref = maxima[0]
-          else:
-              base_ref = seed
+              candidate_head = maxima[0]
+              if any(
+                  guard_step_succeeded(run_id)
+                  for run_id in sorted(eligible_runs[candidate_head], reverse=True)
+              ):
+                  base_ref = candidate_head
+                  break
+              remaining.remove(candidate_head)
           if not is_ancestor(seed, base_ref) or not is_ancestor(base_ref, checkout_sha):
               fail("resolved generated-guard base is outside the reviewed ancestry chain")
           print("mode=durable")

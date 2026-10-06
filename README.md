@@ -103,7 +103,7 @@ reports each repo's encoder-generated / manual / unmanifested coverage.
 ### Durable generated-guard rollout
 
 Repositories can prevent a failed direct push from being hidden by a later
-unrelated push by introducing this immutable caller-owned anchor:
+unrelated push by introducing this immutable caller anchor:
 
 ```toml
 [generated_guard_anchor]
@@ -114,8 +114,11 @@ reviewed_known_good_sha = "<40-character-reviewed-commit-sha>"
 Store it at `.axiom/generated-guard-anchor.toml`, and grant the caller workflow
 both `actions: read` and `contents: read`. The reviewed SHA must predate the
 commit that first introduces the anchor and must be a known-good commit on the
-same ancestry chain. The file's first committed blob is permanent for this
-contract: changing, deleting, or deleting and re-adding it fails closed.
+same ancestry chain. It must also match the repository's bootstrap SHA in the
+reusable workflow's centrally reviewed `REVIEWED_SEEDS` registry; a caller
+cannot bless its own earlier commit merely by writing it into this file. The
+file's first committed blob is permanent for this contract: changing,
+deleting, or deleting and re-adding it fails closed.
 
 For an anchored repository, the reusable workflow never uses `event.before`,
 `origin/main`, or `HEAD~1` as the generated-guard base. It starts at the
@@ -129,10 +132,11 @@ new trust chain.
 
 Roll this out in order:
 
-1. In a reviewed caller PR, add the anchor and `actions: read` permission while
+1. Add the repository and known-good SHA to `REVIEWED_SEEDS`, then merge and
+   validate that reviewed shared-workflow release.
+2. In a reviewed caller PR, add the anchor and `actions: read` permission while
    retaining the existing reusable-workflow pin. The old workflow ignores the
    new file, so no future shared-workflow SHA needs to be guessed.
-2. Merge and validate this shared-workflow change.
 3. In another reviewed caller PR, update the reusable-workflow pin to the exact
    merged commit. Its first run scans from the reviewed seed; later exact-
    contract successes can advance the durable base.
