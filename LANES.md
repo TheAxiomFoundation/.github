@@ -4,11 +4,11 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-06 — Pin RuleSpec validation to encoder with decimal comparison fix (#1514) | 101 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | queued |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-06 — Pin RuleSpec validation to encoder with decimal comparison fix (#1514) | 101 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-06 — Merge pull request #436 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 72 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-06 — Merge pull request #20 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-10-06 — Merge pull request #130 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-05 — Merge pull request #122 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 4 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
+| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-05 — Merge pull request #122 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 0 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | success |
 | [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-04 — Merge pull request #38 from TheAxiomFoundation/southmod-licence-tripwire | 0 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-03 — Merge pull request #18 from TheAxiomFoundation/fix/oracle-coverage-pending-dir-1021 | 0 | et-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#88) | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
