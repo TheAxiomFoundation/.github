@@ -119,9 +119,9 @@ ProgramSpec shape:
 This is a lexical tripwire. It catches a hand-written module or a literal
 amount, but arithmetic on the allowed literals is not prevented, so review
 still owns ProgramSpec formulas. Setting `guard-programs-root: true` also
-requires a tracked manifest recording each changed `programs/` file's
-sha256. That check verifies no signature, and no current encoder tool can
-produce a ProgramSpec manifest.
+requires a tracked encoding manifest for each changed `programs/` file.
+That check verifies no signature, and no current encoder tool can produce a
+ProgramSpec manifest.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it

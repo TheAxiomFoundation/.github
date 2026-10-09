@@ -119,8 +119,8 @@ on:
           Whether to also require encoding manifests on the composed-pilot
           `programs/` root (encode#1053). The pre-check always requires every
           changed `programs/` file to have the axiom-compose ProgramSpec
-          shape. When true, it additionally requires a tracked manifest
-          recording each file's sha256 (no signature is verified), and
+          shape. When true, it additionally requires a tracked encoding
+          manifest for each file (no signature is verified), and
           `programs` is guarded as a RuleSpec root rather than merely
           tolerated as an allowed extra directory. No current encoder tool
           can produce a ProgramSpec manifest.
@@ -251,9 +251,8 @@ jobs:
           # not a proof of their absence (see the ProgramSpec shape notes
           # below). A caller that sets `guard-programs-root: true` also gets
           # the legacy manifest check on `programs/`. That check verifies no
-          # signature, and no current encoder tool can produce a ProgramSpec
-          # manifest, so opting in blocks ProgramSpec edits unless someone
-          # commits an unsigned manifest.
+          # signature (a tracked manifest at the mirrored path suffices), and
+          # no current encoder tool can produce a ProgramSpec manifest.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -491,7 +490,9 @@ jobs:
               # Engine candidate_rule_repo_roots: the checkout serves its own
               # prefix at the root and under `<prefix>/`, and any other prefix
               # under `rulespec-<prefix>/` and then `<prefix>/`. The first
-              # existing file wins.
+              # existing file wins. This mirrors how program builds compile
+              # (AXIOM_RULESPEC_REPO_ROOTS set to the checkout, cwd outside it);
+              # a compile from inside the checkout would try more locations.
               if prefix == REPO_PREFIX:
                   candidates = [f"{relative}.yaml", f"{prefix}/{relative}.yaml"]
               else:
@@ -552,7 +553,7 @@ jobs:
               # lexes every rule's formula as one source, with escapes, so an
               # open string in one value could otherwise hide the next.
               quoted = [character for character in "\"'\\" if character in text]
-              return [f"quote or backslash {character!r}" for character in quoted] + [
+              return [f"QUOTE:{character!r}" for character in quoted] + [
                   literal
                   for literal in NUMBER.findall(formula_text(text))
                   if Decimal(literal.replace("_", "")) not in ALLOWED_LITERALS
@@ -583,10 +584,16 @@ jobs:
                       continue
                   else:
                       for literal in formula_literals(value):
-                          issues.append(
-                              f"{label} {field} carries the literal {literal}; "
-                              "amounts and rates must come from encoded modules"
-                          )
+                          if literal.startswith("QUOTE:"):
+                              issues.append(
+                                  f"{label} {field} carries a quote or backslash "
+                                  f"{literal.removeprefix('QUOTE:')}; formulas take no strings"
+                              )
+                          else:
+                              issues.append(
+                                  f"{label} {field} carries the literal {literal}; "
+                                  "amounts and rates must come from encoded modules"
+                              )
               return issues
 
 

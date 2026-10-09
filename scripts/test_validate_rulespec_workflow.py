@@ -634,6 +634,12 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 ["entry 'policies/ext.json/bbce' resolves to us/policies/ext.json/bbce.yaml, which is not an encoded module"],
             ),
             (
+                "dangling-symlink-spec",
+                {},
+                {"programs/us-xx/dangling/fy-2026.yaml": "../../../nowhere.yaml"},
+                ["programs/us-xx/dangling/fy-2026.yaml is a symlink or sits under one"],
+            ),
+            (
                 "symlinked-spec",
                 {"bulk/specs/tanf.yaml": program_spec("us-xx/tanf")},
                 {"programs/us-xx/tanf/fy-2026.yaml": "../../../bulk/specs/tanf.yaml"},
@@ -723,7 +729,7 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 f"quoted-{index}",
                 {spec: program_spec("us-xx/snap", extra=f"  - pattern: derived_formula\n    name: quoted\n    effective_from: '2026-01-01'\n    formula: {json.dumps(formula)}\n")},
                 {},
-                [f"(quoted) formula carries the literal quote or backslash {character!r}"],
+                [f"(quoted) formula carries a quote or backslash {character!r}; formulas take no strings"],
             ))
         for name, files, links, messages in cases:
             head = branch(root, base, name, files, links)
@@ -732,6 +738,18 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 assert result.returncode != 0, (name, result.stdout)
                 for message in messages:
                     assert message in result.stderr, (name, message, result.stderr)
+
+        # A gitlink (submodule) named like a spec is not a regular file.
+        git(root, "checkout", "-q", base)
+        git(root, "checkout", "-q", "-B", "gitlink-spec")
+        git(root, "update-index", "--add", "--cacheinfo", f"160000,{base},programs/us-xx/sub.yaml")
+        (root / "programs/us-xx/sub.yaml").mkdir(parents=True)
+        git(root, "commit", "-qm", "gitlink spec")
+        gitlink = git(root, "rev-parse", "HEAD")
+        for guard_programs in ("false", "true"):
+            result = precheck(root, base, gitlink, guard_programs)
+            assert result.returncode != 0, guard_programs
+            assert "programs/us-xx/sub.yaml is not a regular file" in result.stderr
 
         # Atomic modules stay manifest-guarded whatever the programs opt-in says.
         for relative in (federal, statute, state):
