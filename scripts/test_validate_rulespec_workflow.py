@@ -470,6 +470,11 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
 
+    def link(root: Path, relative: str, destination: str) -> None:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(destination)
+
     def precheck(root: Path, base: str, head: str, guard_programs: str | None):
         env = {
             key: value
@@ -478,6 +483,7 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         } | {
             "BASE_SHA": base,
             "GITHUB_SHA": head,
+            "GITHUB_REPOSITORY": "TheAxiomFoundation/rulespec-us",
             "EVENT_NAME": "pull_request",
             "RUN_GENERATED_GUARD": "true",
         }
@@ -492,18 +498,29 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             text=True,
         )
 
-    def program_spec(program: str, *, scope: str = "regulations/7-cfr/273/9", extra: str = "") -> str:
+    def program_spec(
+        program: str,
+        *,
+        scope: str = "regulations/7-cfr/273/9",
+        extra: str = "",
+        header: str = "",
+        state: str = "us-xx:policies/manual/page-1",
+    ) -> str:
         return (
             f"program: {program}\n"
             "period: 2026-01\n"
             "outputs:\n  - snap_eligible\n"
-            f"scope:\n  federal:\n    - {scope}\n"
-            "  state:\n    - us-xx:policies/manual/page-1\n"
+            f"scope:\n{header}  federal:\n    - {scope}\n"
+            f"  state:\n    - {state}\n"
             "  jurisdictions:\n    - us\n    - us-xx\n"
             "transformations:\n"
             "  - pattern: derived_formula\n"
             "    name: annual_snap_benefit\n"
             "    effective_from: '2026-01-01'\n"
+            "    entity: Household\n"
+            "    dtype: Money\n"
+            "    period: Year\n"
+            "    unit: USD\n"
             "    formula: snap_benefit * 12\n"
             "  - pattern: conditional_value\n"
             "    name: snap_benefit\n"
@@ -512,33 +529,42 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             "    when_true: snap_monthly_allotment\n"
             "    when_false: 0\n"
             "  - pattern: derived_formula\n"
-            "    name: cited_rule\n"
+            "    name: assistance_group_size\n"
             "    effective_from: '2026-01-01'\n"
-            "    formula: us:regulations/7-cfr/273/9#snap_standard_income_eligible\n"
-            "  - pattern: derived_formula\n"
-            "    name: annual_cited\n"
-            "    effective_from: '2026-01-01'\n"
+            "    dtype: Count\n"
+            "    source: 'FL ESS 2210.0301 (SFU = household); 7 CFR 273.1'\n"
             "    formula: |-\n"
-            "      snap_monthly_allotment * 12  # 7 CFR 273.10(e)(2), FY 2026\n"
+            "      household_size  # Appendix A-1 rows 1-10 + 1 per member\n"
             "  - pattern: sum_terms\n"
             "    name: snap_gross_monthly_income\n"
             "    effective_from: '2026-01-01'\n"
             "    unit: USD\n"
             "    terms:\n      - snap_countable_earned_income\n      - snap_countable_unearned_income\n"
+            "  - pattern: table_lookup_with_extension\n"
+            "    name: bounded_limit\n"
+            "    effective_from: '2026-01-01'\n"
+            "    index: household_size\n"
+            "    table: limit_table\n"
+            "    extension: limit_each_additional_member\n"
+            "    minimum_index: 1\n"
+            "    maximum_index: 8\n"
             + extra
         )
 
-    def branch(root: Path, base: str, name: str, files: dict[str, str]) -> str:
+    def branch(root: Path, base: str, name: str, files: dict[str, str], links: dict[str, str] | None = None) -> str:
         git(root, "checkout", "-q", base)
         git(root, "checkout", "-q", "-B", name)
         for relative, content in files.items():
             write(root, relative, content)
+        for relative, destination in (links or {}).items():
+            link(root, relative, destination)
         return commit(root, name)
 
     spec = "programs/us-xx/snap/fy-2026.yaml"
     federal = "regulations/7-cfr/273/9.yaml"
     statute = "statutes/7/2014/a.yaml"
     state = "us-xx/policies/manual/page-1.yaml"
+    module = "format: rulespec/v1\nrules: []\n"
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         git(root, "init", "-q", "-b", "main")
@@ -546,20 +572,23 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         git(root, "config", "user.name", "Workflow Test")
         for relative, content, manifest_path, applied in [
             (spec, program_spec("us-xx/snap"), ".axiom/encoding-manifests/programs/us-xx/snap/fy-2026.json", spec),
-            (federal, "format: rulespec/v1\n", ".axiom/encoding-manifests/regulations/7-cfr/273/9.json", federal),
-            (statute, "format: rulespec/v1\n", ".axiom/encoding-manifests/statutes/7/2014/a.json", statute),
-            (state, "format: rulespec/v1\n", "us-xx/.axiom/encoding-manifests/policies/manual/page-1.json", "policies/manual/page-1.yaml"),
+            (federal, module, ".axiom/encoding-manifests/regulations/7-cfr/273/9.json", federal),
+            (statute, module, ".axiom/encoding-manifests/statutes/7/2014/a.json", statute),
+            (state, module, "us-xx/.axiom/encoding-manifests/policies/manual/page-1.json", "policies/manual/page-1.yaml"),
         ]:
             write(root, relative, content)
             write(root, manifest_path, manifest(applied, content))
         base = commit(root, "manifested base")
 
-        # Assembled ProgramSpec edits, top-level and jurisdiction-nested: no
-        # manifest needed on the opt-out.
+        # Assembled ProgramSpec edits: top-level and jurisdiction-nested, with
+        # the root, `prefix:` and jurisdiction-prefixed entry forms, all
+        # resolving to encoded modules. No manifest needed on the opt-out.
         program_edit = branch(root, base, "edit-program-specs", {
-            spec: program_spec("us-xx/snap", scope="policies/manual/page-1"),
+            spec: program_spec("us-xx/snap", scope="us-xx/policies/manual/page-1"),
             "programs/us-xx/tanf/fy-2026.yaml": program_spec("us-xx/tanf", scope="us:statutes/7/2014/a"),
-            "us-xx/programs/snap/fy-2027.yaml": program_spec("us-xx/snap", scope="us-xx/policies/manual/page-1"),
+            # An unqualified `state` entry resolves under the program's
+            # jurisdiction (us-xx), not the federal prefix.
+            "us-xx/programs/snap/fy-2027.yaml": program_spec("us-xx/snap", state="policies/manual/page-1"),
         })
         for opt_out in ("false", None):
             result = precheck(root, base, program_edit, opt_out)
@@ -572,124 +601,119 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         assert "programs/us-xx/tanf/fy-2026.yaml has no tracked encoder apply manifest" in result.stderr
         assert "us-xx/programs/snap/fy-2027.yaml has no tracked encoder apply manifest" in result.stderr
 
-        # A hand-written module under programs/, imported through a spec's
-        # scope, is rejected on the opt-out: axiom-compose indexes programs/
-        # as corpus, so this is the bypass the manifest check used to block.
-        smuggled = branch(root, base, "smuggled-module", {
-            "programs/us/helpers/bbce.yaml": (
-                "format: rulespec/v1\nrules:\n  - name: bbce_limit\n"
-                "    kind: derived\n    versions:\n      - effective_from: '2026-01-01'\n"
-                "        formula: 2.0 * snap_poverty_guideline\n"
+        # Each case is a change a hand-written module or amount could ride in
+        # on; every one must fail on the opt-out with the named reason.
+        bbce = "format: rulespec/v1\nrules:\n  - name: bbce_limit\n    versions:\n      - formula: 2.0 * snap_poverty_line\n"
+        cases = [
+            (
+                "smuggled-module",
+                {"programs/us/helpers/bbce.yaml": bbce, spec: program_spec("us-xx/snap", scope="programs/us/helpers/bbce")},
+                {},
+                [
+                    "programs/us/helpers/bbce.yaml lacks ProgramSpec keys: outputs, period, program",
+                    "programs/us/helpers/bbce.yaml has keys a ProgramSpec does not take: format, rules",
+                    f"{spec} scope.federal entry 'programs/us/helpers/bbce' resolves to programs/us/helpers/bbce.yaml, which is not an encoded module",
+                ],
             ),
-            spec: program_spec("us-xx/snap", scope="programs/us/helpers/bbce"),
-        })
-        for guard_programs in ("false", None):
-            result = precheck(root, base, smuggled, guard_programs)
-            assert result.returncode != 0
-            assert "programs/us/helpers/bbce.yaml lacks ProgramSpec keys: outputs, period, program" in result.stderr
-            assert "programs/us/helpers/bbce.yaml has keys a ProgramSpec does not take: format, rules" in result.stderr
-            assert f"{spec} scope.federal entry 'programs/us/helpers/bbce' is not an encoded-root path" in result.stderr
-
-        # Without an import scope axiom-compose resolves outputs across the
-        # whole checkout, reaching unguarded trees such as bulk/.
-        scopeless = branch(root, base, "scopeless", {
-            "bulk/bbce.yaml": "format: rulespec/v1\nrules: []\n",
-            spec: "program: us-xx/snap\nperiod: 2026-01\noutputs:\n  - smuggled_bbce_eligible\n",
-        })
-        result = precheck(root, base, scopeless, "false")
-        assert result.returncode != 0
-        assert f"{spec} has no import scope" in result.stderr
-
-        # Scope keys become import prefixes, so they must be federal, state
-        # or a jurisdiction; entries must be clean encoded-root paths; and a
-        # .test.yaml under programs/ is shape-checked, not exempt.
-        for name, files, message in [
+            (
+                "scopeless",
+                {"bulk/bbce.yaml": bbce, spec: "program: us-xx/snap\nperiod: 2026-01\noutputs:\n  - smuggled_bbce_eligible\n"},
+                {},
+                [f"{spec} has no import scope"],
+            ),
+            (
+                "double-nested",
+                {"us/us-xx/policies/bbce.yaml": bbce, spec: program_spec("us-xx/snap", scope="us-xx/policies/bbce")},
+                {},
+                ["entry 'us-xx/policies/bbce' resolves to us/us-xx/policies/bbce.yaml, which is not an encoded module"],
+            ),
+            (
+                "symlinked-root",
+                {"bulk/bbce.yaml": bbce, spec: program_spec("us-xx/snap", scope="policies/ext.json/bbce")},
+                {"us/policies/ext.json": "../../bulk"},
+                ["entry 'policies/ext.json/bbce' resolves to us/policies/ext.json/bbce.yaml, which is not an encoded module"],
+            ),
+            (
+                "symlinked-spec",
+                {"bulk/specs/tanf.yaml": program_spec("us-xx/tanf")},
+                {"programs/us-xx/tanf/fy-2026.yaml": "../../../bulk/specs/tanf.yaml"},
+                ["programs/us-xx/tanf/fy-2026.yaml is a symlink or sits under one"],
+            ),
             (
                 "scope-key-import",
                 {
-                    "programs/us-xx/snap/helpers/bbce.test.yaml": "format: rulespec/v1\nrules: []\n",
-                    spec: program_spec("us-xx/snap").replace(
-                        "  federal:\n", '  "us:programs/us-xx/snap/helpers/bbce.test#":\n    - statutes/7/2014/a\n  federal:\n', 1
-                    ),
+                    "programs/us-xx/snap/helpers/bbce.test.yaml": bbce,
+                    spec: program_spec("us-xx/snap", header='  "us:programs/us-xx/snap/helpers/bbce.test#":\n    - statutes/7/2014/a\n'),
                 },
-                "scope key 'us:programs/us-xx/snap/helpers/bbce.test#' is neither federal, state nor a jurisdiction",
+                {},
+                ["scope key 'us:programs/us-xx/snap/helpers/bbce.test#' is neither federal, state nor a jurisdiction"],
             ),
-            ("relative-entry", {spec: program_spec("us-xx/snap", scope="policies/../programs/x")}, "entry 'policies/../programs/x' is not an encoded-root path"),
-            ("test-entry", {spec: program_spec("us-xx/snap", scope="policies/manual/page-1.test")}, "entry 'policies/manual/page-1.test' names a relative, test"),
-            ("tools-entry", {spec: program_spec("us-xx/snap", scope="us:tools/bbce")}, "entry 'us:tools/bbce' is not an encoded-root path"),
-            ("test-file", {"programs/us-xx/snap/fy-2026.test.yaml": "- name: not a spec\n"}, "programs/us-xx/snap/fy-2026.test.yaml is not a ProgramSpec mapping"),
-        ]:
-            head = branch(root, base, name, files)
-            result = precheck(root, base, head, "false")
-            assert result.returncode != 0, name
-            assert message in result.stderr, (name, result.stderr)
-
-        # Amounts or rates typed into a composition, and unknown patterns.
-        for name, extra, message in [
+            ("relative-entry", {spec: program_spec("us-xx/snap", scope="policies/../programs/x")}, {}, ["entry 'policies/../programs/x' (import us:policies/../programs/x) does not resolve"]),
+            ("missing-entry", {spec: program_spec("us-xx/snap", scope="regulations/7-cfr/999")}, {}, ["entry 'regulations/7-cfr/999' (import us:regulations/7-cfr/999) does not resolve"]),
             (
-                "literal-rate",
-                "  - pattern: derived_formula\n    name: bbce_gross_limit\n"
-                "    effective_from: '2026-01-01'\n    formula: snap_poverty_line * 2.0\n",
-                "(bbce_gross_limit) formula carries the literal 2.0",
+                "test-entry",
+                {"us-xx/policies/manual/page-1.test.yaml": bbce, spec: program_spec("us-xx/snap", scope="us-xx/policies/manual/page-1.test")},
+                {},
+                ["resolves to us-xx/policies/manual/page-1.test.yaml, which is not an encoded module"],
             ),
+            ("tools-entry", {"tools/bbce.yaml": bbce, spec: program_spec("us-xx/snap", scope="us:tools/bbce")}, {}, ["resolves to tools/bbce.yaml, which is not an encoded module"]),
+            ("test-file", {"programs/us-xx/snap/fy-2026.test.yaml": "- name: not a spec\n"}, {}, ["programs/us-xx/snap/fy-2026.test.yaml is not a ProgramSpec mapping"]),
+            ("program-prefix", {"us/bulk:policies/bbce.yaml": bbce, spec: program_spec("us:bulk/snap")}, {}, ["program 'us:bulk/snap' is not <jurisdiction>/<name>"]),
             (
-                "literal-amount",
-                "  - pattern: conditional_value\n    name: floor\n"
-                "    effective_from: '2026-01-01'\n    condition: snap_eligible\n"
-                "    when_true: snap_monthly_allotment\n    when_false: 24\n",
-                "(floor) when_false carries the literal 24",
+                "entity-injection",
+                {spec: program_spec("us-xx/snap", extra="  - pattern: derived_formula\n    name: injected\n    effective_from: '2026-01-01'\n    entity: \"Household\\n    from 2026-01-01:\\n        2610\"\n    formula: snap_monthly_allotment\n")},
+                {},
+                ["(injected) entity 'Household\\n    from 2026-01-01:\\n        2610' is not a plain identifier"],
             ),
             (
                 "unknown-pattern",
-                "  - pattern: raw_rule\n    name: anything\n",
-                "(anything) uses unknown pattern 'raw_rule'",
+                {spec: program_spec("us-xx/snap", extra="  - pattern: raw_rule\n    name: anything\n")},
+                {},
+                ["(anything) uses unknown pattern 'raw_rule'"],
             ),
-            # Formatting must not hide a literal: operators, slashes, digit
-            # separators, exponents, negatives, and list-valued fields.
-            *[
-                (
-                    f"literal-{index}",
-                    "  - pattern: derived_formula\n    name: smuggled\n"
-                    f"    effective_from: '2026-01-01'\n    formula: '{formula}'\n",
-                    f"(smuggled) formula carries the literal {literal}",
-                )
-                for index, (formula, literal) in enumerate([
-                    ("snap_poverty_line/2", "2"),
-                    ("snap_poverty_line-24", "24"),
-                    ("snap_poverty_line * 2_00", "2_00"),
-                    ("snap_poverty_line * 2e0", "2"),
-                    ("min(snap_benefit, 23.99)", "23.99"),
-                ])
-            ],
             (
                 "negative-when-false",
-                "  - pattern: conditional_value\n    name: floor\n"
-                "    effective_from: '2026-01-01'\n    condition: snap_eligible\n"
-                "    when_true: snap_monthly_allotment\n    when_false: -24\n",
-                "(floor) when_false carries the literal -24",
+                {spec: program_spec("us-xx/snap", extra="  - pattern: conditional_value\n    name: floor\n    effective_from: '2026-01-01'\n    condition: snap_eligible\n    when_true: snap_monthly_allotment\n    when_false: -24\n")},
+                {},
+                ["(floor) when_false carries the literal -24"],
             ),
             (
                 "literal-term",
-                "  - pattern: sum_terms\n    name: padded\n"
-                "    effective_from: '2026-01-01'\n    terms:\n      - snap_benefit\n      - 2610\n",
-                "(padded) terms carries the literal 2610",
+                {spec: program_spec("us-xx/snap", extra="  - pattern: sum_terms\n    name: padded\n    effective_from: '2026-01-01'\n    terms:\n      - snap_benefit\n      - 2610\n")},
+                {},
+                ["(padded) terms carries the literal 2610"],
             ),
-            (
-                "qualified-programs-scope",
-                "",
-                "scope.federal entry 'us:programs/us/helpers/bbce' is not an encoded-root path",
-            ),
-        ]:
-            scope = "us:programs/us/helpers/bbce" if name == "qualified-programs-scope" else "regulations/7-cfr/273/9"
-            head = branch(root, base, name, {spec: program_spec("us-xx/snap", scope=scope, extra=extra)})
-            result = precheck(root, base, head, "false")
-            assert result.returncode != 0, name
-            assert message in result.stderr, (name, result.stderr)
+        ]
+        # Formatting must not hide a literal: operators, slashes, digit
+        # separators, exponents, decimals, a `#` inside a string, and a
+        # trailing comment glued to the amount.
+        for index, (formula, literal) in enumerate([
+            ("snap_poverty_line/2", "2"),
+            ("snap_poverty_line-24", "24"),
+            ("snap_poverty_line * 2_00", "2_00"),
+            ("snap_poverty_line * 2e0", "2"),
+            ("min(snap_benefit, 23.99)", "23.99"),
+            ("if snap_eligible: snap_monthly_allotment else:2610#x", "2610"),
+            ('if snap_eligible == " #": snap_monthly_allotment else: 2610', "2610"),
+        ]):
+            cases.append((
+                f"literal-{index}",
+                {spec: program_spec("us-xx/snap", extra=f"  - pattern: derived_formula\n    name: smuggled\n    effective_from: '2026-01-01'\n    formula: {json.dumps(formula)}\n")},
+                {},
+                [f"(smuggled) formula carries the literal {literal}"],
+            ))
+        for name, files, links, messages in cases:
+            head = branch(root, base, name, files, links)
+            for guard_programs in ("false", None):
+                result = precheck(root, base, head, guard_programs)
+                assert result.returncode != 0, (name, result.stdout)
+                for message in messages:
+                    assert message in result.stderr, (name, message, result.stderr)
 
         # Atomic modules stay manifest-guarded whatever the programs opt-in says.
         for relative in (federal, statute, state):
             atomic_edit = branch(root, base, f"edit-{relative.replace('/', '-')}", {
-                relative: "format: rulespec/v1\nrules: []\n",
+                relative: "format: rulespec/v1\nrules: []\n# edited\n",
             })
             for guard_programs in ("false", "true", None):
                 result = precheck(root, base, atomic_edit, guard_programs)
@@ -697,11 +721,10 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 assert f"{relative} content matches no sha256" in result.stderr
 
         # A re-manifested atomic edit still passes under the opt-out.
+        edited = "format: rulespec/v1\nrules: []\n# edited\n"
         manifested_edit = branch(root, base, "re-manifested", {
-            federal: "format: rulespec/v1\nrules: []\n",
-            ".axiom/encoding-manifests/regulations/7-cfr/273/9.json": manifest(
-                federal, "format: rulespec/v1\nrules: []\n"
-            ),
+            federal: edited,
+            ".axiom/encoding-manifests/regulations/7-cfr/273/9.json": manifest(federal, edited),
         })
         result = precheck(root, base, manifested_edit, "false")
         assert result.returncode == 0, result.stderr

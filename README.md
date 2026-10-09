@@ -104,13 +104,16 @@ reports each repo's encoder-generated / manual / unmanifested coverage.
 encoded, and the supervised guard does not cover it. By default
 (`guard-programs-root: false`) the early pre-check requires every changed
 `programs/` file, `.test.yaml` included, to have the ProgramSpec shape:
-- only ProgramSpec keys;
+- only ProgramSpec keys, and a `program` of `<jurisdiction>/<name>...`;
 - import scope keys `federal`, `state` or a jurisdiction, with at least one
   import entry;
-- import entries of the form `[prefix:][jurisdiction/]<legislation|policies|regulations|statutes>/...`;
-- known compose patterns;
-- no numeric literals other than 0, 1 and 12 in any formula-bound value
-  (qualified rule references and `#` comments are ignored).
+- every import entry resolves, as axiom-compose and the artifact engine
+  resolve it, to an existing encoded module at a depth the supervised guard
+  protects (`<root>/...` or `<jurisdiction>/<root>/...`), with no symlink on
+  the way;
+- known compose patterns, and plain-identifier or date rule metadata;
+- no numeric literals other than 0, 1 and 12 in any other transformation
+  value, lexed the way the engine lexes formulas (strings, then `#` comments).
 
 This is a lexical tripwire. It catches a hand-written module or a literal
 amount, but arithmetic on the allowed literals is not prevented, so review
