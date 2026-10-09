@@ -446,16 +446,20 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
     import yaml
 
     workflow = yaml.safe_load(WORKFLOW.read_text())
-    step = next(
+    steps = [
         step
         for job in workflow["jobs"].values()
         for step in job.get("steps", [])
-        if step.get("name") == "Reject unmanifested RuleSpec content"
-    )
+    ]
+    step = next(s for s in steps if s.get("name") == "Reject unmanifested RuleSpec content")
     # The opt-in must reach the step from the same input that adds
-    # `programs` to the validate roots.
+    # `programs` to the validate roots, and the shape check's parser must be
+    # installed before the step runs.
     assert step["env"]["GUARD_PROGRAMS_ROOT"] == "${{ inputs.guard-programs-root }}"
     assert "${{" not in step["run"]
+    install = steps.index(next(s for s in steps if s.get("name") == "Install the ProgramSpec shape-check parser"))
+    assert "pyyaml==6.0.3" in steps[install]["run"]
+    assert install < steps.index(step)
 
     def manifest(path: str, content: str) -> str:
         digest = hashlib.sha256(content.encode()).hexdigest()
@@ -488,8 +492,40 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             text=True,
         )
 
+    def program_spec(program: str, *, scope: str = "regulations/7-cfr/273/9", extra: str = "") -> str:
+        return (
+            f"program: {program}\n"
+            "period: 2026-01\n"
+            "outputs:\n  - snap_eligible\n"
+            f"scope:\n  federal:\n    - {scope}\n"
+            "transformations:\n"
+            "  - pattern: derived_formula\n"
+            "    name: annual_snap_benefit\n"
+            "    effective_from: '2026-01-01'\n"
+            "    formula: snap_benefit * 12\n"
+            "  - pattern: conditional_value\n"
+            "    name: snap_benefit\n"
+            "    effective_from: '2026-01-01'\n"
+            "    condition: snap_eligible\n"
+            "    when_true: snap_monthly_allotment\n"
+            "    when_false: 0\n"
+            "  - pattern: derived_formula\n"
+            "    name: cited_rule\n"
+            "    effective_from: '2026-01-01'\n"
+            "    formula: us:regulations/7-cfr/273/9#snap_standard_income_eligible\n"
+            + extra
+        )
+
+    def branch(root: Path, base: str, name: str, files: dict[str, str]) -> str:
+        git(root, "checkout", "-q", base)
+        git(root, "checkout", "-q", "-B", name)
+        for relative, content in files.items():
+            write(root, relative, content)
+        return commit(root, name)
+
     spec = "programs/us-xx/snap/fy-2026.yaml"
     federal = "regulations/7-cfr/273/9.yaml"
+    statute = "statutes/7/2014/a.yaml"
     state = "us-xx/policies/manual/page-1.yaml"
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -497,48 +533,96 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         git(root, "config", "user.email", "workflow-test@example.com")
         git(root, "config", "user.name", "Workflow Test")
         for relative, content, manifest_path, applied in [
-            (spec, "program: us-xx/snap\n", ".axiom/encoding-manifests/programs/us-xx/snap/fy-2026.json", spec),
+            (spec, program_spec("us-xx/snap"), ".axiom/encoding-manifests/programs/us-xx/snap/fy-2026.json", spec),
             (federal, "format: rulespec/v1\n", ".axiom/encoding-manifests/regulations/7-cfr/273/9.json", federal),
+            (statute, "format: rulespec/v1\n", ".axiom/encoding-manifests/statutes/7/2014/a.json", statute),
             (state, "format: rulespec/v1\n", "us-xx/.axiom/encoding-manifests/policies/manual/page-1.json", "policies/manual/page-1.yaml"),
         ]:
             write(root, relative, content)
             write(root, manifest_path, manifest(applied, content))
         base = commit(root, "manifested base")
 
-        # A hand-assembled ProgramSpec edit carries no fresh manifest.
-        write(root, spec, "program: us-xx/snap\nperiod: 2026-01\n")
-        write(root, "programs/us-xx/tanf/fy-2026.yaml", "program: us-xx/tanf\n")
-        program_edit = commit(root, "edit program specs")
+        # Assembled ProgramSpec edits, top-level and jurisdiction-nested, plus
+        # a companion test file: no manifest needed on the opt-out.
+        program_edit = branch(root, base, "edit-program-specs", {
+            spec: program_spec("us-xx/snap", scope="policies/manual/page-1"),
+            "programs/us-xx/tanf/fy-2026.yaml": program_spec("us-xx/tanf"),
+            "us-xx/programs/snap/fy-2027.yaml": program_spec("us-xx/snap"),
+            "programs/us-xx/snap/fy-2026.test.yaml": "- name: not a spec\n",
+        })
         for opt_out in ("false", None):
             result = precheck(root, base, program_edit, opt_out)
             assert result.returncode == 0, result.stderr
+            assert "3 changed ProgramSpec file(s) have the ProgramSpec shape" in result.stdout
             assert "No guarded RuleSpec content in scope" in result.stdout
         result = precheck(root, base, program_edit, "true")
         assert result.returncode != 0
         assert f"{spec} content matches no sha256" in result.stderr
         assert "programs/us-xx/tanf/fy-2026.yaml has no tracked encoder apply manifest" in result.stderr
+        assert "us-xx/programs/snap/fy-2027.yaml has no tracked encoder apply manifest" in result.stderr
+        assert "fy-2026.test.yaml" not in result.stderr
 
-        # Atomic modules stay guarded whatever the programs opt-in says.
-        for relative in (federal, state):
-            git(root, "checkout", "-q", base)
-            git(root, "checkout", "-q", "-B", f"edit-{len(relative)}")
-            write(root, relative, "format: rulespec/v1\nrules: []\n")
-            atomic_edit = commit(root, f"hand-edit {relative}")
+        # A hand-written module under programs/, imported through a spec's
+        # scope, is rejected on the opt-out: axiom-compose indexes programs/
+        # as corpus, so this is the bypass the manifest check used to block.
+        smuggled = branch(root, base, "smuggled-module", {
+            "programs/us/helpers/bbce.yaml": (
+                "format: rulespec/v1\nrules:\n  - name: bbce_limit\n"
+                "    kind: derived\n    versions:\n      - effective_from: '2026-01-01'\n"
+                "        formula: 2.0 * snap_poverty_guideline\n"
+            ),
+            spec: program_spec("us-xx/snap", scope="programs/us/helpers/bbce"),
+        })
+        for guard_programs in ("false", None):
+            result = precheck(root, base, smuggled, guard_programs)
+            assert result.returncode != 0
+            assert "programs/us/helpers/bbce.yaml lacks ProgramSpec keys: outputs, period, program" in result.stderr
+            assert "programs/us/helpers/bbce.yaml has keys a ProgramSpec does not take: format, rules" in result.stderr
+            assert f"{spec} scope.federal entry 'programs/us/helpers/bbce' is not under an encoded root" in result.stderr
+
+        # Amounts or rates typed into a composition, and unknown patterns.
+        for name, extra, message in [
+            (
+                "literal-rate",
+                "  - pattern: derived_formula\n    name: bbce_gross_limit\n"
+                "    effective_from: '2026-01-01'\n    formula: snap_poverty_line * 2.0\n",
+                "(bbce_gross_limit) formula carries the literal 2.0",
+            ),
+            (
+                "literal-amount",
+                "  - pattern: conditional_value\n    name: floor\n"
+                "    effective_from: '2026-01-01'\n    condition: snap_eligible\n"
+                "    when_true: snap_monthly_allotment\n    when_false: 24\n",
+                "(floor) when_false carries the literal 24",
+            ),
+            (
+                "unknown-pattern",
+                "  - pattern: raw_rule\n    name: anything\n",
+                "(anything) uses unknown pattern 'raw_rule'",
+            ),
+        ]:
+            head = branch(root, base, name, {spec: program_spec("us-xx/snap", extra=extra)})
+            result = precheck(root, base, head, "false")
+            assert result.returncode != 0, name
+            assert message in result.stderr, (name, result.stderr)
+
+        # Atomic modules stay manifest-guarded whatever the programs opt-in says.
+        for relative in (federal, statute, state):
+            atomic_edit = branch(root, base, f"edit-{relative.replace('/', '-')}", {
+                relative: "format: rulespec/v1\nrules: []\n",
+            })
             for guard_programs in ("false", "true", None):
                 result = precheck(root, base, atomic_edit, guard_programs)
                 assert result.returncode != 0, (relative, guard_programs)
                 assert f"{relative} content matches no sha256" in result.stderr
 
         # A re-manifested atomic edit still passes under the opt-out.
-        git(root, "checkout", "-q", base)
-        git(root, "checkout", "-q", "-B", "re-manifested")
-        write(root, federal, "format: rulespec/v1\nrules: []\n")
-        write(
-            root,
-            ".axiom/encoding-manifests/regulations/7-cfr/273/9.json",
-            manifest(federal, "format: rulespec/v1\nrules: []\n"),
-        )
-        manifested_edit = commit(root, "re-manifested edit")
+        manifested_edit = branch(root, base, "re-manifested", {
+            federal: "format: rulespec/v1\nrules: []\n",
+            ".axiom/encoding-manifests/regulations/7-cfr/273/9.json": manifest(
+                federal, "format: rulespec/v1\nrules: []\n"
+            ),
+        })
         result = precheck(root, base, manifested_edit, "false")
         assert result.returncode == 0, result.stderr
         assert "every one carries an encoder apply manifest" in result.stdout

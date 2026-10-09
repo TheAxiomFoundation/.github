@@ -100,10 +100,15 @@ sign-applied-files` (add `--manual-exception` for new files, or `--all` to
 backfill a corpus that has no manifests). `axiom-encode manifest-census`
 reports each repo's encoder-generated / manual / unmanifested coverage.
 
-Set `guard-programs-root: true` on the caller to require manifests on the
-composed-pilot `programs/` root too (default `false`). Enable it per repo only
-after every existing `programs/` file has a manifest or manual attestation,
-otherwise the guard fails on the backlog.
+`programs/` holds axiom-compose ProgramSpecs, which are assembled rather than
+encoded, and the supervised guard does not cover it. By default (`guard-programs-root:
+false`) the early pre-check requires every changed `programs/` file to have the
+ProgramSpec shape: only ProgramSpec keys, scope entries under an encoded root,
+known compose patterns, and no numeric literals other than 0, 1 and 12 in
+formulas. That keeps hand-written modules and amounts out of the root. Setting
+`guard-programs-root: true` instead requires an encoder apply manifest on every
+changed `programs/` file. No current encoder tool can produce one for a
+ProgramSpec, so opting in freezes the root.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it
