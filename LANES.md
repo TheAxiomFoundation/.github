@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-06 — Pin RuleSpec validation to encoder with decimal comparison fix (#1514) | 101 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-06 — Pin RuleSpec validation to encoder with decimal comparison fix (#1514) | 104 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | failure |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-06 — Merge pull request #436 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 72 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | failure |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-06 — Merge pull request #20 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-10-06 — Merge pull request #130 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
