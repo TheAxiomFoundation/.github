@@ -280,7 +280,7 @@ jobs:
           import re
           import subprocess
           import sys
-          from datetime import datetime, timezone
+          from datetime import date, datetime, timezone
           from decimal import Decimal
           from pathlib import Path
 
@@ -573,7 +573,11 @@ jobs:
                       if not isinstance(value, str) or IDENTIFIER.fullmatch(value) is None:
                           issues.append(f"{label} {field} {value!r} is not a plain identifier")
                   elif field == "effective_from":
-                      if DATE.fullmatch(str(value)) is None:
+                      try:
+                          valid = DATE.fullmatch(str(value)) is not None and bool(date.fromisoformat(str(value)))
+                      except ValueError:
+                          valid = False
+                      if not valid:
                           issues.append(f"{label} effective_from {value!r} is not a date")
                   elif field == "source":
                       if any(ord(character) < 32 for character in str(value)):
@@ -619,6 +623,13 @@ jobs:
               extra = sorted(keys - PROGRAM_SPEC_KEYS)
               if extra:
                   issues.append("has keys a ProgramSpec does not take: " + ", ".join(extra))
+              outputs = document.get("outputs")
+              if "outputs" in document and (
+                  not isinstance(outputs, list)
+                  or not outputs
+                  or any(not isinstance(name, str) or IDENTIFIER.fullmatch(name) is None for name in outputs)
+              ):
+                  issues.append("outputs must be a non-empty list of rule names")
               program = str(document.get("program", ""))
               if PROGRAM_NAME.fullmatch(program) is None:
                   issues.append(f"program {program!r} is not <jurisdiction>/<name>")
@@ -646,6 +657,11 @@ jobs:
                           issues.append(
                               f"scope.{key} entry {entry!r} resolves to {resolved}, which is not "
                               "an encoded module the supervised guard protects"
+                          )
+                      elif not Path(resolved).is_file():
+                          issues.append(
+                              f"scope.{key} entry {entry!r} resolves to {resolved}, which is not "
+                              "a regular file"
                           )
               if not import_entries:
                   issues.append(

@@ -96,8 +96,9 @@ fixtures | <issue-ref>`. Net-new statutory encoding must come from an encoder
 run; hand-authoring stays legal only for composition/oracle plumbing,
 validator-driven repairs, and fixtures, and only by declaring itself. The local
 `axiom-encode sign-applied-files` attestation command was removed in the
-encoder hard cut (axiom-encode#1108); signed manifests now come from the
-protected `targeted-signed-reencode` workflow. `axiom-encode manifest-census`
+encoder hard cut (axiom-encode#1108, commit `bebfee404`); as of axiom-encode
+`436cf3044` (2026-10-08), signed manifests come from its protected
+`targeted-signed-reencode` workflow. `axiom-encode manifest-census`
 reports each repo's encoder-generated / manual / unmanifested coverage.
 
 `programs/` holds axiom-compose ProgramSpecs, which are assembled rather than
@@ -107,11 +108,13 @@ ProgramSpec shape:
 - only ProgramSpec keys, and a `program` of `<jurisdiction>/<name>...`;
 - import scope keys `federal`, `state` or a jurisdiction, with at least one
   import entry;
-- every import entry resolves, as axiom-compose and the artifact engine
-  resolve it (the checkout's own prefix at the root then under `<prefix>/`,
-  any other prefix under `rulespec-<prefix>/` then `<prefix>/`), to an
-  existing encoded module at a depth the supervised guard protects
-  (`<root>/...` or `<jurisdiction>/<root>/...`), with no symlink on the way;
+- every import entry resolves, as axiom-compose `fabe0b3b` and the artifact
+  engine `98af0dce` resolve it (the pins rulespec-us used on 2026-10-09: the
+  checkout's own prefix at the root then under `<prefix>/`, any other prefix
+  under `rulespec-<prefix>/` then `<prefix>/`), to an existing regular-file
+  encoded module at a depth the supervised guard protects (`<root>/...` or
+  `<jurisdiction>/<root>/...`), with no symlink on the way. Callers on other
+  compose or engine pins should confirm their resolution order matches;
 - known compose patterns, and plain-identifier or date rule metadata;
 - no quotes or backslashes, and no numeric literals other than 0, 1 and 12,
   in any other transformation value (`#` comments are ignored).

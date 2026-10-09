@@ -655,6 +655,20 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 ["scope key 'us:programs/us-xx/snap/helpers/bbce.test#' is neither federal, state nor a jurisdiction"],
             ),
             ("relative-entry", {spec: program_spec("us-xx/snap", scope="policies/../programs/x")}, {}, ["entry 'policies/../programs/x' (import us:policies/../programs/x) does not resolve"]),
+            # An import that resolves to a directory, not a module file.
+            (
+                "directory-import",
+                {"regulations/directory.yaml/README.txt": "not a module\n", spec: program_spec("us-xx/snap", scope="regulations/directory")},
+                {},
+                ["entry 'regulations/directory' resolves to regulations/directory.yaml, which is not a regular file"],
+            ),
+            ("null-outputs", {spec: program_spec("us-xx/snap").replace("outputs:\n  - snap_eligible\n", "outputs:\n", 1)}, {}, [f"{spec} outputs must be a non-empty list of rule names"]),
+            (
+                "invalid-date",
+                {spec: program_spec("us-xx/snap", extra="  - pattern: sum_terms\n    name: dated\n    effective_from: '2026-02-30'\n    terms:\n      - snap_benefit\n")},
+                {},
+                ["(dated) effective_from '2026-02-30' is not a date"],
+            ),
             # A foreign prefix never falls back to the repo root, and the
             # engine's rulespec-<prefix>/ shadow is tried first and refused.
             ("foreign-prefix-root", {spec: program_spec("us-xx/snap", scope="us-yy:regulations/7-cfr/273/9")}, {}, ["entry 'us-yy:regulations/7-cfr/273/9' (import us-yy:regulations/7-cfr/273/9) does not resolve"]),
@@ -750,6 +764,20 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             result = precheck(root, base, gitlink, guard_programs)
             assert result.returncode != 0, guard_programs
             assert "programs/us-xx/sub.yaml is not a regular file" in result.stderr
+
+        # A gitlink at an import's resolved path is a directory, not a module.
+        git(root, "checkout", "-q", base)
+        git(root, "checkout", "-q", "-B", "gitlink-import")
+        git(root, "update-index", "--add", "--cacheinfo", f"160000,{base},regulations/sub.yaml")
+        (root / "regulations/sub.yaml").mkdir(parents=True)
+        write(root, spec, program_spec("us-xx/snap", scope="regulations/sub"))
+        git(root, "add", spec)
+        git(root, "commit", "-qm", "gitlink import")
+        gitlink_import = git(root, "rev-parse", "HEAD")
+        for guard_programs in ("false", "true"):
+            result = precheck(root, base, gitlink_import, guard_programs)
+            assert result.returncode != 0, guard_programs
+            assert "entry 'regulations/sub' resolves to regulations/sub.yaml, which is not a regular file" in result.stderr
 
         # Atomic modules stay manifest-guarded whatever the programs opt-in says.
         for relative in (federal, statute, state):
