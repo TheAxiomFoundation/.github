@@ -94,33 +94,34 @@ The guard also rejects a `backend: manual` apply manifest that introduces a
 *new* rule file unless it declares `manual_exception: composition | repair |
 fixtures | <issue-ref>`. Net-new statutory encoding must come from an encoder
 run; hand-authoring stays legal only for composition/oracle plumbing,
-validator-driven repairs, and fixtures, and only by declaring itself. Attest
-encoder output committed outside the `--apply` flow with `axiom-encode
-sign-applied-files` (add `--manual-exception` for new files, or `--all` to
-backfill a corpus that has no manifests). `axiom-encode manifest-census`
+validator-driven repairs, and fixtures, and only by declaring itself. The local
+`axiom-encode sign-applied-files` attestation command was removed in the
+encoder hard cut (axiom-encode#1108); signed manifests now come from the
+protected `targeted-signed-reencode` workflow. `axiom-encode manifest-census`
 reports each repo's encoder-generated / manual / unmanifested coverage.
 
 `programs/` holds axiom-compose ProgramSpecs, which are assembled rather than
-encoded, and the supervised guard does not cover it. By default
-(`guard-programs-root: false`) the early pre-check requires every changed
-`programs/` file, `.test.yaml` included, to have the ProgramSpec shape:
+encoded, and the supervised guard does not cover it. The early pre-check
+requires every changed `programs/` file, `.test.yaml` included, to have the
+ProgramSpec shape:
 - only ProgramSpec keys, and a `program` of `<jurisdiction>/<name>...`;
 - import scope keys `federal`, `state` or a jurisdiction, with at least one
   import entry;
 - every import entry resolves, as axiom-compose and the artifact engine
-  resolve it, to an existing encoded module at a depth the supervised guard
-  protects (`<root>/...` or `<jurisdiction>/<root>/...`), with no symlink on
-  the way;
+  resolve it (the checkout's own prefix at the root then under `<prefix>/`,
+  any other prefix under `rulespec-<prefix>/` then `<prefix>/`), to an
+  existing encoded module at a depth the supervised guard protects
+  (`<root>/...` or `<jurisdiction>/<root>/...`), with no symlink on the way;
 - known compose patterns, and plain-identifier or date rule metadata;
-- no numeric literals other than 0, 1 and 12 in any other transformation
-  value, lexed the way the engine lexes formulas (strings, then `#` comments).
+- no quotes or backslashes, and no numeric literals other than 0, 1 and 12,
+  in any other transformation value (`#` comments are ignored).
 
 This is a lexical tripwire. It catches a hand-written module or a literal
 amount, but arithmetic on the allowed literals is not prevented, so review
-still owns ProgramSpec formulas. Setting `guard-programs-root: true` instead
-requires an encoder apply manifest on every changed `programs/` file. No
-current encoder tool can produce one for a ProgramSpec, so opting in freezes
-the root.
+still owns ProgramSpec formulas. Setting `guard-programs-root: true` also
+requires a tracked manifest recording each changed `programs/` file's
+sha256. That check verifies no signature, and no current encoder tool can
+produce a ProgramSpec manifest.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it

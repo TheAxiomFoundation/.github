@@ -116,13 +116,14 @@ on:
         default: ""
       guard-programs-root:
         description: >-
-          Whether to require encoding manifests on the composed-pilot
-          `programs/` root too (encode#1053). When false (the default), the
-          pre-check instead requires every changed `programs/` file to have
-          the axiom-compose ProgramSpec shape. When true, `programs` is
-          guarded as a RuleSpec root rather than merely tolerated as an
-          allowed extra directory. No current encoder tool can attest a
-          ProgramSpec, so opting in freezes `programs/` edits.
+          Whether to also require encoding manifests on the composed-pilot
+          `programs/` root (encode#1053). The pre-check always requires every
+          changed `programs/` file to have the axiom-compose ProgramSpec
+          shape. When true, it additionally requires a tracked manifest
+          recording each file's sha256 (no signature is verified), and
+          `programs` is guarded as a RuleSpec root rather than merely
+          tolerated as an allowed extra directory. No current encoder tool
+          can produce a ProgramSpec manifest.
         required: false
         type: boolean
         default: false
@@ -248,9 +249,11 @@ jobs:
           # name encoded roots and whose formulas carry no literal amounts.
           # That is a lexical tripwire for hand-written modules and amounts,
           # not a proof of their absence (see the ProgramSpec shape notes
-          # below). A caller that sets `guard-programs-root: true` instead gets
-          # the legacy manifest check on `programs/`. No current encoder tool
-          # can produce a ProgramSpec manifest, so opting in freezes the root.
+          # below). A caller that sets `guard-programs-root: true` also gets
+          # the legacy manifest check on `programs/`. That check verifies no
+          # signature, and no current encoder tool can produce a ProgramSpec
+          # manifest, so opting in blocks ProgramSpec edits unless someone
+          # commits an unsigned manifest.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -310,13 +313,15 @@ jobs:
           # - Every import entry must resolve, the way compose and the engine
           #   resolve it, to an existing encoded module at a depth the
           #   supervised guard protects (`<root>/...` or
-          #   `<jurisdiction>/<root>/...`), with no symlink on the way.
+          #   `<jurisdiction>/<root>/...`), with no symlink on the way. Modules
+          #   under `composed/` and `legislation/` are checked here only for
+          #   placement; their provenance is the supervised guard's.
           # - Rule metadata values must be plain identifiers or dates, since
           #   the engine writes some of them unquoted into formula source.
-          #   All other transformation values are scanned as formula text with
-          #   the engine's lexing order (strings, then `#` comments). Only the
-          #   numeric literals 0, 1 and 12 (months and years) may appear;
-          #   amounts and rates come from encoded modules.
+          #   All other transformation values are scanned as formula text: no
+          #   quotes or backslashes (so no string can open), `#` comments
+          #   dropped, and only the numeric literals 0, 1 and 12 (months and
+          #   years). Amounts and rates come from encoded modules.
           # This catches hand-written modules and literal amounts, not every
           # computed constant: arithmetic on the allowed literals is not
           # prevented, and review still owns ProgramSpec formulas.
@@ -435,8 +440,10 @@ jobs:
           def program_spec_path(path: str) -> bool:
               """A `programs/` file this step shape-checks instead of manifest-checking."""
               # Companion `.test.yaml` files are not exempt: no ProgramSpec has
-              # one, and an import could otherwise name one as a module.
-              if "programs" in ROOTS or not path.endswith((".yaml", ".yml")):
+              # one, and an import could otherwise name one as a module. The
+              # shape check runs whether or not the caller opts in to the
+              # manifest check, which verifies no signatures.
+              if not path.endswith((".yaml", ".yml")):
                   return False
               parts = path.split("/")
               if len(parts) >= 2 and parts[0] == "programs":
@@ -483,10 +490,12 @@ jobs:
                   return None, target
               # Engine candidate_rule_repo_roots: the checkout serves its own
               # prefix at the root and under `<prefix>/`, and any other prefix
-              # under `<prefix>/`. The first existing file wins.
-              candidates = [f"{relative}.yaml", f"{prefix}/{relative}.yaml"]
-              if prefix != REPO_PREFIX:
-                  candidates = candidates[1:]
+              # under `rulespec-<prefix>/` and then `<prefix>/`. The first
+              # existing file wins.
+              if prefix == REPO_PREFIX:
+                  candidates = [f"{relative}.yaml", f"{prefix}/{relative}.yaml"]
+              else:
+                  candidates = [f"rulespec-{prefix}/{relative}.yaml", f"{prefix}/{relative}.yaml"]
               for candidate in candidates:
                   if Path(candidate).exists() or Path(candidate).is_symlink():
                       return candidate, target
@@ -537,9 +546,15 @@ jobs:
                       for item in pair
                       for found in formula_literals(item)
                   ]
-              return [
+              text = str(value)
+              # No ProgramSpec formula needs a string literal. Rejecting quotes
+              # and backslashes keeps the per-value lexing sound: the engine
+              # lexes every rule's formula as one source, with escapes, so an
+              # open string in one value could otherwise hide the next.
+              quoted = [character for character in "\"'\\" if character in text]
+              return [f"quote or backslash {character!r}" for character in quoted] + [
                   literal
-                  for literal in NUMBER.findall(formula_text(str(value)))
+                  for literal in NUMBER.findall(formula_text(text))
                   if Decimal(literal.replace("_", "")) not in ALLOWED_LITERALS
               ]
 
@@ -580,6 +595,8 @@ jobs:
 
               if through_symlink(path):
                   return ["is a symlink or sits under one"]
+              if not Path(path).is_file():
+                  return ["is not a regular file"]
               try:
                   document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
               except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
@@ -799,7 +816,7 @@ jobs:
                   changed = git(*diff, base, head) or []
 
           program_paths = sorted(
-              path for path in changed if program_spec_path(path) and Path(path).is_file()
+              path for path in changed if program_spec_path(path) and os.path.lexists(path)
           )
           program_issues = [
               (path, issue) for path in program_paths for issue in program_spec_issues(path)

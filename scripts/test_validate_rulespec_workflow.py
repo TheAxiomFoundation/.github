@@ -649,6 +649,15 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 ["scope key 'us:programs/us-xx/snap/helpers/bbce.test#' is neither federal, state nor a jurisdiction"],
             ),
             ("relative-entry", {spec: program_spec("us-xx/snap", scope="policies/../programs/x")}, {}, ["entry 'policies/../programs/x' (import us:policies/../programs/x) does not resolve"]),
+            # A foreign prefix never falls back to the repo root, and the
+            # engine's rulespec-<prefix>/ shadow is tried first and refused.
+            ("foreign-prefix-root", {spec: program_spec("us-xx/snap", scope="us-yy:regulations/7-cfr/273/9")}, {}, ["entry 'us-yy:regulations/7-cfr/273/9' (import us-yy:regulations/7-cfr/273/9) does not resolve"]),
+            (
+                "foreign-prefix-shadow",
+                {"rulespec-us-xx/policies/manual/page-1.yaml": bbce, spec: program_spec("us-xx/snap", scope="statutes/7/2014/a")},
+                {},
+                ["entry 'us-xx:policies/manual/page-1' resolves to rulespec-us-xx/policies/manual/page-1.yaml, which is not an encoded module"],
+            ),
             ("missing-entry", {spec: program_spec("us-xx/snap", scope="regulations/7-cfr/999")}, {}, ["entry 'regulations/7-cfr/999' (import us:regulations/7-cfr/999) does not resolve"]),
             (
                 "test-entry",
@@ -702,9 +711,23 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 {},
                 [f"(smuggled) formula carries the literal {literal}"],
             ))
+        # No formula needs a string, so quotes and backslashes are refused:
+        # the engine lexes all rules as one source with escapes, and an open
+        # string could otherwise hide a `#` or a literal from this scan.
+        for index, (formula, character) in enumerate([
+            ('if "\\" #" == "": snap_monthly_allotment else: snap_monthly_allotment + 1', '\\'),
+            ("if 'x' == '", "'"),
+            ('snap_benefit # "', '"'),
+        ]):
+            cases.append((
+                f"quoted-{index}",
+                {spec: program_spec("us-xx/snap", extra=f"  - pattern: derived_formula\n    name: quoted\n    effective_from: '2026-01-01'\n    formula: {json.dumps(formula)}\n")},
+                {},
+                [f"(quoted) formula carries the literal quote or backslash {character!r}"],
+            ))
         for name, files, links, messages in cases:
             head = branch(root, base, name, files, links)
-            for guard_programs in ("false", None):
+            for guard_programs in ("false", "true", None):
                 result = precheck(root, base, head, guard_programs)
                 assert result.returncode != 0, (name, result.stdout)
                 for message in messages:
