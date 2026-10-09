@@ -498,6 +498,8 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             "period: 2026-01\n"
             "outputs:\n  - snap_eligible\n"
             f"scope:\n  federal:\n    - {scope}\n"
+            "  state:\n    - us-xx:policies/manual/page-1\n"
+            "  jurisdictions:\n    - us\n    - us-xx\n"
             "transformations:\n"
             "  - pattern: derived_formula\n"
             "    name: annual_snap_benefit\n"
@@ -513,6 +515,16 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             "    name: cited_rule\n"
             "    effective_from: '2026-01-01'\n"
             "    formula: us:regulations/7-cfr/273/9#snap_standard_income_eligible\n"
+            "  - pattern: derived_formula\n"
+            "    name: annual_cited\n"
+            "    effective_from: '2026-01-01'\n"
+            "    formula: |-\n"
+            "      snap_monthly_allotment * 12  # 7 CFR 273.10(e)(2), FY 2026\n"
+            "  - pattern: sum_terms\n"
+            "    name: snap_gross_monthly_income\n"
+            "    effective_from: '2026-01-01'\n"
+            "    unit: USD\n"
+            "    terms:\n      - snap_countable_earned_income\n      - snap_countable_unearned_income\n"
             + extra
         )
 
@@ -542,13 +554,12 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             write(root, manifest_path, manifest(applied, content))
         base = commit(root, "manifested base")
 
-        # Assembled ProgramSpec edits, top-level and jurisdiction-nested, plus
-        # a companion test file: no manifest needed on the opt-out.
+        # Assembled ProgramSpec edits, top-level and jurisdiction-nested: no
+        # manifest needed on the opt-out.
         program_edit = branch(root, base, "edit-program-specs", {
             spec: program_spec("us-xx/snap", scope="policies/manual/page-1"),
-            "programs/us-xx/tanf/fy-2026.yaml": program_spec("us-xx/tanf"),
-            "us-xx/programs/snap/fy-2027.yaml": program_spec("us-xx/snap"),
-            "programs/us-xx/snap/fy-2026.test.yaml": "- name: not a spec\n",
+            "programs/us-xx/tanf/fy-2026.yaml": program_spec("us-xx/tanf", scope="us:statutes/7/2014/a"),
+            "us-xx/programs/snap/fy-2027.yaml": program_spec("us-xx/snap", scope="us-xx/policies/manual/page-1"),
         })
         for opt_out in ("false", None):
             result = precheck(root, base, program_edit, opt_out)
@@ -560,7 +571,6 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         assert f"{spec} content matches no sha256" in result.stderr
         assert "programs/us-xx/tanf/fy-2026.yaml has no tracked encoder apply manifest" in result.stderr
         assert "us-xx/programs/snap/fy-2027.yaml has no tracked encoder apply manifest" in result.stderr
-        assert "fy-2026.test.yaml" not in result.stderr
 
         # A hand-written module under programs/, imported through a spec's
         # scope, is rejected on the opt-out: axiom-compose indexes programs/
@@ -578,7 +588,41 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             assert result.returncode != 0
             assert "programs/us/helpers/bbce.yaml lacks ProgramSpec keys: outputs, period, program" in result.stderr
             assert "programs/us/helpers/bbce.yaml has keys a ProgramSpec does not take: format, rules" in result.stderr
-            assert f"{spec} scope.federal entry 'programs/us/helpers/bbce' is not under an encoded root" in result.stderr
+            assert f"{spec} scope.federal entry 'programs/us/helpers/bbce' is not an encoded-root path" in result.stderr
+
+        # Without an import scope axiom-compose resolves outputs across the
+        # whole checkout, reaching unguarded trees such as bulk/.
+        scopeless = branch(root, base, "scopeless", {
+            "bulk/bbce.yaml": "format: rulespec/v1\nrules: []\n",
+            spec: "program: us-xx/snap\nperiod: 2026-01\noutputs:\n  - smuggled_bbce_eligible\n",
+        })
+        result = precheck(root, base, scopeless, "false")
+        assert result.returncode != 0
+        assert f"{spec} has no import scope" in result.stderr
+
+        # Scope keys become import prefixes, so they must be federal, state
+        # or a jurisdiction; entries must be clean encoded-root paths; and a
+        # .test.yaml under programs/ is shape-checked, not exempt.
+        for name, files, message in [
+            (
+                "scope-key-import",
+                {
+                    "programs/us-xx/snap/helpers/bbce.test.yaml": "format: rulespec/v1\nrules: []\n",
+                    spec: program_spec("us-xx/snap").replace(
+                        "  federal:\n", '  "us:programs/us-xx/snap/helpers/bbce.test#":\n    - statutes/7/2014/a\n  federal:\n', 1
+                    ),
+                },
+                "scope key 'us:programs/us-xx/snap/helpers/bbce.test#' is neither federal, state nor a jurisdiction",
+            ),
+            ("relative-entry", {spec: program_spec("us-xx/snap", scope="policies/../programs/x")}, "entry 'policies/../programs/x' is not an encoded-root path"),
+            ("test-entry", {spec: program_spec("us-xx/snap", scope="policies/manual/page-1.test")}, "entry 'policies/manual/page-1.test' names a relative, test"),
+            ("tools-entry", {spec: program_spec("us-xx/snap", scope="us:tools/bbce")}, "entry 'us:tools/bbce' is not an encoded-root path"),
+            ("test-file", {"programs/us-xx/snap/fy-2026.test.yaml": "- name: not a spec\n"}, "programs/us-xx/snap/fy-2026.test.yaml is not a ProgramSpec mapping"),
+        ]:
+            head = branch(root, base, name, files)
+            result = precheck(root, base, head, "false")
+            assert result.returncode != 0, name
+            assert message in result.stderr, (name, result.stderr)
 
         # Amounts or rates typed into a composition, and unknown patterns.
         for name, extra, message in [
@@ -600,8 +644,44 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 "  - pattern: raw_rule\n    name: anything\n",
                 "(anything) uses unknown pattern 'raw_rule'",
             ),
+            # Formatting must not hide a literal: operators, slashes, digit
+            # separators, exponents, negatives, and list-valued fields.
+            *[
+                (
+                    f"literal-{index}",
+                    "  - pattern: derived_formula\n    name: smuggled\n"
+                    f"    effective_from: '2026-01-01'\n    formula: '{formula}'\n",
+                    f"(smuggled) formula carries the literal {literal}",
+                )
+                for index, (formula, literal) in enumerate([
+                    ("snap_poverty_line/2", "2"),
+                    ("snap_poverty_line-24", "24"),
+                    ("snap_poverty_line * 2_00", "2_00"),
+                    ("snap_poverty_line * 2e0", "2"),
+                    ("min(snap_benefit, 23.99)", "23.99"),
+                ])
+            ],
+            (
+                "negative-when-false",
+                "  - pattern: conditional_value\n    name: floor\n"
+                "    effective_from: '2026-01-01'\n    condition: snap_eligible\n"
+                "    when_true: snap_monthly_allotment\n    when_false: -24\n",
+                "(floor) when_false carries the literal -24",
+            ),
+            (
+                "literal-term",
+                "  - pattern: sum_terms\n    name: padded\n"
+                "    effective_from: '2026-01-01'\n    terms:\n      - snap_benefit\n      - 2610\n",
+                "(padded) terms carries the literal 2610",
+            ),
+            (
+                "qualified-programs-scope",
+                "",
+                "scope.federal entry 'us:programs/us/helpers/bbce' is not an encoded-root path",
+            ),
         ]:
-            head = branch(root, base, name, {spec: program_spec("us-xx/snap", extra=extra)})
+            scope = "us:programs/us/helpers/bbce" if name == "qualified-programs-scope" else "regulations/7-cfr/273/9"
+            head = branch(root, base, name, {spec: program_spec("us-xx/snap", scope=scope, extra=extra)})
             result = precheck(root, base, head, "false")
             assert result.returncode != 0, name
             assert message in result.stderr, (name, result.stderr)

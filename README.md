@@ -101,14 +101,23 @@ backfill a corpus that has no manifests). `axiom-encode manifest-census`
 reports each repo's encoder-generated / manual / unmanifested coverage.
 
 `programs/` holds axiom-compose ProgramSpecs, which are assembled rather than
-encoded, and the supervised guard does not cover it. By default (`guard-programs-root:
-false`) the early pre-check requires every changed `programs/` file to have the
-ProgramSpec shape: only ProgramSpec keys, scope entries under an encoded root,
-known compose patterns, and no numeric literals other than 0, 1 and 12 in
-formulas. That keeps hand-written modules and amounts out of the root. Setting
-`guard-programs-root: true` instead requires an encoder apply manifest on every
-changed `programs/` file. No current encoder tool can produce one for a
-ProgramSpec, so opting in freezes the root.
+encoded, and the supervised guard does not cover it. By default
+(`guard-programs-root: false`) the early pre-check requires every changed
+`programs/` file, `.test.yaml` included, to have the ProgramSpec shape:
+- only ProgramSpec keys;
+- import scope keys `federal`, `state` or a jurisdiction, with at least one
+  import entry;
+- import entries of the form `[prefix:][jurisdiction/]<legislation|policies|regulations|statutes>/...`;
+- known compose patterns;
+- no numeric literals other than 0, 1 and 12 in any formula-bound value
+  (qualified rule references and `#` comments are ignored).
+
+This is a lexical tripwire. It catches a hand-written module or a literal
+amount, but arithmetic on the allowed literals is not prevented, so review
+still owns ProgramSpec formulas. Setting `guard-programs-root: true` instead
+requires an encoder apply manifest on every changed `programs/` file. No
+current encoder tool can produce one for a ProgramSpec, so opting in freezes
+the root.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it

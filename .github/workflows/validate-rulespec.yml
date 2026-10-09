@@ -244,12 +244,13 @@ jobs:
           # `programs/` is the exception, because the supervised guard never
           # looks at it (see ROOTS below). By default this step is the only
           # gate there, and it checks shape rather than provenance: every
-          # changed file must be an axiom-compose ProgramSpec that wires
-          # encoded modules together, so the root can carry neither a
-          # hand-written module nor hand-entered amounts. A caller that sets
-          # `guard-programs-root: true` instead gets the legacy manifest check
-          # on `programs/`. No current encoder tool can produce a ProgramSpec
-          # manifest, so opting in freezes the root.
+          # changed file must be an axiom-compose ProgramSpec whose imports
+          # name encoded roots and whose formulas carry no literal amounts.
+          # That is a lexical tripwire for hand-written modules and amounts,
+          # not a proof of their absence (see the ProgramSpec shape notes
+          # below). A caller that sets `guard-programs-root: true` instead gets
+          # the legacy manifest check on `programs/`. No current encoder tool
+          # can produce a ProgramSpec manifest, so opting in freezes the root.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -296,13 +297,24 @@ jobs:
           ROOTS = {"statutes", "regulations", "policies"}
           if os.environ.get("GUARD_PROGRAMS_ROOT", "false").strip().lower() == "true":
               ROOTS.add("programs")
-          # ProgramSpec shape, from axiom-compose's ProgramSpec.from_mapping
-          # and its PATTERNS registry. Scope entries must name encoded roots:
-          # axiom-compose indexes `programs/` as corpus too, so a scope entry
-          # there could import a hand-written module. Transformations wire
-          # encoded rules together; amounts and rates come from encoded
-          # modules, so the only numeric literals allowed are 0 and 1 and the
-          # 12 that converts between months and years.
+          # ProgramSpec shape: a lexical tripwire for the regime's rule that
+          # ProgramSpecs only wire encoded modules together. It mirrors
+          # axiom-compose's ProgramSpec.from_mapping, import_scopes and
+          # PATTERNS registry (fabe0b3b), narrowed to the forms rulespec repos
+          # use:
+          # - Import scope keys are `federal`, `state` or a jurisdiction, and
+          #   every import entry (`[prefix:][jurisdiction/]<root>/...`) names an
+          #   encoded root. axiom-compose indexes the whole checkout, so an
+          #   entry elsewhere could import a hand-written module.
+          # - At least one import entry is required. Without one, axiom-compose
+          #   resolves each output's producer across the whole checkout.
+          # - axiom-compose splices every transformation value except the rule
+          #   metadata keys into a formula. There, only the numeric literals 0,
+          #   1 and 12 (months and years) may appear; amounts and rates come
+          #   from encoded modules. Qualified rule references and `#` comments
+          #   are dropped first. This catches literal amounts, not every
+          #   computed constant: arithmetic on the allowed literals is not
+          #   prevented, and review still owns that.
           PROGRAM_SPEC_KEYS = {
               "program",
               "period",
@@ -325,10 +337,29 @@ jobs:
               "sum_terms",
               "table_lookup_with_extension",
           }
-          SCOPE_ROOTS = {"legislation", "policies", "regulations", "statutes"}
-          FORMULA_FIELDS = ("formula", "when_true", "when_false", "predicate")
+          IMPORT_SCOPE_KEYS = {"federal", "state"}
+          NON_IMPORT_SCOPE_KEYS = {"jurisdictions", "include", "exclude"}
+          IMPORT_ENTRY = re.compile(
+              r"(?:(?P<prefix>[a-z]{2}(?:-[a-z0-9_]+)*):)?"
+              r"(?:[a-z]{2}(?:-[a-z0-9_]+)*/)?"
+              r"(?:legislation|policies|regulations|statutes)"
+              r"(?:/[A-Za-z0-9_~-][A-Za-z0-9_.~-]*)+"
+          )
+          RULE_METADATA_KEYS = {
+              "pattern",
+              "name",
+              "source",
+              "effective_from",
+              "entity",
+              "dtype",
+              "period",
+              "unit",
+              "arity",
+          }
           ALLOWED_LITERALS = {Decimal(0), Decimal(1), Decimal(12)}
-          NUMBER = re.compile(r"(?<![A-Za-z0-9_./:#-])[0-9]+(?:\.[0-9]+)?(?![A-Za-z0-9_./:#-])")
+          QUALIFIED_REFERENCE = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*:[A-Za-z0-9_./~-]+#[A-Za-z_][A-Za-z0-9_]*")
+          COMMENT = re.compile(r"(?:^|(?<=\s))#[^\n]*")
+          NUMBER = re.compile(r"(?<![A-Za-z0-9_])[0-9][0-9_]*(?:\.[0-9][0-9_]*)?")
           # Jurisdiction directory of a country monorepo (us/, us-co/, tz-znz/,
           # uk-ashford/): byte-identical to axiom-encode's
           # `_protected_rulespec_root_index` pattern, so a name that classifier
@@ -406,9 +437,9 @@ jobs:
 
           def program_spec_path(path: str) -> bool:
               """A `programs/` file this step shape-checks instead of manifest-checking."""
+              # Companion `.test.yaml` files are not exempt: no ProgramSpec has
+              # one, and a scope key could otherwise import one as a module.
               if "programs" in ROOTS or not path.endswith((".yaml", ".yml")):
-                  return False
-              if path.endswith((".test.yaml", ".test.yml")):
                   return False
               parts = path.split("/")
               if len(parts) >= 2 and parts[0] == "programs":
@@ -418,6 +449,40 @@ jobs:
                   and parts[1] == "programs"
                   and JURISDICTION.fullmatch(parts[0]) is not None
               )
+
+
+          def formula_literals(value: object) -> list[str]:
+              """Numeric literals other than 0, 1 and 12 in a formula-bound value."""
+              if isinstance(value, bool) or value is None:
+                  return []
+              if isinstance(value, (int, float)):
+                  return [] if Decimal(str(value)) in ALLOWED_LITERALS else [str(value)]
+              if isinstance(value, list):
+                  return [found for item in value for found in formula_literals(item)]
+              if isinstance(value, dict):
+                  return [
+                      found
+                      for pair in value.items()
+                      for item in pair
+                      for found in formula_literals(item)
+                  ]
+              text = COMMENT.sub(" ", QUALIFIED_REFERENCE.sub(" ", str(value)))
+              return [
+                  literal
+                  for literal in NUMBER.findall(text)
+                  if Decimal(literal.replace("_", "")) not in ALLOWED_LITERALS
+              ]
+
+
+          def import_entry_issue(entry: object) -> str | None:
+              text = str(entry)
+              match = IMPORT_ENTRY.fullmatch(text)
+              if match is None:
+                  return "is not an encoded-root path"
+              segments = text.partition(":")[2].split("/") if ":" in text else text.split("/")
+              if any(segment in {".", ".."} or segment.endswith((".test", ".yaml", ".yml")) for segment in segments):
+                  return "names a relative, test or file-suffixed path"
+              return None
 
 
           def program_spec_issues(path: str) -> list[str]:
@@ -441,13 +506,27 @@ jobs:
               if not isinstance(scope, dict):
                   issues.append("scope is not a mapping")
                   scope = {}
+              import_entries = 0
               for key, entries in scope.items():
+                  key = str(key)
+                  if key in NON_IMPORT_SCOPE_KEYS:
+                      continue
+                  if key not in IMPORT_SCOPE_KEYS and JURISDICTION.fullmatch(key) is None:
+                      issues.append(f"scope key {key!r} is neither federal, state nor a jurisdiction")
+                      continue
                   for entry in entries if isinstance(entries, list) else [entries]:
-                      if str(entry).split("/", 1)[0] not in SCOPE_ROOTS:
+                      import_entries += 1
+                      problem = import_entry_issue(entry)
+                      if problem:
                           issues.append(
-                              f"scope.{key} entry {entry!r} is not under an encoded root "
-                              f"({', '.join(sorted(SCOPE_ROOTS))})"
+                              f"scope.{key} entry {entry!r} {problem}; imports must be "
+                              "`[prefix:][jurisdiction/]<legislation|policies|regulations|statutes>/...`"
                           )
+              if not import_entries:
+                  issues.append(
+                      "has no import scope, so axiom-compose would resolve outputs "
+                      "across the whole checkout"
+                  )
               transformations = document.get("transformations") or []
               if not isinstance(transformations, list):
                   issues.append("transformations is not a list")
@@ -459,15 +538,14 @@ jobs:
                   label = f"transformations[{index}] ({item.get('name')})"
                   if item.get("pattern") not in COMPOSE_PATTERNS:
                       issues.append(f"{label} uses unknown pattern {item.get('pattern')!r}")
-                  for field in FORMULA_FIELDS:
-                      if field not in item:
+                  for field, value in item.items():
+                      if field in RULE_METADATA_KEYS:
                           continue
-                      for literal in NUMBER.findall(str(item[field])):
-                          if Decimal(literal) not in ALLOWED_LITERALS:
-                              issues.append(
-                                  f"{label} {field} carries the literal {literal}; "
-                                  "amounts and rates must come from encoded modules"
-                              )
+                      for literal in formula_literals(value):
+                          issues.append(
+                              f"{label} {field} carries the literal {literal}; "
+                              "amounts and rates must come from encoded modules"
+                          )
               return issues
 
 
