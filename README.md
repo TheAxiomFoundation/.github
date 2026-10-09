@@ -113,11 +113,15 @@ ProgramSpec shape:
   checkout's own prefix at the root then under `<prefix>/`, any other prefix
   under `rulespec-<prefix>/` then `<prefix>/`), to an existing regular-file
   encoded module at a depth the supervised guard protects (`<root>/...` or
-  `<jurisdiction>/<root>/...`), with no symlink on the way. Callers on other
-  compose or engine pins should confirm their resolution order matches;
+  `<jurisdiction>/<root>/...`), with no symlink on the way, that `git ls-files`
+  lists under exactly that spelling (a case variant opened by a
+  case-insensitive filesystem does not count). Callers on other compose or
+  engine pins should confirm their resolution order matches;
 - known compose patterns, and plain-identifier or date rule metadata;
 - no quotes or backslashes, and no numeric literals other than 0, 1 and 12,
-  in any other transformation value (`#` comments are ignored).
+  in any other transformation value (`#` comments are ignored). A literal is
+  read whole and must be spelled exactly `0`, `1` or `12`, so `1e2610`, `.12`,
+  `12.0`, `1_2` and `0x1` are refused, in formula text and as YAML numbers.
 
 This is a lexical tripwire. It catches a hand-written module or a literal
 amount, but arithmetic on the allowed literals is not prevented, so review

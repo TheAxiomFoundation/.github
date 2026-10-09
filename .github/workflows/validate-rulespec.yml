@@ -281,7 +281,6 @@ jobs:
           import subprocess
           import sys
           from datetime import date, datetime, timezone
-          from decimal import Decimal
           from pathlib import Path
 
           # Roots whose files need an encoder apply manifest here. The
@@ -312,15 +311,17 @@ jobs:
           # - Every import entry must resolve, the way compose and the engine
           #   resolve it, to an existing encoded module at a depth the
           #   supervised guard protects (`<root>/...` or
-          #   `<jurisdiction>/<root>/...`), with no symlink on the way. Modules
-          #   under `composed/` and `legislation/` are checked here only for
-          #   placement; their provenance is the supervised guard's.
+          #   `<jurisdiction>/<root>/...`), with no symlink on the way, and the
+          #   resolved path must be a `git ls-files` entry byte for byte.
+          #   Modules under `composed/` and `legislation/` are checked here
+          #   only for placement; their provenance is the supervised guard's.
           # - Rule metadata values must be plain identifiers or dates, since
           #   the engine writes some of them unquoted into formula source.
           #   All other transformation values are scanned as formula text: no
           #   quotes or backslashes (so no string can open), `#` comments
-          #   dropped, and only the numeric literals 0, 1 and 12 (months and
-          #   years). Amounts and rates come from encoded modules.
+          #   dropped, and no numeric literal spelled other than exactly 0, 1
+          #   or 12 (months and years). Amounts and rates come from encoded
+          #   modules.
           # This catches hand-written modules and literal amounts, not every
           # computed constant: arithmetic on the allowed literals is not
           # prevented, and review still owns ProgramSpec formulas.
@@ -357,8 +358,24 @@ jobs:
           # Positive table bounds of table_lookup_with_extension; left to review.
           STRUCTURAL_INT_KEYS = {"arity", "minimum_index", "maximum_index"}
           SOURCE_RELATION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*:[A-Za-z0-9_./~-]+#[A-Za-z_][A-Za-z0-9_.]*")
-          ALLOWED_LITERALS = {Decimal(0), Decimal(1), Decimal(12)}
-          NUMBER = re.compile(r"(?<![A-Za-z0-9_])[0-9][0-9_]*(?:\.[0-9][0-9_]*)?")
+          # Literals are compared by spelling, not value: `12.0`, `1_2` and a
+          # YAML `0x1` are refused even though they equal an allowed value.
+          ALLOWED_LITERALS = {"0", "1", "12"}
+          # Formula tokens for the literal scan, matched left to right. An
+          # identifier is consumed whole, so its digits (`x12`, `e2610`) are
+          # not literals, as in the engine. A numeric literal is tokenised
+          # whole. That covers the engine's own Int and Float forms (98af0dce
+          # src/formula.rs:224-261: an ASCII digit, then digits and `_`, then
+          # an optional `.` and digit-led fraction). It also covers a leading-dot
+          # fraction, an exponent with its sign, and any letter, digit, `_` or
+          # `.` glued on. The engine lexes `1e2610` as Int `1` then Ident
+          # `e2610`, `.12` as `.` then Int `12`, and `0x1` as Int `0` then
+          # Ident `x1`. Matching only the engine's form would let those
+          # allowed prefixes stand in for the whole spelling.
+          FORMULA_TOKEN = re.compile(
+              r"(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)"
+              r"|(?P<number>\.?[0-9](?:[A-Za-z0-9_.]|(?<=[eE])[+-])*)"
+          )
           REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").rpartition("/")[2] or Path.cwd().name
           REPO_PREFIX = REPOSITORY.removeprefix("rulespec-")
           # Jurisdiction directory of a country monorepo (us/, us-co/, tz-znz/,
@@ -494,6 +511,9 @@ jobs:
               # (AXIOM_RULESPEC_REPO_ROOTS set to the checkout, the composed
               # module written outside it), where the engine tries these
               # candidates before any location derived from the module or cwd.
+              # "Existing" is the filesystem's answer, so on a case-insensitive
+              # one a candidate can open a differently spelled tracked file;
+              # the caller requires an exact `git ls-files` entry.
               if prefix == REPO_PREFIX:
                   candidates = [f"{relative}.yaml", f"{prefix}/{relative}.yaml"]
               else:
@@ -533,12 +553,61 @@ jobs:
               return "".join(out)
 
 
+          class SpelledInt(int):
+              """A YAML int that keeps the scalar text it was loaded from."""
+
+              spelling = ""
+
+
+          class SpelledFloat(float):
+              """A YAML float that keeps the scalar text it was loaded from."""
+
+              spelling = ""
+
+
+          def load_program_spec(text: str) -> object:
+              """`yaml.safe_load`, except that numbers keep their spelling.
+
+              PyYAML resolves `0x1`, `0b1100`, `1_2` and `+12` to allowed int
+              values, and axiom-compose writes a numeric `when_false` into the
+              formula as `str(value)`, so the value alone cannot show how the
+              ProgramSpec spelled the literal.
+              """
+              import yaml
+
+              class SpellingLoader(yaml.SafeLoader):
+                  pass
+
+              def spelled(kind: type, construct):
+                  def constructor(loader, node):
+                      value = kind(construct(loader, node))
+                      value.spelling = node.value
+                      return value
+
+                  return constructor
+
+              SpellingLoader.add_constructor(
+                  "tag:yaml.org,2002:int",
+                  spelled(SpelledInt, yaml.SafeLoader.construct_yaml_int),
+              )
+              SpellingLoader.add_constructor(
+                  "tag:yaml.org,2002:float",
+                  spelled(SpelledFloat, yaml.SafeLoader.construct_yaml_float),
+              )
+              return yaml.load(text, Loader=SpellingLoader)
+
+
           def formula_literals(value: object) -> list[str]:
-              """Numeric literals other than 0, 1 and 12 in a formula-bound value."""
+              """Numeric literals not spelled exactly 0, 1 or 12 in a formula-bound value."""
               if isinstance(value, bool) or value is None:
                   return []
               if isinstance(value, (int, float)):
-                  return [] if Decimal(str(value)) in ALLOWED_LITERALS else [str(value)]
+                  # A float never qualifies: compose would write even
+                  # `!!float 12` into the formula as `12.0`.
+                  spelling = getattr(value, "spelling", "") or str(value)
+                  if isinstance(value, float):
+                      return [f"!!float {spelling}" if spelling in ALLOWED_LITERALS else spelling]
+                  return [] if spelling in ALLOWED_LITERALS else [spelling]
               if isinstance(value, list):
                   return [found for item in value for found in formula_literals(item)]
               if isinstance(value, dict):
@@ -555,9 +624,10 @@ jobs:
               # open string in one value could otherwise hide the next.
               quoted = [character for character in "\"'\\" if character in text]
               return [f"QUOTE:{character!r}" for character in quoted] + [
-                  literal
-                  for literal in NUMBER.findall(formula_text(text))
-                  if Decimal(literal.replace("_", "")) not in ALLOWED_LITERALS
+                  token.group("number")
+                  for token in FORMULA_TOKEN.finditer(formula_text(text))
+                  if token.group("number") is not None
+                  and token.group("number") not in ALLOWED_LITERALS
               ]
 
 
@@ -610,7 +680,7 @@ jobs:
               if not Path(path).is_file():
                   return ["is not a regular file"]
               try:
-                  document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+                  document = load_program_spec(Path(path).read_text(encoding="utf-8"))
               except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
                   return [f"is not readable YAML: {error}"]
               if not isinstance(document, dict):
@@ -652,6 +722,18 @@ jobs:
                           issues.append(
                               f"scope.{key} entry {entry!r} (import {target}) does not resolve "
                               "to a module in this checkout"
+                          )
+                      elif resolved not in tracked_set:
+                          # Classify only a byte-exact tracked spelling. On a
+                          # case-insensitive filesystem `us/regulations/x.yaml`
+                          # opens a tracked `us/Regulations/x.yaml`,
+                          # `US/regulations/x.yaml` or `us/regulations/x.YAML`,
+                          # none of which the supervised guard protects, and
+                          # the lowercase spelling would be classified in
+                          # their place.
+                          issues.append(
+                              f"scope.{key} entry {entry!r} resolves to {resolved}, which "
+                              "`git ls-files` does not list under exactly that spelling"
                           )
                       elif not encoded_module_path(resolved) or through_symlink(resolved):
                           issues.append(

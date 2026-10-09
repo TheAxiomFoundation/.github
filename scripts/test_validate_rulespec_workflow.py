@@ -631,7 +631,14 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 "symlinked-root",
                 {"bulk/bbce.yaml": bbce, spec: program_spec("us-xx/snap", scope="policies/ext.json/bbce")},
                 {"us/policies/ext.json": "../../bulk"},
-                ["entry 'policies/ext.json/bbce' resolves to us/policies/ext.json/bbce.yaml, which is not an encoded module"],
+                ["entry 'policies/ext.json/bbce' resolves to us/policies/ext.json/bbce.yaml, which `git ls-files` does not list under exactly that spelling"],
+            ),
+            # A tracked symlink is a `git ls-files` entry, but not a module.
+            (
+                "symlinked-module",
+                {"bulk/bbce.yaml": bbce, spec: program_spec("us-xx/snap", scope="regulations/7-cfr/273/alias")},
+                {"regulations/7-cfr/273/alias.yaml": "../../../bulk/bbce.yaml"},
+                ["entry 'regulations/7-cfr/273/alias' resolves to regulations/7-cfr/273/alias.yaml, which is not an encoded module"],
             ),
             (
                 "dangling-symlink-spec",
@@ -660,7 +667,7 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 "directory-import",
                 {"regulations/directory.yaml/README.txt": "not a module\n", spec: program_spec("us-xx/snap", scope="regulations/directory")},
                 {},
-                ["entry 'regulations/directory' resolves to regulations/directory.yaml, which is not a regular file"],
+                ["entry 'regulations/directory' resolves to regulations/directory.yaml, which `git ls-files` does not list under exactly that spelling"],
             ),
             ("null-outputs", {spec: program_spec("us-xx/snap").replace("outputs:\n  - snap_eligible\n", "outputs:\n", 1)}, {}, [f"{spec} outputs must be a non-empty list of rule names"]),
             (
@@ -715,21 +722,55 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         ]
         # Formatting must not hide a literal: operators, slashes, digit
         # separators, exponents, decimals, a `#` inside a string, and a
-        # trailing comment glued to the amount.
+        # trailing comment glued to the amount. A literal is tokenised whole
+        # and allowed only when spelled exactly 0, 1 or 12, so an allowed
+        # prefix (`1` of `1e2610`, `12` of `.12`, `0` of `0x1`) or an allowed
+        # value (`12.0`, `1_2`, `012`) does not let it through.
         for index, (formula, literal) in enumerate([
             ("snap_poverty_line/2", "2"),
             ("snap_poverty_line-24", "24"),
             ("snap_poverty_line * 2_00", "2_00"),
-            ("snap_poverty_line * 2e0", "2"),
+            ("snap_poverty_line * 2e0", "2e0"),
             ("min(snap_benefit, 23.99)", "23.99"),
             ("if snap_eligible: snap_monthly_allotment else:2610#x", "2610"),
             ('if snap_eligible == " #": snap_monthly_allotment else: 2610', "2610"),
+            ("snap_benefit * 1e2610", "1e2610"),
+            ("snap_benefit * .12", ".12"),
+            ("snap_benefit * 12.0", "12.0"),
+            ("snap_benefit * 1E1", "1E1"),
+            ("snap_benefit * 0x1", "0x1"),
+            ("snap_benefit * 1_2", "1_2"),
+            ("snap_benefit * 012", "012"),
+            ("snap_benefit * 12e-1", "12e-1"),
+            ("snap_benefit * 1.e5", "1.e5"),
+            ("snap_benefit.12", ".12"),
+            ("snap_benefit * 12 # x\n  * 1E+1", "1E+1"),
         ]):
             cases.append((
                 f"literal-{index}",
                 {spec: program_spec("us-xx/snap", extra=f"  - pattern: derived_formula\n    name: smuggled\n    effective_from: '2026-01-01'\n    formula: {json.dumps(formula)}\n")},
                 {},
-                [f"(smuggled) formula carries the literal {literal}"],
+                [f"(smuggled) formula carries the literal {literal}; amounts and rates"],
+            ))
+        # A numeric YAML scalar keeps its spelling: PyYAML loads `0x1`,
+        # `0b1100`, `1_2` and `+12` as allowed ints, and compose writes a
+        # numeric `when_false` into the formula as `str(value)`.
+        for index, (value, literal) in enumerate([
+            ("0x1", "0x1"),
+            ("12.0", "12.0"),
+            (".12", ".12"),
+            ("1_2", "1_2"),
+            ("+12", "+12"),
+            ("0b1100", "0b1100"),
+            ("-0", "-0"),
+            ("!!float 12", "!!float 12"),
+            ("1e3", "1e3"),
+        ]):
+            cases.append((
+                f"scalar-{index}",
+                {spec: program_spec("us-xx/snap", extra=f"  - pattern: conditional_value\n    name: scalar\n    effective_from: '2026-01-01'\n    condition: snap_eligible\n    when_true: snap_monthly_allotment\n    when_false: {value}\n")},
+                {},
+                [f"(scalar) when_false carries the literal {literal}; amounts and rates"],
             ))
         # No formula needs a string, so quotes and backslashes are refused:
         # the engine lexes all rules as one source with escapes, and an open
@@ -752,6 +793,56 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 assert result.returncode != 0, (name, result.stdout)
                 for message in messages:
                     assert message in result.stderr, (name, message, result.stderr)
+
+        # Allowed literals pass wherever they sit, and digits inside
+        # identifiers are not literals.
+        allowed = branch(root, base, "allowed-literals", {spec: program_spec("us-xx/snap", extra=(
+            "  - pattern: derived_formula\n    name: allowed\n    effective_from: '2026-01-01'\n"
+            "    formula: |-\n"
+            "      if snap_eligible and household.size_12 >= 1:\n"
+            "          max(limit_table[12] - x12 * e2610, 0) * 12 + _1 / E1  # 2610 per 7 CFR 273.10\n"
+            "      else:\n"
+            "          0\n"
+            "  - pattern: conditional_value\n    name: allowed_scalar\n    effective_from: '2026-01-01'\n"
+            "    condition: snap_eligible\n    when_true: snap_monthly_allotment\n    when_false: 12\n"
+        ))})
+        for opt_out in ("false", None):
+            result = precheck(root, base, allowed, opt_out)
+            assert result.returncode == 0, result.stderr
+
+        # An import must resolve to a byte-exact `git ls-files` entry before it
+        # is classified. On a case-insensitive filesystem (macOS, Windows) the
+        # lowercase import spelling opens each tracked case variant below, none
+        # of which the supervised guard protects. A case-sensitive filesystem
+        # (the Linux runner) presents the same thing to the pre-check when an
+        # untracked file sits at the lowercase spelling, so the test writes one
+        # there; `untracked-shadow` is that state on every filesystem.
+        (root / "CaseProbe").write_text("")
+        case_insensitive = (root / "caseprobe").exists()
+        (root / "CaseProbe").unlink()
+        not_tracked = "which `git ls-files` does not list under exactly that spelling"
+        for name, tracked_path, entry, resolved in [
+            ("case-directory", "us/Regulations/7-cfr/273/10.yaml", "regulations/7-cfr/273/10", "us/regulations/7-cfr/273/10.yaml"),
+            ("case-jurisdiction", "US/regulations/7-cfr/273/10.yaml", "regulations/7-cfr/273/10", "us/regulations/7-cfr/273/10.yaml"),
+            ("case-extension", "us/regulations/7-cfr/273/10.YAML", "regulations/7-cfr/273/10", "us/regulations/7-cfr/273/10.yaml"),
+            ("case-root", "Policies/manual/page-2.yaml", "policies/manual/page-2", "policies/manual/page-2.yaml"),
+            ("untracked-shadow", None, "regulations/7-cfr/273/11", "us/regulations/7-cfr/273/11.yaml"),
+        ]:
+            files = {spec: program_spec("us-xx/snap", scope=entry)}
+            if tracked_path is not None:
+                files[tracked_path] = bbce
+            head = branch(root, base, name, files)
+            if tracked_path is None or not case_insensitive:
+                write(root, resolved, bbce)
+            listed = set(git(root, "ls-files", "-z").split("\0"))
+            assert tracked_path is None or tracked_path in listed, (name, sorted(listed))
+            assert resolved not in listed and (root / resolved).is_file(), name
+            for guard_programs in ("false", "true", None):
+                result = precheck(root, base, head, guard_programs)
+                assert result.returncode != 0, (name, result.stdout)
+                message = f"entry '{entry}' resolves to {resolved}, {not_tracked}"
+                assert message in result.stderr, (name, message, result.stderr)
+            git(root, "clean", "-fdq")
 
         # A gitlink (submodule) named like a spec is not a regular file.
         git(root, "checkout", "-q", base)
@@ -798,6 +889,194 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         result = precheck(root, base, manifested_edit, "false")
         assert result.returncode == 0, result.stderr
         assert "every one carries an encoder apply manifest" in result.stdout
+
+
+def precheck_definitions() -> dict:
+    """The pre-check's constants and functions, without its git-driven body."""
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    step = next(
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == "Reject unmanifested RuleSpec content"
+    )
+    source = step["run"].split("python3 <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    definitions, body, _ = textwrap.dedent(source).partition(
+        '\ntracked = git("ls-files", "-z") or []\n'
+    )
+    assert body, "pre-check body marker moved"
+    namespace: dict = {"__name__": "precheck"}
+    exec(compile(definitions, "precheck", "exec"), namespace)
+    return namespace
+
+
+def engine_numeric_tokens(source: str) -> list[tuple[str, int, int]] | None:
+    """(kind, start, end) of each Int, Float and Date token the engine lexes.
+
+    A port of `Lexer::tokenise` in axiom-rules-engine 98af0dce (the artifact
+    engine rulespec-us pins), src/formula.rs:176-412, kept to what decides
+    where a numeric token starts and ends: `#` comments (:189-195),
+    `is_ascii_whitespace` (:197-201), dates (:207-222), numbers (:224-261),
+    identifiers and paths (:314-359), and operators (:361-407). Quotes are
+    left out because the pre-check refuses every quote. None is a lex error.
+    """
+    data = source.encode()
+    size = len(data)
+
+    def digit(index: int) -> bool:
+        return index < size and 0x30 <= data[index] <= 0x39
+
+    def ident_start(index: int) -> bool:
+        return index < size and (chr(data[index]).isascii() and chr(data[index]).isalpha() or data[index] == 0x5F)
+
+    def ident_part(index: int) -> bool:
+        return ident_start(index) or digit(index)
+
+    tokens = []
+    pos = 0
+    while pos < size:
+        byte = data[pos]
+        if byte == ord("#"):
+            while pos < size and data[pos] != ord("\n"):
+                pos += 1
+            continue
+        if byte in b" \t\n\x0c\r":
+            pos += 1
+            continue
+        if digit(pos) and pos + 10 <= size:
+            window = data[pos : pos + 10]
+            if window[4] == window[7] == ord("-") and all(
+                index in (4, 7) or 0x30 <= value <= 0x39 for index, value in enumerate(window)
+            ):
+                tokens.append(("Date", pos, pos + 10))
+                pos += 10
+                continue
+        if digit(pos):
+            end = pos
+            while digit(end) or (end < size and data[end] == ord("_")):
+                end += 1
+            kind = "Int"
+            if end < size and data[end] == ord(".") and digit(end + 1):
+                kind = "Float"
+                end += 1
+                while digit(end) or (end < size and data[end] == ord("_")):
+                    end += 1
+            tokens.append((kind, pos, end))
+            pos = end
+            continue
+        if ident_start(pos):
+            end = pos
+            while ident_part(end):
+                end += 1
+            while end < size and data[end] == ord("/") and ident_start(end + 1):
+                end += 2
+                while ident_part(end):
+                    end += 1
+            pos = end
+            continue
+        if data[pos : pos + 2] in (b"=>", b"<=", b">=", b"==", b"!=", b"->"):
+            pos += 2
+            continue
+        if byte in b":,.=+-*/<>()[]":
+            pos += 1
+            continue
+        return None
+    return tokens
+
+
+def test_formula_literal_scan_covers_every_engine_numeric_literal() -> None:
+    import itertools
+    import random
+
+    precheck = precheck_definitions()
+    formula_literals = precheck["formula_literals"]
+    formula_text = precheck["formula_text"]
+    token = precheck["FORMULA_TOKEN"]
+    allowed = {"0", "1", "12"}
+    assert precheck["ALLOWED_LITERALS"] == allowed
+
+    # The port agrees with the engine on the forms the review raised (lexed
+    # by the extracted 98af0dce lexer when this test was written).
+    for source, expected in [
+        ("snap_benefit * 1e2610", ["1"]),
+        ("snap_benefit * .12", ["12"]),
+        ("snap_benefit * 12.0", ["12.0"]),
+        ("snap_benefit * 1E1", ["1"]),
+        ("snap_benefit * 0x1", ["0"]),
+        ("x * 1_2", ["1_2"]),
+        ("x * 12.", ["12"]),
+        ("a 2026-01-01", ["2026-01-01"]),
+        ("x.12", ["12"]),
+    ]:
+        lexed = engine_numeric_tokens(source)
+        assert [source[start:end] for _, start, end in lexed] == expected, source
+
+    checked = [0]
+
+    def check(source: str) -> None:
+        engine = engine_numeric_tokens(source)
+        if engine is None:
+            return
+        text = formula_text(source)
+        # The engine drops `#` comments exactly as the pre-check does.
+        stripped = engine_numeric_tokens(text)
+        assert [source[s:e] for _, s, e in engine] == [text[s:e] for _, s, e in stripped], source
+        spans = [match.span() for match in token.finditer(text) if match.group("number")]
+        refused = formula_literals(source)
+        for kind, start, end in stripped:
+            if kind == "Date":
+                # Scanned as `dddd`, `dd`, `dd`, none spelled 0, 1 or 12.
+                assert refused, source
+                continue
+            # Every engine number sits inside one scanned literal, so one
+            # the engine reads as other than exactly 0, 1 or 12 is refused.
+            assert any(a <= start and end <= b for a, b in spans), (source, text[start:end])
+            if text[start:end] not in allowed:
+                assert refused, (source, text[start:end])
+        checked[0] += 1
+
+    # Exhaustive over every string of up to four characters drawn from
+    # digits, separators, exponent and radix letters, signs, comments and
+    # operators, then seeded random strings up to 16 characters long.
+    alphabet = "0125.eEx_+- #\n/*a"
+    for length in range(1, 5):
+        for characters in itertools.product(alphabet, repeat=length):
+            check("".join(characters))
+    generator = random.Random(20261009)
+    for _ in range(100_000):
+        check("".join(generator.choices(alphabet, k=generator.randint(5, 16))))
+    for source in ("0000-00-00", "x 1999-12-31*1", "2026-01-01x", "12 # 2026-01-01\n- 1"):
+        check(source)
+    # Every generated source lexes: the alphabet holds no character the
+    # engine rejects, so none of the checks above was skipped.
+    assert checked[0] == sum(len(alphabet) ** n for n in range(1, 5)) + 100_004, checked[0]
+
+    # Formulas built only from allowed literals, identifiers carrying digits,
+    # field access, comments and operators are never refused.
+    pieces = [
+        "snap_benefit", "x12", "e2610", "E1", "_1", "household.size_12",
+        "limit_table[12]", "max(x, 0)", "0", "1", "12", "+", "-", "*", "/",
+        "(", ")", "<=", ">=", "==", "!=", "if", "else:", "and", "or", "not",
+        "# 2610 per 7 CFR 273.10\n",
+    ]
+    for _ in range(20_000):
+        source = " ".join(generator.choices(pieces, k=generator.randint(1, 12)))
+        assert formula_literals(source) == [], source
+
+    # A numeric YAML scalar is judged by its spelling and an int's type.
+    load = precheck["load_program_spec"]
+    for scalar, expected in [
+        ("0", []), ("1", []), ("12", []),
+        ("0x1", ["0x1"]), ("0o14", ["0o14"]), ("0b1100", ["0b1100"]),
+        ("1_2", ["1_2"]), ("+12", ["+12"]), ("012", ["012"]), ("-0", ["-0"]),
+        ("12.0", ["12.0"]), (".12", [".12"]), ("1.0e+1", ["1.0e+1"]),
+        (".inf", [".inf"]), (".nan", [".nan"]), ("!!float 12", ["!!float 12"]),
+        ("!!int 12", []), ("'12'", []), ("1e3", ["1e3"]), ("true", []),
+    ]:
+        value = load(f"when_false: {scalar}\n")["when_false"]
+        assert formula_literals(value) == expected, (scalar, value)
 
 
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
@@ -1039,6 +1318,7 @@ def main() -> None:
     test_release_pin_companion_accepts_exact_staged_consumption()
     test_generated_guard_resolves_scheduled_base_to_exact_commit()
     test_unmanifested_precheck_guards_programs_only_on_opt_in()
+    test_formula_literal_scan_covers_every_engine_numeric_literal()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_validation_jobs_are_bounded_in_time_and_parallelism()
     test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix()
