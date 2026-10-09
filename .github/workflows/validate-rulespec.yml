@@ -280,6 +280,7 @@ jobs:
           import re
           import subprocess
           import sys
+          import unicodedata
           from datetime import date, datetime, timezone
           from pathlib import Path
 
@@ -311,8 +312,9 @@ jobs:
           # - Every import entry must resolve, the way compose and the engine
           #   resolve it, to an existing encoded module at a depth the
           #   supervised guard protects (`<root>/...` or
-          #   `<jurisdiction>/<root>/...`), with no symlink on the way, and the
-          #   resolved path must be a `git ls-files` entry byte for byte.
+          #   `<jurisdiction>/<root>/...`), with no symlink on the way. The
+          #   resolved path must be a `git ls-files` entry byte for byte, and
+          #   no other tracked path may match it under case folding.
           #   Modules under `composed/` and `legislation/` are checked here
           #   only for placement; their provenance is the supervised guard's.
           # - Rule metadata values must be plain identifiers or dates, since
@@ -355,8 +357,12 @@ jobs:
           IDENTIFIER_METADATA_KEYS = {"name", "entity", "dtype", "period", "unit"}
           IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
           DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-          # Positive table bounds of table_lookup_with_extension; left to review.
+          # Relation arity and the table bounds of table_lookup_with_extension.
+          # Compose writes the bounds into that pattern's formula, so they are
+          # literals of any size, left to review; they must at least be
+          # positive integers spelled in plain decimal.
           STRUCTURAL_INT_KEYS = {"arity", "minimum_index", "maximum_index"}
+          STRUCTURAL_INT = re.compile(r"[1-9][0-9]*")
           SOURCE_RELATION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*:[A-Za-z0-9_./~-]+#[A-Za-z_][A-Za-z0-9_.]*")
           # Literals are compared by spelling, not value: `12.0`, `1_2` and a
           # YAML `0x1` are refused even though they equal an allowed value.
@@ -490,6 +496,26 @@ jobs:
               return any(Path(*parts[: index + 1]).is_symlink() for index in range(len(parts)))
 
 
+          TRACKED_BY_FOLD: dict[str, set[str]] = {}
+
+
+          def case_variants(path: str) -> list[str]:
+              """Other tracked paths a case-insensitive filesystem treats as `path`.
+
+              APFS and NTFS fold case (and APFS also normalises Unicode), so
+              of two such tracked paths only one file exists on disk there,
+              holding either path's content.
+              """
+
+              def fold(name: str) -> str:
+                  return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+              if not TRACKED_BY_FOLD:
+                  for tracked_path in tracked_set:
+                      TRACKED_BY_FOLD.setdefault(fold(tracked_path), set()).add(tracked_path)
+              return sorted(TRACKED_BY_FOLD.get(fold(path), set()) - {path})
+
+
           def resolve_import(program: str, key: str, entry: str) -> tuple[str | None, str]:
               """(resolved module path, import target) as compose and the engine resolve it."""
               # axiom-compose _scope_target: `prefix:path` passes through;
@@ -581,7 +607,15 @@ jobs:
               def spelled(kind: type, construct):
                   def constructor(loader, node):
                       value = kind(construct(loader, node))
-                      value.spelling = node.value
+                      # Only a plain scalar's text is its spelling. A tagged
+                      # quoted or block scalar is read after escapes and
+                      # folding (`!!int "\x31\x32"` is 12), so it never
+                      # matches an allowed spelling.
+                      if node.style is None:
+                          value.spelling = node.value
+                      else:
+                          style = "quoted" if node.style in "'\"" else "block"
+                          value.spelling = f"{node.value!r} ({style}, not a plain scalar)"
                       return value
 
                   return constructor
@@ -653,8 +687,17 @@ jobs:
                       if any(ord(character) < 32 for character in str(value)):
                           issues.append(f"{label} source contains control characters")
                   elif field in STRUCTURAL_INT_KEYS:
-                      if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                          issues.append(f"{label} {field} {value!r} is not a positive integer")
+                      spelling = getattr(value, "spelling", "")
+                      if (
+                          isinstance(value, bool)
+                          or not isinstance(value, int)
+                          or value < 1
+                          or STRUCTURAL_INT.fullmatch(spelling) is None
+                      ):
+                          issues.append(
+                              f"{label} {field} {spelling or repr(value)} is not a positive "
+                              "integer spelled in plain decimal"
+                          )
                   elif field == "source_relation" and isinstance(value, str) and SOURCE_RELATION.fullmatch(value):
                       continue
                   else:
@@ -683,6 +726,10 @@ jobs:
                   document = load_program_spec(Path(path).read_text(encoding="utf-8"))
               except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
                   return [f"is not readable YAML: {error}"]
+              except (ValueError, TypeError, KeyError) as error:
+                  # A tagged scalar its constructor cannot build, such as
+                  # `!!int 12.0` or `!!bool 1`.
+                  return [f"is not readable YAML: a tagged scalar does not construct ({error!r})"]
               if not isinstance(document, dict):
                   return ["is not a ProgramSpec mapping"]
               issues: list[str] = []
@@ -734,6 +781,15 @@ jobs:
                           issues.append(
                               f"scope.{key} entry {entry!r} resolves to {resolved}, which "
                               "`git ls-files` does not list under exactly that spelling"
+                          )
+                      elif case_variants(resolved):
+                          # Exact, but sharing one file on a case-insensitive
+                          # filesystem with another tracked path, which may be
+                          # an unguarded one.
+                          issues.append(
+                              f"scope.{key} entry {entry!r} resolves to {resolved}, which a "
+                              "case-insensitive filesystem cannot tell apart from tracked "
+                              + ", ".join(case_variants(resolved))
                           )
                       elif not encoded_module_path(resolved) or through_symlink(resolved):
                           issues.append(

@@ -719,6 +719,23 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 {},
                 ["(padded) terms carries the literal 2610"],
             ),
+            # Table bounds reach the formula, so they are spelled in plain
+            # decimal even though their size is left to review.
+            (
+                "hex-bound",
+                {spec: program_spec("us-xx/snap", extra="  - pattern: table_lookup_with_extension\n    name: hex_bound\n    effective_from: '2026-01-01'\n    index: household_size\n    table: limit_table\n    extension: limit_each_additional_member\n    minimum_index: !!int '1'\n    maximum_index: 0x1F4\n")},
+                {},
+                [
+                    "(hex_bound) minimum_index '1' (quoted, not a plain scalar) is not a positive integer spelled in plain decimal",
+                    "(hex_bound) maximum_index 0x1F4 is not a positive integer spelled in plain decimal",
+                ],
+            ),
+            (
+                "unconstructible-tag",
+                {spec: program_spec("us-xx/snap", extra="  - pattern: conditional_value\n    name: tagged\n    effective_from: '2026-01-01'\n    condition: snap_eligible\n    when_true: snap_monthly_allotment\n    when_false: !!int 12.0\n")},
+                {},
+                [f"{spec} is not readable YAML: a tagged scalar does not construct"],
+            ),
         ]
         # Formatting must not hide a literal: operators, slashes, digit
         # separators, exponents, decimals, a `#` inside a string, and a
@@ -765,6 +782,9 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
             ("-0", "-0"),
             ("!!float 12", "!!float 12"),
             ("1e3", "1e3"),
+            # A tagged quoted or block scalar is read after escapes.
+            ('!!int "\\x31\\x32"', "'12' (quoted, not a plain scalar)"),
+            ("!!int '12'", "'12' (quoted, not a plain scalar)"),
         ]):
             cases.append((
                 f"scalar-{index}",
@@ -843,6 +863,32 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
                 message = f"entry '{entry}' resolves to {resolved}, {not_tracked}"
                 assert message in result.stderr, (name, message, result.stderr)
             git(root, "clean", "-fdq")
+
+        # Two tracked paths that differ only in case share one file on a
+        # case-insensitive filesystem, holding either one's content, so an
+        # exact import of one of them is refused as well. The index entry is
+        # added directly because such a filesystem cannot hold both files.
+        git(root, "checkout", "-q", base)
+        git(root, "checkout", "-q", "-B", "case-collision")
+        write(root, "us/regulations/7-cfr/273/12.yaml", module)
+        write(root, "bulk/bbce.yaml", bbce)
+        write(root, spec, program_spec("us-xx/snap", scope="regulations/7-cfr/273/12"))
+        git(root, "add", "-A")
+        blob = git(root, "hash-object", "-w", "bulk/bbce.yaml")
+        git(root, "update-index", "--add", "--cacheinfo", f"100644,{blob},us/Regulations/7-cfr/273/12.yaml")
+        git(root, "commit", "-qm", "case collision")
+        collision = git(root, "rev-parse", "HEAD")
+        for guard_programs in ("false", "true", None):
+            result = precheck(root, base, collision, guard_programs)
+            assert result.returncode != 0, result.stdout
+            message = (
+                "entry 'regulations/7-cfr/273/12' resolves to us/regulations/7-cfr/273/12.yaml, "
+                "which a case-insensitive filesystem cannot tell apart from tracked "
+                "us/Regulations/7-cfr/273/12.yaml"
+            )
+            assert message in result.stderr, result.stderr
+        git(root, "checkout", "-qf", base)
+        git(root, "clean", "-fdq")
 
         # A gitlink (submodule) named like a spec is not a regular file.
         git(root, "checkout", "-q", base)
@@ -1074,6 +1120,8 @@ def test_formula_literal_scan_covers_every_engine_numeric_literal() -> None:
         ("12.0", ["12.0"]), (".12", [".12"]), ("1.0e+1", ["1.0e+1"]),
         (".inf", [".inf"]), (".nan", [".nan"]), ("!!float 12", ["!!float 12"]),
         ("!!int 12", []), ("'12'", []), ("1e3", ["1e3"]), ("true", []),
+        ('!!int "\\x31\\x32"', ["'12' (quoted, not a plain scalar)"]),
+        ("!!int |-\n  12", ["'12' (block, not a plain scalar)"]),
     ]:
         value = load(f"when_false: {scalar}\n")["when_false"]
         assert formula_literals(value) == expected, (scalar, value)
