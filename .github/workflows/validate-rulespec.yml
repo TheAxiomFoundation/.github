@@ -491,8 +491,9 @@ jobs:
               # prefix at the root and under `<prefix>/`, and any other prefix
               # under `rulespec-<prefix>/` and then `<prefix>/`. The first
               # existing file wins. This mirrors how program builds compile
-              # (AXIOM_RULESPEC_REPO_ROOTS set to the checkout, cwd outside it);
-              # a compile from inside the checkout would try more locations.
+              # (AXIOM_RULESPEC_REPO_ROOTS set to the checkout, the composed
+              # module written outside it), where the engine tries these
+              # candidates before any location derived from the module or cwd.
               if prefix == REPO_PREFIX:
                   candidates = [f"{relative}.yaml", f"{prefix}/{relative}.yaml"]
               else:
