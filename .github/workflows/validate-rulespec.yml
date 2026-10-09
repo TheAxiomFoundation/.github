@@ -212,6 +212,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
           EVENT_NAME: ${{ github.event_name }}
           RUN_GENERATED_GUARD: ${{ inputs.run-generated-guard }}
+          GUARD_PROGRAMS_ROOT: ${{ inputs.guard-programs-root }}
         run: |
           set -euo pipefail
           # Fail closed on hand-authored RuleSpec BEFORE any toolchain
@@ -260,12 +261,21 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          # Roots that hold encoded RuleSpec modules: exactly axiom-encode's
-          # RULESPEC_SOURCE_ROOTS, the default `--roots` of the supervised
-          # `guard-generated` step. `legislation/` is deliberately NOT here:
-          # the supervised guard does not protect it, and this pre-check must
-          # reject a strict subset of what that guard rejects.
-          ROOTS = {"statutes", "regulations", "policies", "programs"}
+          # Roots that hold encoded RuleSpec modules. The supervised
+          # `guard-generated` step guards axiom-encode's
+          # RULESPEC_ATOMIC_MODULE_ROOTS (legislation, policies, regulations,
+          # statutes) and, since the encoder hard cut (axiom-encode#1108),
+          # never `programs/`: ProgramSpecs are assembled axiom-compose
+          # specs, not encoder output, and no signer or manifest surface
+          # covers them. This pre-check must reject a strict subset of what
+          # that guard rejects, so `programs/` is guarded here only when the
+          # caller opts in with `guard-programs-root: true`, the same input
+          # that adds `programs` to the validate roots below. `legislation/`
+          # stays unguarded here, as before (82d9ff5); a subset of the
+          # supervised guard's roots is still a subset.
+          ROOTS = {"statutes", "regulations", "policies"}
+          if os.environ.get("GUARD_PROGRAMS_ROOT", "false").strip().lower() == "true":
+              ROOTS.add("programs")
           # Jurisdiction directory of a country monorepo (us/, us-co/, tz-znz/,
           # uk-ashford/): byte-identical to axiom-encode's
           # `_protected_rulespec_root_index` pattern, so a name that classifier

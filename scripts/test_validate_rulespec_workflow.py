@@ -442,6 +442,108 @@ def test_generated_guard_resolves_scheduled_base_to_exact_commit() -> None:
         assert resolve(root, event="push", before="HEAD~1").returncode != 0
 
 
+def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    step = next(
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == "Reject unmanifested RuleSpec content"
+    )
+    # The opt-in must reach the step from the same input that adds
+    # `programs` to the validate roots.
+    assert step["env"]["GUARD_PROGRAMS_ROOT"] == "${{ inputs.guard-programs-root }}"
+    assert "${{" not in step["run"]
+
+    def manifest(path: str, content: str) -> str:
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        return json.dumps({"applied_files": [{"path": path, "sha256": digest}]})
+
+    def write(root: Path, relative: str, content: str) -> None:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+    def precheck(root: Path, base: str, head: str, guard_programs: str | None):
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "GUARD_PROGRAMS_ROOT"
+        } | {
+            "BASE_SHA": base,
+            "GITHUB_SHA": head,
+            "EVENT_NAME": "pull_request",
+            "RUN_GENERATED_GUARD": "true",
+        }
+        if guard_programs is not None:
+            env["GUARD_PROGRAMS_ROOT"] = guard_programs
+        git(root, "checkout", "-q", head)
+        return subprocess.run(
+            ["bash", "-c", step["run"]],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    spec = "programs/us-xx/snap/fy-2026.yaml"
+    federal = "regulations/7-cfr/273/9.yaml"
+    state = "us-xx/policies/manual/page-1.yaml"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        for relative, content, manifest_path, applied in [
+            (spec, "program: us-xx/snap\n", ".axiom/encoding-manifests/programs/us-xx/snap/fy-2026.json", spec),
+            (federal, "format: rulespec/v1\n", ".axiom/encoding-manifests/regulations/7-cfr/273/9.json", federal),
+            (state, "format: rulespec/v1\n", "us-xx/.axiom/encoding-manifests/policies/manual/page-1.json", "policies/manual/page-1.yaml"),
+        ]:
+            write(root, relative, content)
+            write(root, manifest_path, manifest(applied, content))
+        base = commit(root, "manifested base")
+
+        # A hand-assembled ProgramSpec edit carries no fresh manifest.
+        write(root, spec, "program: us-xx/snap\nperiod: 2026-01\n")
+        write(root, "programs/us-xx/tanf/fy-2026.yaml", "program: us-xx/tanf\n")
+        program_edit = commit(root, "edit program specs")
+        for opt_out in ("false", None):
+            result = precheck(root, base, program_edit, opt_out)
+            assert result.returncode == 0, result.stderr
+            assert "No guarded RuleSpec content in scope" in result.stdout
+        result = precheck(root, base, program_edit, "true")
+        assert result.returncode != 0
+        assert f"{spec} content matches no sha256" in result.stderr
+        assert "programs/us-xx/tanf/fy-2026.yaml has no tracked encoder apply manifest" in result.stderr
+
+        # Atomic modules stay guarded whatever the programs opt-in says.
+        for relative in (federal, state):
+            git(root, "checkout", "-q", base)
+            git(root, "checkout", "-q", "-B", f"edit-{len(relative)}")
+            write(root, relative, "format: rulespec/v1\nrules: []\n")
+            atomic_edit = commit(root, f"hand-edit {relative}")
+            for guard_programs in ("false", "true", None):
+                result = precheck(root, base, atomic_edit, guard_programs)
+                assert result.returncode != 0, (relative, guard_programs)
+                assert f"{relative} content matches no sha256" in result.stderr
+
+        # A re-manifested atomic edit still passes under the opt-out.
+        git(root, "checkout", "-q", base)
+        git(root, "checkout", "-q", "-B", "re-manifested")
+        write(root, federal, "format: rulespec/v1\nrules: []\n")
+        write(
+            root,
+            ".axiom/encoding-manifests/regulations/7-cfr/273/9.json",
+            manifest(federal, "format: rulespec/v1\nrules: []\n"),
+        )
+        manifested_edit = commit(root, "re-manifested edit")
+        result = precheck(root, base, manifested_edit, "false")
+        assert result.returncode == 0, result.stderr
+        assert "every one carries an encoder apply manifest" in result.stdout
+
+
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Enforce validation waiver ratchet")
@@ -680,6 +782,7 @@ def main() -> None:
     test_release_pin_companion_requires_strict_retirement()
     test_release_pin_companion_accepts_exact_staged_consumption()
     test_generated_guard_resolves_scheduled_base_to_exact_commit()
+    test_unmanifested_precheck_guards_programs_only_on_opt_in()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_validation_jobs_are_bounded_in_time_and_parallelism()
     test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix()
