@@ -116,12 +116,14 @@ on:
         default: ""
       guard-programs-root:
         description: >-
-          Whether to require encoding manifests on the composed-pilot
-          `programs/` root too (encode#1053). Opt-in per repo: enable only
-          after every existing `programs/` file has an encoder apply-manifest
-          or a manual attestation, otherwise the guard fails on the backlog.
-          When true, `programs` is guarded as a RuleSpec root rather than
-          merely tolerated as an allowed extra directory.
+          Whether to also require encoding manifests on the composed-pilot
+          `programs/` root (encode#1053). The pre-check always requires every
+          changed `programs/` file to have the axiom-compose ProgramSpec
+          shape. When true, it additionally requires a tracked encoding
+          manifest for each file (no signature is verified), and
+          `programs` is guarded as a RuleSpec root rather than merely
+          tolerated as an allowed extra directory. No current encoder tool
+          can produce a ProgramSpec manifest.
         required: false
         type: boolean
         default: false
@@ -206,12 +208,21 @@ jobs:
               raise SystemExit(1)
           '
 
+      - name: Set up Python for the RuleSpec pre-check
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install the ProgramSpec shape-check parser
+        run: python -m pip install --disable-pip-version-check pyyaml==6.0.3
+
       - name: Reject unmanifested RuleSpec content
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
           EVENT_NAME: ${{ github.event_name }}
           RUN_GENERATED_GUARD: ${{ inputs.run-generated-guard }}
+          GUARD_PROGRAMS_ROOT: ${{ inputs.guard-programs-root }}
         run: |
           set -euo pipefail
           # Fail closed on hand-authored RuleSpec BEFORE any toolchain
@@ -223,13 +234,25 @@ jobs:
           # This step runs in the first job, before any of that, and it is also
           # where `run-generated-guard: false` stops being a free opt-out.
           #
-          # What this step rejects is a strict SUBSET of what the supervised
-          # guard rejects, so it can only ever fail a change the supervised
-          # guard would also fail: the supervised guard requires coverage by a
-          # manifest CHANGED in the same diff, this one accepts coverage by any
-          # tracked manifest. It is a cheap provenance pre-check, not a
-          # replacement -- it verifies neither manifest signatures nor the
-          # manual-exception gate.
+          # On the atomic roots, what this step rejects is a strict SUBSET of
+          # what the supervised guard rejects, so it can only ever fail a
+          # change the supervised guard would also fail: the supervised guard
+          # requires coverage by a manifest CHANGED in the same diff, this one
+          # accepts coverage by any tracked manifest. It is a cheap provenance
+          # pre-check, not a replacement -- it verifies neither manifest
+          # signatures nor the manual-exception gate.
+          #
+          # `programs/` is the exception, because the supervised guard never
+          # looks at it (see ROOTS below). By default this step is the only
+          # gate there, and it checks shape rather than provenance: every
+          # changed file must be an axiom-compose ProgramSpec whose imports
+          # name encoded roots and whose formulas carry no literal amounts.
+          # That is a lexical tripwire for hand-written modules and amounts,
+          # not a proof of their absence (see the ProgramSpec shape notes
+          # below). A caller that sets `guard-programs-root: true` also gets
+          # the legacy manifest check on `programs/`. That check verifies no
+          # signature (a tracked manifest at the mirrored path suffices), and
+          # no current encoder tool can produce a ProgramSpec manifest.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -257,15 +280,87 @@ jobs:
           import re
           import subprocess
           import sys
-          from datetime import datetime, timezone
+          from datetime import date, datetime, timezone
+          from decimal import Decimal
           from pathlib import Path
 
-          # Roots that hold encoded RuleSpec modules: exactly axiom-encode's
-          # RULESPEC_SOURCE_ROOTS, the default `--roots` of the supervised
-          # `guard-generated` step. `legislation/` is deliberately NOT here:
-          # the supervised guard does not protect it, and this pre-check must
-          # reject a strict subset of what that guard rejects.
-          ROOTS = {"statutes", "regulations", "policies", "programs"}
+          # Roots whose files need an encoder apply manifest here. The
+          # supervised `guard-generated` step guards axiom-encode's
+          # RULESPEC_ATOMIC_MODULE_ROOTS (legislation, policies, regulations,
+          # statutes) and, since the encoder hard cut (axiom-encode#1108),
+          # never `programs/`: ProgramSpecs are assembled axiom-compose specs,
+          # not encoder output, and no signer or manifest surface covers them.
+          # `programs/` therefore takes the manifest check only when the caller
+          # opts in with `guard-programs-root: true`, the same input that adds
+          # `programs` to the validate roots below; otherwise it takes the
+          # ProgramSpec shape check. `legislation/` stays unguarded here, as
+          # before (82d9ff5); a subset of the supervised guard's roots is
+          # still a subset.
+          ROOTS = {"statutes", "regulations", "policies"}
+          if os.environ.get("GUARD_PROGRAMS_ROOT", "false").strip().lower() == "true":
+              ROOTS.add("programs")
+          # ProgramSpec shape: a lexical tripwire for the regime's rule that
+          # ProgramSpecs only wire encoded modules together. It mirrors
+          # axiom-compose's ProgramSpec.from_mapping, import_scopes,
+          # _scope_target and PATTERNS (fabe0b3b), and the artifact engine's
+          # repo-local import resolution (98af0dce), narrowed to the forms
+          # rulespec repos use:
+          # - `program` is `<jurisdiction>/<name>...`, import scope keys are
+          #   `federal`, `state` or a jurisdiction, and at least one import
+          #   entry is required. Without one, axiom-compose resolves outputs
+          #   across the whole checkout.
+          # - Every import entry must resolve, the way compose and the engine
+          #   resolve it, to an existing encoded module at a depth the
+          #   supervised guard protects (`<root>/...` or
+          #   `<jurisdiction>/<root>/...`), with no symlink on the way. Modules
+          #   under `composed/` and `legislation/` are checked here only for
+          #   placement; their provenance is the supervised guard's.
+          # - Rule metadata values must be plain identifiers or dates, since
+          #   the engine writes some of them unquoted into formula source.
+          #   All other transformation values are scanned as formula text: no
+          #   quotes or backslashes (so no string can open), `#` comments
+          #   dropped, and only the numeric literals 0, 1 and 12 (months and
+          #   years). Amounts and rates come from encoded modules.
+          # This catches hand-written modules and literal amounts, not every
+          # computed constant: arithmetic on the allowed literals is not
+          # prevented, and review still owns ProgramSpec formulas.
+          PROGRAM_SPEC_KEYS = {
+              "program",
+              "period",
+              "outputs",
+              "scope",
+              "rounding",
+              "transformations",
+              "acknowledged_incomplete",
+              "auto_gate_outputs",
+          }
+          PROGRAM_SPEC_REQUIRED = {"program", "period", "outputs"}
+          PROGRAM_NAME = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*(?:/[a-z0-9_-]+)+")
+          COMPOSE_PATTERNS = {
+              "all_of",
+              "any_of",
+              "any_related",
+              "conditional_value",
+              "data_relation",
+              "derived_formula",
+              "derived_relation",
+              "sum_terms",
+              "table_lookup_with_extension",
+          }
+          ENCODED_ROOTS = {"legislation", "policies", "regulations", "statutes"}
+          IMPORT_SCOPE_KEYS = {"federal", "state"}
+          NON_IMPORT_SCOPE_KEYS = {"jurisdictions", "include", "exclude"}
+          IMPORT_PATH = re.compile(r"[A-Za-z0-9_~-][A-Za-z0-9_.~-]*(?:/[A-Za-z0-9_~-][A-Za-z0-9_.~-]*)*")
+          IDENTIFIER_METADATA_KEYS = {"name", "entity", "dtype", "period", "unit"}
+          IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+          DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+          # Positive table bounds of table_lookup_with_extension; left to review.
+          STRUCTURAL_INT_KEYS = {"arity", "minimum_index", "maximum_index"}
+          SOURCE_RELATION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*:[A-Za-z0-9_./~-]+#[A-Za-z_][A-Za-z0-9_.]*")
+          ALLOWED_LITERALS = {Decimal(0), Decimal(1), Decimal(12)}
+          NUMBER = re.compile(r"(?<![A-Za-z0-9_])[0-9][0-9_]*(?:\.[0-9][0-9_]*)?")
+          REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").rpartition("/")[2] or Path.cwd().name
+          REPO_PREFIX = REPOSITORY.removeprefix("rulespec-")
           # Jurisdiction directory of a country monorepo (us/, us-co/, tz-znz/,
           # uk-ashford/): byte-identical to axiom-encode's
           # `_protected_rulespec_root_index` pattern, so a name that classifier
@@ -339,6 +434,251 @@ jobs:
                   and parts[1] in ROOTS
                   and JURISDICTION.fullmatch(parts[0]) is not None
               )
+
+
+          def program_spec_path(path: str) -> bool:
+              """A `programs/` file this step shape-checks instead of manifest-checking."""
+              # Companion `.test.yaml` files are not exempt: no ProgramSpec has
+              # one, and an import could otherwise name one as a module. The
+              # shape check runs whether or not the caller opts in to the
+              # manifest check, which verifies no signatures.
+              if not path.endswith((".yaml", ".yml")):
+                  return False
+              parts = path.split("/")
+              if len(parts) >= 2 and parts[0] == "programs":
+                  return True
+              return (
+                  len(parts) >= 3
+                  and parts[1] == "programs"
+                  and JURISDICTION.fullmatch(parts[0]) is not None
+              )
+
+
+          def encoded_module_path(path: str) -> bool:
+              """A module path at a depth the supervised guard protects."""
+              if not path.endswith(".yaml") or path.endswith(".test.yaml"):
+                  return False
+              parts = path.split("/")
+              if len(parts) >= 2 and parts[0] in ENCODED_ROOTS:
+                  return True
+              return (
+                  len(parts) >= 3
+                  and parts[1] in ENCODED_ROOTS
+                  and JURISDICTION.fullmatch(parts[0]) is not None
+              )
+
+
+          def through_symlink(path: str) -> bool:
+              parts = path.split("/")
+              return any(Path(*parts[: index + 1]).is_symlink() for index in range(len(parts)))
+
+
+          def resolve_import(program: str, key: str, entry: str) -> tuple[str | None, str]:
+              """(resolved module path, import target) as compose and the engine resolve it."""
+              # axiom-compose _scope_target: `prefix:path` passes through;
+              # otherwise federal -> us, state -> the program's jurisdiction,
+              # and any other key is the prefix itself.
+              if ":" in entry:
+                  prefix, _, relative = entry.partition(":")
+              else:
+                  prefix = {"federal": "us", "state": program.split("/", 1)[0]}.get(key, key)
+                  relative = entry
+              relative = relative.strip().strip("/")
+              target = f"{prefix}:{relative}"
+              if JURISDICTION.fullmatch(prefix) is None or IMPORT_PATH.fullmatch(relative) is None:
+                  return None, target
+              # Engine candidate_rule_repo_roots: the checkout serves its own
+              # prefix at the root and under `<prefix>/`, and any other prefix
+              # under `rulespec-<prefix>/` and then `<prefix>/`. The first
+              # existing file wins. This mirrors how program builds compile
+              # (AXIOM_RULESPEC_REPO_ROOTS set to the checkout, the composed
+              # module written outside it), where the engine tries these
+              # candidates before any location derived from the module or cwd.
+              if prefix == REPO_PREFIX:
+                  candidates = [f"{relative}.yaml", f"{prefix}/{relative}.yaml"]
+              else:
+                  candidates = [f"rulespec-{prefix}/{relative}.yaml", f"{prefix}/{relative}.yaml"]
+              for candidate in candidates:
+                  if Path(candidate).exists() or Path(candidate).is_symlink():
+                      return candidate, target
+              return None, target
+
+
+          def formula_text(value: str) -> str:
+              """`value` without engine comments: strings lex first, then `#` to end of line."""
+              out: list[str] = []
+              index = 0
+              quote = None
+              while index < len(value):
+                  if quote is None:
+                      if value.startswith('"""', index):
+                          quote = '"""'
+                      elif value[index] in "\"'":
+                          quote = value[index]
+                      elif value[index] == "#":
+                          newline = value.find("\n", index)
+                          index = len(value) if newline < 0 else newline
+                          continue
+                      if quote:
+                          out.append(quote)
+                          index += len(quote)
+                          continue
+                  elif value.startswith(quote, index):
+                      out.append(quote)
+                      index += len(quote)
+                      quote = None
+                      continue
+                  out.append(value[index])
+                  index += 1
+              return "".join(out)
+
+
+          def formula_literals(value: object) -> list[str]:
+              """Numeric literals other than 0, 1 and 12 in a formula-bound value."""
+              if isinstance(value, bool) or value is None:
+                  return []
+              if isinstance(value, (int, float)):
+                  return [] if Decimal(str(value)) in ALLOWED_LITERALS else [str(value)]
+              if isinstance(value, list):
+                  return [found for item in value for found in formula_literals(item)]
+              if isinstance(value, dict):
+                  return [
+                      found
+                      for pair in value.items()
+                      for item in pair
+                      for found in formula_literals(item)
+                  ]
+              text = str(value)
+              # No ProgramSpec formula needs a string literal. Rejecting quotes
+              # and backslashes keeps the per-value lexing sound: the engine
+              # lexes every rule's formula as one source, with escapes, so an
+              # open string in one value could otherwise hide the next.
+              quoted = [character for character in "\"'\\" if character in text]
+              return [f"QUOTE:{character!r}" for character in quoted] + [
+                  literal
+                  for literal in NUMBER.findall(formula_text(text))
+                  if Decimal(literal.replace("_", "")) not in ALLOWED_LITERALS
+              ]
+
+
+          def transformation_issues(label: str, item: dict) -> list[str]:
+              issues: list[str] = []
+              if item.get("pattern") not in COMPOSE_PATTERNS:
+                  issues.append(f"{label} uses unknown pattern {item.get('pattern')!r}")
+              for field, value in item.items():
+                  field = str(field)
+                  if field == "pattern":
+                      continue
+                  if field in IDENTIFIER_METADATA_KEYS:
+                      if not isinstance(value, str) or IDENTIFIER.fullmatch(value) is None:
+                          issues.append(f"{label} {field} {value!r} is not a plain identifier")
+                  elif field == "effective_from":
+                      try:
+                          valid = DATE.fullmatch(str(value)) is not None and bool(date.fromisoformat(str(value)))
+                      except ValueError:
+                          valid = False
+                      if not valid:
+                          issues.append(f"{label} effective_from {value!r} is not a date")
+                  elif field == "source":
+                      if any(ord(character) < 32 for character in str(value)):
+                          issues.append(f"{label} source contains control characters")
+                  elif field in STRUCTURAL_INT_KEYS:
+                      if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                          issues.append(f"{label} {field} {value!r} is not a positive integer")
+                  elif field == "source_relation" and isinstance(value, str) and SOURCE_RELATION.fullmatch(value):
+                      continue
+                  else:
+                      for literal in formula_literals(value):
+                          if literal.startswith("QUOTE:"):
+                              issues.append(
+                                  f"{label} {field} carries a quote or backslash "
+                                  f"{literal.removeprefix('QUOTE:')}; formulas take no strings"
+                              )
+                          else:
+                              issues.append(
+                                  f"{label} {field} carries the literal {literal}; "
+                                  "amounts and rates must come from encoded modules"
+                              )
+              return issues
+
+
+          def program_spec_issues(path: str) -> list[str]:
+              import yaml
+
+              if through_symlink(path):
+                  return ["is a symlink or sits under one"]
+              if not Path(path).is_file():
+                  return ["is not a regular file"]
+              try:
+                  document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+                  return [f"is not readable YAML: {error}"]
+              if not isinstance(document, dict):
+                  return ["is not a ProgramSpec mapping"]
+              issues: list[str] = []
+              keys = {str(key) for key in document}
+              missing = sorted(PROGRAM_SPEC_REQUIRED - keys)
+              if missing:
+                  issues.append("lacks ProgramSpec keys: " + ", ".join(missing))
+              extra = sorted(keys - PROGRAM_SPEC_KEYS)
+              if extra:
+                  issues.append("has keys a ProgramSpec does not take: " + ", ".join(extra))
+              outputs = document.get("outputs")
+              if "outputs" in document and (
+                  not isinstance(outputs, list)
+                  or not outputs
+                  or any(not isinstance(name, str) or IDENTIFIER.fullmatch(name) is None for name in outputs)
+              ):
+                  issues.append("outputs must be a non-empty list of rule names")
+              program = str(document.get("program", ""))
+              if PROGRAM_NAME.fullmatch(program) is None:
+                  issues.append(f"program {program!r} is not <jurisdiction>/<name>")
+              scope = document.get("scope") or {}
+              if not isinstance(scope, dict):
+                  issues.append("scope is not a mapping")
+                  scope = {}
+              import_entries = 0
+              for key, entries in scope.items():
+                  key = str(key)
+                  if key in NON_IMPORT_SCOPE_KEYS:
+                      continue
+                  if key not in IMPORT_SCOPE_KEYS and JURISDICTION.fullmatch(key) is None:
+                      issues.append(f"scope key {key!r} is neither federal, state nor a jurisdiction")
+                      continue
+                  for entry in entries if isinstance(entries, list) else [entries]:
+                      import_entries += 1
+                      resolved, target = resolve_import(program, key, str(entry))
+                      if resolved is None:
+                          issues.append(
+                              f"scope.{key} entry {entry!r} (import {target}) does not resolve "
+                              "to a module in this checkout"
+                          )
+                      elif not encoded_module_path(resolved) or through_symlink(resolved):
+                          issues.append(
+                              f"scope.{key} entry {entry!r} resolves to {resolved}, which is not "
+                              "an encoded module the supervised guard protects"
+                          )
+                      elif not Path(resolved).is_file():
+                          issues.append(
+                              f"scope.{key} entry {entry!r} resolves to {resolved}, which is not "
+                              "a regular file"
+                          )
+              if not import_entries:
+                  issues.append(
+                      "has no import scope, so axiom-compose would resolve outputs "
+                      "across the whole checkout"
+                  )
+              transformations = document.get("transformations") or []
+              if not isinstance(transformations, list):
+                  issues.append("transformations is not a list")
+                  transformations = []
+              for index, item in enumerate(transformations):
+                  label = f"transformations[{index}]"
+                  if not isinstance(item, dict):
+                      issues.append(f"{label} is not a mapping")
+                      continue
+                  issues.extend(transformation_issues(f"{label} ({item.get('name')})", item))
+              return issues
 
 
           def manifest_candidates(path: str) -> list[str]:
@@ -498,6 +838,33 @@ jobs:
               changed = git(*diff, f"{base}...{head}", check=False)
               if changed is None:
                   changed = git(*diff, base, head) or []
+
+          program_paths = sorted(
+              path for path in changed if program_spec_path(path) and os.path.lexists(path)
+          )
+          program_issues = [
+              (path, issue) for path in program_paths for issue in program_spec_issues(path)
+          ]
+          if program_issues:
+              print(
+                  "Changed programs/ files that are not ProgramSpecs "
+                  f"({len({path for path, _ in program_issues})} of {len(program_paths)}, "
+                  f"scan={scan_mode}):",
+                  file=sys.stderr,
+              )
+              for path, issue in program_issues:
+                  print(f"  {path} {issue}", file=sys.stderr)
+              fail(
+                  "",
+                  "programs/ holds axiom-compose ProgramSpecs that wire encoded "
+                  "modules together; RuleSpec modules and amounts belong under an "
+                  "encoded root, produced by `axiom-encode encode --apply`.",
+              )
+          if program_paths:
+              print(
+                  f"{len(program_paths)} changed ProgramSpec file(s) have the "
+                  f"ProgramSpec shape (scan={scan_mode})."
+              )
 
           guarded_paths = sorted(path for path in changed if guarded(path))
           if not guarded_paths:
