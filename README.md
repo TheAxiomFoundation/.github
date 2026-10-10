@@ -34,6 +34,7 @@ calls the centralized reusable workflow in this repository:
 jobs:
   validate:
     uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@<workflow-commit-sha>
+    secrets: inherit
     with:
       axiom-encode-ref: <40-character-commit-sha>
       axiom-rules-engine-ref: <40-character-commit-sha>
@@ -68,6 +69,25 @@ corpus checkout's matching `releases/<name>/<content_sha256>.json` path. It
 checks the content address and release name immediately; the protected
 verification supervisor then verifies its Ed25519 signature and supplies all
 three public trust roots without exposing signing capability.
+
+After authenticating the corpus provenance commit, the workflow checks for
+`.axiom/corpus-locks/` in the corpus checkout. When it is absent, the workflow
+logs a skip and preserves the existing behavior for pre-switch corpus pins.
+When it is present, the pinned encoder must include `axiom-encode corpus-fetch`
+([axiom-encode#1742](https://github.com/TheAxiomFoundation/axiom-encode/pull/1742)).
+The workflow runs that command outside the protected supervisor to place the
+pinned release's provisions before provisioning the supervisor or running its
+gates. It uses the release object already acquired above, and places only bytes
+whose size and SHA-256 match both that release and the checkout's scope locks.
+
+For provisions available only in R2, configure read-only organization or
+repository secrets `R2_CORPUS_READ_ACCESS_KEY_ID` and
+`R2_CORPUS_READ_SECRET_ACCESS_KEY`, and pass them with `secrets: inherit` as in
+the example. The placement step exposes them only as `R2_ACCESS_KEY_ID` and
+`R2_SECRET_ACCESS_KEY`; supervised gates receive no cloud credentials. Releases
+whose provisions are available from the checkout's git history do not need
+these secrets. The bucket comes from the release object, and the command uses
+the built-in R2 account endpoint; no endpoint or account secret is required.
 
 Configure those protected roots as `AXIOM_ENCODE_APPLY_SIGNING_PUBLIC_KEY`,
 `AXIOM_ENCODE_EVAL_SIGNING_PUBLIC_KEY`, and

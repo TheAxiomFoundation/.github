@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the embedded exact reviewed-migration authorization guard."""
+"""Exercise embedded RuleSpec workflow guards and corpus placement shell."""
 
 from __future__ import annotations
 
@@ -16,6 +16,208 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/validate-rulespec.yml"
 RETIRED = "1" * 64
 WAIVER = "2" * 64
+CORPUS_PLACEMENT_STEP = "Place the pinned corpus release's provisions"
+
+
+def corpus_placement_step() -> dict:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    return next(step for step in steps if step.get("name") == CORPUS_PLACEMENT_STEP)
+
+
+def test_corpus_placement_runs_before_supervised_gates_with_step_only_credentials() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    steps = workflow["jobs"]["validate"]["steps"]
+    names = [step.get("name") for step in steps]
+    index = names.index(CORPUS_PLACEMENT_STEP)
+    assert names[index - 1] == "Authenticate signed corpus provenance commit"
+    assert names[index + 1] == "Provision protected verification supervisor"
+    install = steps[names.index("Install Python dependencies")]
+    assert names.index("Install Python dependencies") < index
+    assert 'python -m pip install -e "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"' in install["run"]
+
+    step = steps[index]
+    assert step["shell"] == "bash"
+    assert step["run"].startswith("set -euo pipefail\n")
+    assert "${{" not in step["run"]
+    assert "/opt/axiom-verification" not in step["run"]
+    assert "axiom-encode-signing-supervisor" not in step["run"]
+    assert step["working-directory"] == "${{ github.workspace }}"
+    assert step["env"]["CORPUS_PATH"] == "${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus"
+    assert step["env"]["RELEASE_NAME"] == "${{ steps.toolchain.outputs.axiom_corpus_release }}"
+    assert step["env"]["RELEASE_CONTENT_SHA256"] == "${{ steps.toolchain.outputs.axiom_corpus_release_content_sha256 }}"
+    assert step["env"]["R2_ACCESS_KEY_ID"] == "${{ secrets.R2_CORPUS_READ_ACCESS_KEY_ID }}"
+    assert step["env"]["R2_SECRET_ACCESS_KEY"] == "${{ secrets.R2_CORPUS_READ_SECRET_ACCESS_KEY }}"
+
+    credential_names = ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+    secret_names = ("R2_CORPUS_READ_ACCESS_KEY_ID", "R2_CORPUS_READ_SECRET_ACCESS_KEY")
+    assert not any(key in workflow.get("env", {}) for key in credential_names)
+    for job in workflow["jobs"].values():
+        assert not any(key in job.get("env", {}) for key in credential_names)
+        for other_step in job.get("steps", []):
+            if other_step == step:
+                continue
+            assert not any(key in other_step.get("env", {}) for key in credential_names)
+            assert not any(secret in json.dumps(other_step) for secret in secret_names)
+    for earlier in steps[:index]:
+        assert "axiom-encode-signing-supervisor" not in earlier.get("run", "")
+
+
+def run_corpus_placement(
+    *,
+    locks: bool = True,
+    supported: bool = True,
+    credentials: bool = False,
+    r2_only: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], list[dict], bool]:
+    """Run the actual shell using a pinned-encoder stand-in, without network access."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        workspace = root / "rulespec with spaces"
+        corpus = root / "corpus checkout with spaces"
+        bin_path = root / "bin"
+        workspace.mkdir()
+        corpus.mkdir()
+        bin_path.mkdir()
+        if locks:
+            (corpus / ".axiom/corpus-locks").mkdir(parents=True)
+        release_name, release_sha = "pinned-release", "b" * 64
+        release = corpus / "releases" / release_name / f"{release_sha}.json"
+        release.parent.mkdir(parents=True)
+        release.write_text(json.dumps({"release": release_name, "content_sha256": release_sha}))
+        calls = root / "encoder-calls.jsonl"
+        local = root / "local-provisions.json"
+        local.write_text('{"provisions": ["local git artifact"]}\n')
+        fake = bin_path / "axiom-encode"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            + textwrap.dedent("""\
+                import argparse
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                with open(os.environ["ENCODER_CALLS"], "a") as log:
+                    log.write(json.dumps({
+                        "args": sys.argv[1:],
+                        "access_key_id": os.environ.get("R2_ACCESS_KEY_ID", ""),
+                        "secret_access_key": os.environ.get("R2_SECRET_ACCESS_KEY", ""),
+                    }) + "\\n")
+                assert sys.argv[1] == "corpus-fetch", sys.argv[1:]
+                if sys.argv[2:] == ["--help"]:
+                    if os.environ["ENCODER_SUPPORTED"] == "false":
+                        print("unknown command corpus-fetch", file=sys.stderr)
+                        sys.exit(2)
+                    print("usage: axiom-encode corpus-fetch")
+                    sys.exit(0)
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--corpus-path", type=Path, required=True)
+                parser.add_argument("--release", required=True)
+                parser.add_argument("--content-sha256", required=True)
+                parser.add_argument("--artifact-class", action="append", choices=["provisions"])
+                args = parser.parse_args(sys.argv[2:])
+                assert args.corpus_path == Path(os.environ["CORPUS_PATH"])
+                assert args.release == os.environ["RELEASE_NAME"]
+                assert args.content_sha256 == os.environ["RELEASE_CONTENT_SHA256"]
+                release = args.corpus_path / "releases" / args.release / (args.content_sha256 + ".json")
+                assert release.is_file(), "must reuse the previously fetched release object"
+                if os.environ["R2_ONLY"] == "true" and not (
+                    os.environ.get("R2_ACCESS_KEY_ID") and os.environ.get("R2_SECRET_ACCESS_KEY")
+                ):
+                    print("data/corpus/provisions/us/statutes/v1.json: git: absent; R2 read credentials absent", file=sys.stderr)
+                    sys.exit(1)
+                destination = args.corpus_path / "data/corpus/provisions/us/statutes/v1.json"
+                destination.parent.mkdir(parents=True)
+                destination.write_bytes(Path(os.environ["LOCAL_PROVISIONS"]).read_bytes())
+                print("pinned-release: 1 artifact(s) placed")
+                """)
+        )
+        fake.chmod(0o755)
+        # Keep ambient credentials out of these fixtures, including developer
+        # overrides that could accidentally make the missing-secret case pass.
+        env = {key: value for key, value in os.environ.items() if not key.startswith("R2_")}
+        env.update({
+            "PATH": str(bin_path) + os.pathsep + env.get("PATH", ""),
+            "GITHUB_WORKSPACE": str(workspace),
+            "AXIOM_DEPENDENCY_ROOT": str(root),
+            "CORPUS_PATH": str(corpus),
+            "RELEASE_NAME": release_name,
+            "RELEASE_CONTENT_SHA256": release_sha,
+            "ENCODER_CALLS": str(calls),
+            "ENCODER_SUPPORTED": str(supported).lower(),
+            "R2_ONLY": str(r2_only).lower(),
+            "LOCAL_PROVISIONS": str(local),
+            "R2_ACCESS_KEY_ID": "fixture-read-access-key" if credentials else "",
+            "R2_SECRET_ACCESS_KEY": "fixture-read-secret-key" if credentials else "",
+        })
+        result = subprocess.run(
+            ["bash", "-c", corpus_placement_step()["run"]],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        invocations = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+        destination = corpus / "data/corpus/provisions/us/statutes/v1.json"
+        placed = destination.exists() and destination.read_bytes() == local.read_bytes()
+        # Credential values may reach the encoder's environment, never shell logs.
+        assert "fixture-read-access-key" not in result.stdout + result.stderr
+        assert "fixture-read-secret-key" not in result.stdout + result.stderr
+        return result, invocations, placed
+
+
+def test_pre_switch_corpus_skips_placement_without_invoking_old_encoder() -> None:
+    result, invocations, placed = run_corpus_placement(locks=False, supported=False)
+    assert result.returncode == 0, result.stderr
+    assert not invocations
+    assert not placed
+    assert "No .axiom/corpus-locks directory" in result.stdout
+    assert "skipping provisions placement for this pre-switch corpus pin" in result.stdout
+    assert "::error::" not in result.stdout + result.stderr
+
+
+def test_post_switch_corpus_rejects_encoder_without_corpus_fetch() -> None:
+    result, invocations, placed = run_corpus_placement(supported=False)
+    assert result.returncode != 0
+    assert [call["args"] for call in invocations] == [["corpus-fetch", "--help"]]
+    assert not placed
+    assert "::error::" in result.stdout + result.stderr
+    assert "pin an axiom-encode that includes #1742" in result.stdout + result.stderr
+
+
+def test_post_switch_corpus_places_pinned_release_with_read_credentials() -> None:
+    result, invocations, placed = run_corpus_placement(credentials=True, r2_only=True)
+    assert result.returncode == 0, result.stderr
+    assert placed
+    assert len(invocations) == 2
+    assert invocations[0]["args"] == ["corpus-fetch", "--help"]
+    assert invocations[1]["access_key_id"] == "fixture-read-access-key"
+    assert invocations[1]["secret_access_key"] == "fixture-read-secret-key"
+    assert "::error::" not in result.stdout + result.stderr
+
+
+def test_post_switch_corpus_accepts_local_artifacts_without_credentials() -> None:
+    result, invocations, placed = run_corpus_placement()
+    assert result.returncode == 0, result.stderr
+    assert placed
+    assert len(invocations) == 2, "credentials cannot be required before trying local sources"
+    assert invocations[1]["access_key_id"] == ""
+    assert invocations[1]["secret_access_key"] == ""
+
+
+def test_post_switch_corpus_fetch_failure_preserves_missing_artifact_diagnostic() -> None:
+    result, invocations, placed = run_corpus_placement(r2_only=True)
+    assert result.returncode != 0
+    assert len(invocations) == 2, "the encoder must determine whether R2 is needed"
+    assert not placed
+    output = result.stdout + result.stderr
+    assert "::error::" in output
+    assert "data/corpus/provisions/us/statutes/v1.json" in output
+    assert "R2 read credentials absent" in output
 
 
 def git(root: Path, *args: str) -> str:
@@ -1035,6 +1237,13 @@ def test_conflicted_merge_is_rejected() -> None:
 
 
 def main() -> None:
+    test_corpus_placement_runs_before_supervised_gates_with_step_only_credentials()
+    test_pre_switch_corpus_skips_placement_without_invoking_old_encoder()
+    test_post_switch_corpus_rejects_encoder_without_corpus_fetch()
+    test_post_switch_corpus_places_pinned_release_with_read_credentials()
+    test_post_switch_corpus_accepts_local_artifacts_without_credentials()
+    test_post_switch_corpus_fetch_failure_preserves_missing_artifact_diagnostic()
+    print("pinned corpus placement: 6 regression checks passed")
     test_release_pin_companion_requires_strict_retirement()
     test_release_pin_companion_accepts_exact_staged_consumption()
     test_generated_guard_resolves_scheduled_base_to_exact_commit()
