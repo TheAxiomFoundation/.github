@@ -1970,6 +1970,43 @@ jobs:
               exit 1
             }
 
+      - name: Place the pinned corpus release's provisions
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          CORPUS_PATH: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus
+          RELEASE_NAME: ${{ steps.toolchain.outputs.axiom_corpus_release }}
+          RELEASE_CONTENT_SHA256: ${{ steps.toolchain.outputs.axiom_corpus_release_content_sha256 }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_CORPUS_READ_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_CORPUS_READ_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ ! -d "$CORPUS_PATH/.axiom/corpus-locks" ]; then
+            echo "No .axiom/corpus-locks directory in the corpus checkout; skipping provisions placement for this pre-switch corpus pin."
+            exit 0
+          fi
+          # Use the encoder installed from the authenticated axiom-encode-ref.
+          # The supervisor strips cloud credentials and reads local git objects
+          # only, so R2-only provisions must be placed before its first gate.
+          if ! axiom-encode corpus-fetch --help >/dev/null 2>&1; then
+            echo "::error::This corpus pin is after the lock switch; pin an axiom-encode that includes #1742 (corpus-fetch)." >&2
+            exit 1
+          fi
+          # Explicit release pins are mutually exclusive with --rulespec-root.
+          # These outputs came from the caller's .axiom/toolchain.toml; the
+          # command reads the release object already fetched into CORPUS_PATH.
+          # Let it try local sources before deciding whether R2 is needed.
+          if axiom-encode corpus-fetch \
+            --corpus-path "$CORPUS_PATH" \
+            --release "$RELEASE_NAME" \
+            --content-sha256 "$RELEASE_CONTENT_SHA256"; then
+            :
+          else
+            status=$?
+            echo "::error::Failed to place the pinned corpus release's provisions (exit $status); see corpus-fetch diagnostics above. If the missing files are available only in R2, supply read-only R2_CORPUS_READ_ACCESS_KEY_ID and R2_CORPUS_READ_SECRET_ACCESS_KEY via secrets: inherit." >&2
+            exit "$status"
+          fi
+
       - name: Provision protected verification supervisor
         working-directory: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-encode
         env:
