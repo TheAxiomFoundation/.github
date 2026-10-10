@@ -1986,8 +1986,9 @@ jobs:
             exit 0
           fi
           # Use the encoder installed from the authenticated axiom-encode-ref.
-          # The supervisor strips cloud credentials and reads local git objects
-          # only, so R2-only provisions must be placed before its first gate.
+          # The supervisor's child environment carries no cloud credentials, so
+          # it cannot fetch R2-only bytes: place them locally before its first
+          # gate. It still verifies each placed file's hash and size itself.
           if ! axiom-encode corpus-fetch --help >/dev/null 2>&1; then
             echo "::error::This corpus pin is after the lock switch; pin an axiom-encode that includes #1742 (corpus-fetch)." >&2
             exit 1
