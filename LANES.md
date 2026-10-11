@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-10 — Merge pull request #412 from TheAxiomFoundation/pe-parity-uc-sch4-para10-other-families-children | 71 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-10 — Merge pull request #412 from TheAxiomFoundation/pe-parity-uc-sch4-para10-other-families-children | 74 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-09 — Merge pull request #1549 from TheAxiomFoundation/fix/1183-fl-snap-assistance-group-size | 104 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-06 — Merge pull request #20 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-10-06 — Merge pull request #130 from TheAxiomFoundation/waivers/renew-consume-2026-10 | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
