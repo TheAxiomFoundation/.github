@@ -391,12 +391,14 @@ def test_pending_waiver_requires_exact_digest_only_toolchain_companion() -> None
         "    active:\n      "
         + metadata
     ).encode()
-    head_waiver = base_waiver + b"    pending:\n      " + metadata.encode()
+    pending_metadata = metadata.replace("a" * 64, "b" * 64)
+    head_waiver = base_waiver + b"    pending:\n      " + pending_metadata.encode()
     base_digest = hashlib.sha256(base_waiver).hexdigest()
     head_digest = hashlib.sha256(head_waiver).hexdigest()
     base_toolchain = (
         "[toolchain]\n"
         'axiom_corpus_release = "unchanged"\n'
+        f'axiom_corpus_release_content_sha256 = "{"c" * 64}"\n'
         f'validation_waiver_set_sha256 = "{base_digest}"\n'
     ).encode()
     head_toolchain = base_toolchain.replace(base_digest.encode(), head_digest.encode())
@@ -431,29 +433,51 @@ def test_pending_waiver_requires_exact_digest_only_toolchain_companion() -> None
                 text=True,
             )
 
-        assert run().returncode == 0
+        result = run()
+        assert result.returncode == 0, result.stderr
         assert paths["audit_changed"].read_text() == "known-validation-gaps.yaml\n"
 
+        # Staging requires an exact byte-for-byte digest-only companion,
+        # including unrelated TOML that would leave the parsed pins unchanged.
+        for unrelated_edit in (
+            head_toolchain.replace(b'"unchanged"', b'"changed"'),
+            head_toolchain + b'axiom_encode_ref = "unrelated"\n',
+            head_toolchain + b"[other]\nsetting = true\n",
+            head_toolchain + b"# unrelated comment\n",
+            head_toolchain.replace(b"[toolchain]\n", b"[toolchain]\n\n"),
+        ):
+            paths["head_toolchain"].write_bytes(unrelated_edit)
+            result = run()
+            assert result.returncode != 0, result.stdout
+            assert "ValidationWaiverPinCompanionScope" in result.stderr
+
         paths["head_toolchain"].write_bytes(
-            head_toolchain.replace(b'"unchanged"', b'"changed"')
+            head_toolchain.replace(head_digest.encode(), b"0" * 64)
         )
-        assert run().returncode != 0
+        result = run()
+        assert result.returncode != 0, result.stdout
+        assert "ValidationWaiverPinCompanionMismatch" in result.stderr
         paths["head_toolchain"].write_bytes(head_toolchain)
 
         paths["changed"].write_text("known-validation-gaps.yaml\n")
         assert run().returncode != 0
 
-        paths["changed"].write_text(
-            "known-validation-gaps.yaml\n.axiom/toolchain.toml\nus/statutes/1.yaml\n"
-        )
-        assert run().returncode != 0
+        for extra_path in ("us/statutes/1.yaml", ".github/workflows/repository-checks.yml"):
+            paths["changed"].write_text(
+                "known-validation-gaps.yaml\n.axiom/toolchain.toml\n"
+                + extra_path
+                + "\n"
+            )
+            result = run()
+            assert result.returncode != 0, result.stdout
+            assert "ValidationWaiverRatchetGrowth" in result.stderr
 
         # A newly introduced module can be preapproved, but still only through
         # the same exact two-file transition.
         new_base_waiver = b"validate_failures: {}\n"
         new_head_waiver = (
             b"validate_failures:\n  us/statutes/1.yaml:\n    pending:\n      "
-            + metadata.encode()
+            + pending_metadata.encode()
         )
         new_base_digest = hashlib.sha256(new_base_waiver).hexdigest()
         new_head_digest = hashlib.sha256(new_head_waiver).hexdigest()
@@ -661,6 +685,25 @@ def test_release_pin_companion_accepts_exact_staged_consumption() -> None:
         {**consumed, "us/staged.yaml": {"active": {**new, "expires": "2026-12-01"}}}
     )
     rejected({**consumed, "us/staged.yaml": {"active": {**new, "owner": "@other"}}})
+    rejected(
+        {
+            **consumed,
+            "us/staged.yaml": {
+                "active": {
+                    **new,
+                    "issue": "https://github.com/TheAxiomFoundation/rulespec-us/issues/2",
+                }
+            },
+        }
+    )
+    rejected(
+        {
+            **consumed,
+            "us/staged.yaml": {
+                "active": {key: value for key, value in new.items() if key != "owner"}
+            },
+        }
+    )
     rejected(
         {**consumed, "us/staged.yaml": {"active": {**new, "extra": "field"}}}
     )
@@ -1171,6 +1214,200 @@ def test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix() -> 
     ) in audit_step
 
 
+def run_waiver_audit_cli(
+    *,
+    capability: str,
+    shard: str = "uk",
+    probe_status: int = 0,
+    audit_status: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+    """Run the workflow's audit shell with strict old/new CLI stand-ins."""
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    step = next(step for step in steps if step.get("name") == "Enforce validation waiver ratchet")
+    shell = step["run"].split("# waiver-ratchet-python-end\n", 1)[1]
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        protected = root / "protected"
+        protected.mkdir()
+        workspace = root / "rulespec-uk"
+        workspace.mkdir()
+        calls = root / "calls.jsonl"
+        # No RuleSpec fixtures are needed: the fake CLI reports the modules
+        # whose runtime checks it would perform under the supplied options.
+        base = root / "protected-ledger.txt"
+        base.write_text("protected base ledger\n")
+        changed = root / "audit-changed-paths.txt"
+        changed.write_text("known-validation-gaps.yaml\n")
+        supervisor = protected / "axiom-encode-signing-supervisor"
+        supervisor.write_text(
+            f"#!{sys.executable}\n"
+            + textwrap.dedent("""\
+                import json
+                import os
+                import sys
+
+                args = sys.argv[1:]
+                with open(os.environ["AUDIT_CALLS"], "a") as log:
+                    log.write(json.dumps({"supervisor": args}) + "\\n")
+                boundary = args.index("--")
+                protected = os.environ["PROTECTED_RUNTIME"]
+                assert args[:boundary] == [
+                    "--trusted-signing-roots", protected + "/signing-trust-roots.json",
+                    "--trusted-python-runtime-root", protected + "/python",
+                    "--trusted-python-import-root", protected + "/python/lib/python3.14/site-packages",
+                    "--trusted-python-package-root", protected + "/python/lib/python3.14/site-packages/axiom_encode",
+                ], args
+                command = args[boundary + 1:]
+                assert command[0] == protected + "/axiom-encode", command
+                os.execv(command[0], command)
+                """)
+        )
+        encoder = protected / "axiom-encode"
+        encoder.write_text(
+            f"#!{sys.executable}\n"
+            + textwrap.dedent("""\
+                import argparse
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                argv = sys.argv[1:]
+                with open(os.environ["AUDIT_CALLS"], "a") as log:
+                    log.write(json.dumps({"cli": argv}) + "\\n")
+                assert argv[:2] == ["validation-waivers", "audit"], argv
+                if argv[2:] == ["--help"]:
+                    status = int(os.environ["PROBE_STATUS"])
+                    if status:
+                        print("protected CLI probe failed", file=sys.stderr)
+                        sys.exit(status)
+                    if os.environ["AUDIT_CAPABILITY"] == "empty":
+                        sys.exit(0)
+                parser = argparse.ArgumentParser(prog="axiom-encode validation-waivers audit")
+                parser.add_argument("--json", action="store_true")
+                for option in (
+                    "--root", "--corpus-path", "--protected-base", "--changed-paths",
+                    "--axiom-rules-engine-path",
+                ):
+                    parser.add_argument(option, required=True)
+                capability = os.environ["AUDIT_CAPABILITY"]
+                if capability in {"new", "key-only"}:
+                    parser.add_argument("--partition-key")
+                if capability in {"new", "keys-only"}:
+                    parser.add_argument("--partition-keys-json")
+                args = parser.parse_args(argv[2:])
+                assert args.json
+                assert args.root == os.environ["GITHUB_WORKSPACE"]
+                assert args.corpus_path == os.environ["AXIOM_DEPENDENCY_ROOT"] + "/axiom-corpus"
+                assert args.axiom_rules_engine_path == os.environ["AXIOM_DEPENDENCY_ROOT"] + "/axiom-rules-engine"
+                assert Path(args.protected_base).read_text() == "protected base ledger\\n"
+                assert Path(args.changed_paths).read_text() == "known-validation-gaps.yaml\\n"
+                modules = [
+                    "uk/statutes/active.yaml",
+                    "uk-ashford/policies/pending.yaml",
+                    "uk/statutes/removed.yaml",
+                ]
+                key = getattr(args, "partition_key", None)
+                keys = getattr(args, "partition_keys_json", None)
+                if key is not None:
+                    assert json.loads(keys) == ["uk", "uk-ashford"]
+                    modules = [module for module in modules if module.split("/")[0] == key]
+                else:
+                    assert keys is None
+                print(json.dumps({"checked_modules": modules}))
+                sys.exit(int(os.environ["AUDIT_STATUS"]))
+                """)
+        )
+        supervisor.chmod(0o755)
+        encoder.chmod(0o755)
+        shell = shell.replace("/opt/axiom-verification", str(protected))
+        for expression, value in (
+            ("${{ inputs.python-version }}", "3.14"),
+            ("${{ matrix.shard }}", shard),
+            ("${{ needs.shards.outputs.matrix }}", '["uk", "uk-ashford"]'),
+        ):
+            shell = shell.replace(expression, value)
+        assert "${{" not in shell
+        env = {
+            **os.environ,
+            "RUNNER_TEMP": str(root),
+            "GITHUB_WORKSPACE": str(workspace),
+            "AXIOM_DEPENDENCY_ROOT": str(root / "dependencies with spaces"),
+            "AXIOM_COMPOSE_REF": "",
+            "PROTECTED_RUNTIME": str(protected),
+            "AUDIT_CALLS": str(calls),
+            "AUDIT_CAPABILITY": capability,
+            "PROBE_STATUS": str(probe_status),
+            "AUDIT_STATUS": str(audit_status),
+            "protected_base": str(base),
+            "audit_changed_paths": str(changed),
+        }
+        result = subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + shell],
+            cwd=workspace, env=env, capture_output=True, text=True,
+        )
+        return result, [json.loads(line) for line in calls.read_text().splitlines()]
+
+
+def test_old_waiver_audit_cli_checks_complete_ledger_on_every_shard() -> None:
+    for capability in ("old", "key-only", "keys-only"):
+        for shard in ("uk", "uk-ashford"):
+            result, calls = run_waiver_audit_cli(capability=capability, shard=shard)
+            assert result.returncode == 0, result.stderr
+            assert len(calls) == 4  # Both probe and audit use the supervisor.
+            assert calls[1]["cli"] == ["validation-waivers", "audit", "--help"]
+            assert not any(arg.startswith("--partition-") for arg in calls[3]["cli"])
+            report = json.loads(result.stdout.splitlines()[-1])
+            assert report["checked_modules"] == [
+                "uk/statutes/active.yaml",
+                "uk-ashford/policies/pending.yaml",
+                "uk/statutes/removed.yaml",
+            ]
+            assert "complete unpartitioned waiver audit on this shard" in result.stdout
+
+
+def test_new_waiver_audit_cli_preserves_partition_arguments_and_coverage() -> None:
+    checked = []
+    for shard in ("uk", "uk-ashford"):
+        result, calls = run_waiver_audit_cli(capability="new", shard=shard)
+        assert result.returncode == 0, result.stderr
+        assert len(calls) == 4
+        assert calls[1]["cli"] == ["validation-waivers", "audit", "--help"]
+        args = calls[3]["cli"]
+        assert args[args.index("--partition-key") + 1] == shard
+        assert json.loads(args[args.index("--partition-keys-json") + 1]) == ["uk", "uk-ashford"]
+        assert "unpartitioned" not in result.stdout
+        checked.extend(json.loads(result.stdout)["checked_modules"])
+    assert sorted(checked) == [
+        "uk-ashford/policies/pending.yaml",
+        "uk/statutes/active.yaml",
+        "uk/statutes/removed.yaml",
+    ]
+
+
+def test_waiver_audit_probe_fails_closed_and_audit_failure_propagates() -> None:
+    for capability in ("old", "new"):
+        result, calls = run_waiver_audit_cli(capability=capability, probe_status=37)
+        assert result.returncode == 37, result.stderr
+        assert len(calls) == 2
+        assert calls[1]["cli"] == ["validation-waivers", "audit", "--help"]
+        assert "capability probe failed (exit 37)" in result.stderr
+        assert "unpartitioned" not in result.stdout
+
+        result, calls = run_waiver_audit_cli(capability=capability, audit_status=41)
+        assert result.returncode == 41, result.stderr
+        assert len(calls) == 4
+        assert "--json" in calls[3]["cli"]
+
+    result, calls = run_waiver_audit_cli(capability="empty")
+    assert result.returncode != 0
+    assert len(calls) == 2
+    assert "capability probe returned no help" in result.stderr
+    assert "unpartitioned" not in result.stdout
+
+
 def test_validation_jobs_are_bounded_in_time_and_parallelism() -> None:
     import yaml
 
@@ -1375,6 +1612,10 @@ def main() -> None:
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_validation_jobs_are_bounded_in_time_and_parallelism()
     test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix()
+    test_old_waiver_audit_cli_checks_complete_ledger_on_every_shard()
+    test_new_waiver_audit_cli_preserves_partition_arguments_and_coverage()
+    test_waiver_audit_probe_fails_closed_and_audit_failure_propagates()
+    print("waiver audit CLI compatibility: 13 regression cases passed")
     test_retired_schema_freeze_classifies_only_plural_citations()
     test_retired_schema_prefreeze_bridge_is_fail_closed()
     test_pending_waiver_requires_exact_digest_only_toolchain_companion()

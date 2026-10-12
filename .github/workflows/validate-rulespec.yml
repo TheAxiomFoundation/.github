@@ -2558,19 +2558,47 @@ jobs:
             test -x /opt/axiom-compose-verification/axiom-compose
             composer_args=(--axiom-compose-path /opt/axiom-compose-verification/axiom-compose)
           fi
-          /opt/axiom-verification/axiom-encode-signing-supervisor \
-            --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
-            --trusted-python-runtime-root /opt/axiom-verification/python \
-            --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
-            --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
-            -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" "${dependency_args[@]}" \
+          # Probe the pinned, protected CLI through the same supervisor as the
+          # audit. A failed probe is a failed gate, never a compatibility signal.
+          run_waiver_audit() {
+            /opt/axiom-verification/axiom-encode-signing-supervisor \
+              --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
+              --trusted-python-runtime-root /opt/axiom-verification/python \
+              --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
+              --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
+              -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" "${dependency_args[@]}" "$@"
+          }
+          audit_help="$RUNNER_TEMP/validation-waivers-audit-help.txt"
+          if run_waiver_audit --help > "$audit_help"; then
+            :
+          else
+            status=$?
+            echo "::error::Validation waiver audit capability probe failed (exit $status)." >&2
+            exit "$status"
+          fi
+          if [ ! -s "$audit_help" ]; then
+            echo "::error::Validation waiver audit capability probe returned no help." >&2
+            exit 1
+          fi
+          partition_args=()
+          if grep -qE -- '(^|[[:space:],])--partition-key([[:space:]=,]|$)' "$audit_help" \
+            && grep -qE -- '(^|[[:space:],])--partition-keys-json([[:space:]=,]|$)' "$audit_help"; then
+            partition_args=(
+              --partition-key "${{ matrix.shard }}"
+              --partition-keys-json '${{ needs.shards.outputs.matrix }}'
+            )
+          else
+            # Pre-partition encoders must audit EVERY waiver on EVERY shard.
+            # Duplicate runtime fingerprint checks preserve complete coverage.
+            echo "Pinned encoder lacks audit partition flags; running the complete unpartitioned waiver audit on this shard."
+          fi
+          run_waiver_audit \
             --json \
             --root "$GITHUB_WORKSPACE" \
             --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
             --protected-base "$protected_base" \
             --changed-paths "$audit_changed_paths" \
-            --partition-key "${{ matrix.shard }}" \
-            --partition-keys-json '${{ needs.shards.outputs.matrix }}' \
+            "${partition_args[@]}" \
             --axiom-rules-engine-path "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine"
 
       - name: Reject manual RuleSpec changes
