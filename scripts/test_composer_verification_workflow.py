@@ -1,5 +1,6 @@
 """Execute composer pin admission and check protected consumer wiring."""
 import os
+import importlib.util
 from pathlib import Path
 import subprocess
 import tempfile
@@ -14,16 +15,28 @@ class ComposerWorkflowTests(unittest.TestCase):
         text = WORKFLOW.read_text()
         source = text.split("python - <<'PYCOMPOSE'\n", 1)[1].split('          PYCOMPOSE', 1)[0]
         source = textwrap.dedent(source)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+        spec = importlib.util.spec_from_file_location(
+            'validator_tests', WORKFLOW.parents[2] / 'scripts/test_validate_rulespec_workflow.py',
+        )
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        ref = 'a' * 40
+        table = helper.workflow_toolchain({**helper.WORKFLOW_INPUT_PINS, 'axiom_compose_ref': ref})
+        caller = (
+            'name: Repository checks\non: pull_request\njobs:\n  validate:\n'
+            '    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+            '    with:\n      axiom-compose-ref: ' + ref + '\n'
+        )
+        with helper.WorkflowInputFixture(table=table, caller=caller) as fixture:
+            root = fixture.root
             config = root / '.axiom/workflow-toolchain.toml'
-            config.parent.mkdir()
-            ref = 'a' * 40
-            config.write_text('[workflow_toolchain]\naxiom_compose_ref = "' + ref + '"\n')
             def run(value):
-                return subprocess.run(['python3', '-c', source], cwd=root,
-                                      env={**os.environ, 'AXIOM_COMPOSE_REF': value},
-                                      capture_output=True).returncode
+                helper.git(root, 'add', '-A')
+                helper.git(root, 'commit', '--allow-empty', '-qm', 'fixture composer pin')
+                base = helper.git(root, 'rev-parse', 'HEAD')
+                return helper.run_workflow_inputs(
+                    root, base, pins={'axiom_compose_ref': value},
+                ).returncode
             self.assertEqual(run(ref), 0)
             for value in ['', 'main', 'b' * 40, 'A' * 40, 'a' * 39, 'a' * 40 + '\n']:
                 self.assertNotEqual(run(value), 0, value)
@@ -36,6 +49,21 @@ class ComposerWorkflowTests(unittest.TestCase):
             config.parent.rename(root / 'actual')
             (root / '.axiom').symlink_to(root / 'actual', target_is_directory=True)
             self.assertNotEqual(run(ref), 0)
+            # The later composer step keeps its syntax check, after trusted
+            # configuration consistency has already passed in the shards job.
+            for value in ['', 'main', 'A' * 40, 'a' * 39, 'a' * 40 + '\n']:
+                result = subprocess.run(['python3', '-c', source], cwd=root,
+                                        env={**os.environ, 'AXIOM_COMPOSE_REF': value},
+                                        capture_output=True)
+                self.assertNotEqual(result.returncode, 0, value)
+        # Equality and Git-blob checks run together before dependency checkout;
+        # the executable protected-input regressions exercise their rejection.
+        protected = text.index('- name: Validate immutable dependency inputs')
+        checkout = text.index('- name: Checkout axiom-encode')
+        compose = text.index('- name: Checkout axiom-compose')
+        self.assertLess(protected, checkout)
+        self.assertLess(protected, compose)
+        self.assertIn('effective axiom_compose_ref must match the protected configuration', text)
 
     def test_consumer_flags_fail_closed_and_old_input_is_compatible(self):
         text = WORKFLOW.read_text()

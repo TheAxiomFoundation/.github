@@ -161,6 +161,240 @@ jobs:
           # against the head to see which jurisdiction subtrees changed.
           fetch-depth: 0
 
+      - name: Set up Python for the RuleSpec pre-check
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install the ProgramSpec shape-check parser
+        run: python -I -m pip install --disable-pip-version-check pyyaml==6.0.3
+
+      - name: Validate immutable dependency inputs
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha || '' }}
+          CURRENT_SHA: ${{ github.sha }}
+          CURRENT_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY: ${{ github.repository }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          AXIOM_ENCODE_SHA: ${{ inputs.axiom-encode-ref }}
+          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          AXIOM_RULES_ENGINE_SHA: ${{ inputs.axiom-rules-engine-ref }}
+          AXIOM_CORPUS_SHA: ${{ inputs.axiom-corpus-ref }}
+          RULESPEC_US_SHA: ${{ inputs.rulespec-us-ref }}
+          RELEASE_BASE_URL: ${{ inputs.corpus-release-base-url }}
+          RELEASE_REGISTRY_URL: ${{ inputs.corpus-release-registry-url }}
+          RELEASE_REGISTRY_ANON_KEY: ${{ inputs.corpus-release-registry-anon-key }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          set -euo pipefail
+          for value in "$AXIOM_ENCODE_SHA" "$AXIOM_RULES_ENGINE_SHA" "$AXIOM_CORPUS_SHA" "$RULESPEC_US_SHA"; do
+            if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Dependency inputs must be exact 40-character lowercase commit SHAs: $value" >&2
+              exit 1
+            fi
+          done
+          # python-version is spliced into many run: blocks; bound it to major.minor
+          # so a caller cannot smuggle shell into those steps (fail-open / RCE).
+          if [[ ! "$PYTHON_VERSION" =~ ^3\.[0-9]+$ ]]; then
+            echo "python-version must be a bare major.minor like 3.14: $PYTHON_VERSION" >&2
+            exit 1
+          fi
+          if [ -n "$RELEASE_REGISTRY_URL" ]; then
+            case "$RELEASE_REGISTRY_URL" in
+              https://*) ;;
+              *) echo "corpus-release-registry-url must use HTTPS" >&2; exit 1 ;;
+            esac
+            if [ -z "$RELEASE_REGISTRY_ANON_KEY" ]; then
+              echo "corpus-release-registry-anon-key is required with corpus-release-registry-url" >&2
+              exit 1
+            fi
+          else
+            if [ -n "$RELEASE_REGISTRY_ANON_KEY" ]; then
+              echo "corpus-release-registry-anon-key requires corpus-release-registry-url" >&2
+              exit 1
+            fi
+            case "$RELEASE_BASE_URL" in
+              https://*) ;;
+              *) echo "corpus-release-base-url must use HTTPS" >&2; exit 1 ;;
+            esac
+          fi
+          # Bind effective inputs before checking out or installing dependencies.
+          # Read Git objects from the event's protected base, never candidate
+          # helpers, workflow defaults, environment pins, or working-tree TOML.
+          python -I - <<'PYPINS'
+          import os
+          import re
+          import subprocess
+          import tomllib
+          import yaml
+
+          SHA = re.compile(r"[0-9a-f]{40}")
+          TABLE_PATH = ".axiom/workflow-toolchain.toml"
+          CALLER_PATHS = (
+              ".github/workflows/repository-checks.yml",
+              ".github/workflows/repository-checks.yaml",
+          )
+          INPUTS = {
+              "axiom_encode_ref": "AXIOM_ENCODE_SHA",
+              "axiom_rules_engine_ref": "AXIOM_RULES_ENGINE_SHA",
+              "axiom_corpus_ref": "AXIOM_CORPUS_SHA",
+              "rulespec_us_ref": "RULESPEC_US_SHA",
+          }
+
+          def fail(message):
+              raise SystemExit(f"ProtectedWorkflowInputError: {message}")
+
+          def git(*args):
+              result = subprocess.run(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                  env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+              )
+              if result.returncode:
+                  fail("cannot read protected Git configuration or history")
+              return result.stdout
+
+          event = os.environ["EVENT_NAME"]
+          if event in ("pull_request", "pull_request_target"):
+              base = os.environ["PR_BASE_SHA"]
+          elif event == "merge_group":
+              base = os.environ["MERGE_GROUP_BASE_SHA"]
+          elif event in ("push", "schedule", "workflow_dispatch"):
+              # Push and scheduled runs validate configuration already committed
+              # to the protected branch, including a newly landed pin-only bump.
+              if os.environ["CURRENT_REF"] != "refs/heads/" + os.environ["DEFAULT_BRANCH"]:
+                  fail("non-PR validation must run on the protected default branch")
+              base = os.environ["CURRENT_SHA"]
+          else:
+              fail("unsupported event cannot select protected workflow configuration")
+          if SHA.fullmatch(base) is None or git("cat-file", "-t", base).strip() != b"commit":
+              fail("the event must identify an available exact protected commit")
+          if git("rev-parse", "--is-shallow-repository").strip() != b"false":
+              fail("complete protected history is required")
+
+          def protected_blob(path):
+              entries = git("ls-tree", "-z", base, "--", path).split(b"\0")
+              entries = [entry for entry in entries if entry]
+              if not entries:
+                  return None
+              if len(entries) != 1:
+                  fail(f"ambiguous protected configuration: {path}")
+              metadata, actual_path = entries[0].split(b"\t", 1)
+              mode, kind, oid = metadata.split(b" ")
+              if actual_path.decode("utf-8") != path or mode not in (b"100644", b"100755") or kind != b"blob":
+                  fail(f"protected configuration must be a regular Git blob: {path}")
+              return git("cat-file", "blob", oid.decode("ascii"))
+
+          raw = protected_blob(TABLE_PATH)
+          if raw is None and git("log", "--full-history", "--format=%H", base, "--", TABLE_PATH).strip():
+              # Establishment is permanent across the protected ancestry. A
+              # deletion or rename cannot recover initialization compatibility.
+              fail("workflow-toolchain.toml cannot disappear after establishment")
+          pins = {}
+          if raw is not None:
+              try:
+                  payload = tomllib.loads(raw.decode("utf-8"))
+              except (UnicodeError, tomllib.TOMLDecodeError):
+                  fail("protected workflow-toolchain.toml must be valid UTF-8 TOML")
+              pins = payload.get("workflow_toolchain")
+              if set(payload) != {"workflow_toolchain"} or not isinstance(pins, dict) or "axiom_encode_ref" not in pins:
+                  fail("protected configuration requires [workflow_toolchain] with axiom_encode_ref")
+              for key, value in pins.items():
+                  if not isinstance(value, str) or (key.endswith("_ref") and SHA.fullmatch(value) is None):
+                      fail(f"invalid protected workflow toolchain pin: {key}")
+
+          VALIDATOR = re.compile(r"TheAxiomFoundation/\.github/\.github/workflows/validate-rulespec\.ya?ml@[0-9a-f]{40}")
+
+          class ProtectedLoader(yaml.SafeLoader):
+              def construct_mapping(self, node, deep=False):
+                  keys = set()
+                  for key_node, _ in node.value:
+                      if key_node.tag == "tag:yaml.org,2002:merge":
+                          fail("protected workflows cannot use ambiguous YAML merge keys")
+                      key = self.construct_object(key_node, deep=True)
+                      try:
+                          if key in keys:
+                              fail("protected workflows cannot contain duplicate YAML keys")
+                          keys.add(key)
+                      except TypeError:
+                          fail("protected workflow mapping keys must be scalar values")
+                  return super().construct_mapping(node, deep=deep)
+
+          def workflow_jobs(raw, path):
+              try:
+                  payload = yaml.load(raw.decode("utf-8"), Loader=ProtectedLoader)
+              except (UnicodeError, yaml.YAMLError):
+                  fail(f"protected workflow must be valid UTF-8 YAML: {path}")
+              if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), dict):
+                  fail(f"protected workflow must contain a jobs mapping: {path}")
+              jobs = list(payload["jobs"].values())
+              if any(not isinstance(job, dict) for job in jobs):
+                  fail(f"protected workflow jobs must be mappings: {path}")
+              return jobs
+
+          caller_values = {}
+          direct_caller = False
+          opaque_caller = False
+          for path in CALLER_PATHS:
+              caller = protected_blob(path)
+              if caller is None:
+                  continue
+              for job in workflow_jobs(caller, path):
+                  uses = job.get("uses", "")
+                  if not isinstance(uses, str):
+                      fail(f"protected caller uses must be a string: {path}")
+                  if not VALIDATOR.fullmatch(uses):
+                      opaque_caller |= bool(uses)
+                      continue
+                  direct_caller = True
+                  supplied = job.get("with", {})
+                  if not isinstance(supplied, dict):
+                      fail(f"protected validator inputs must be a mapping: {path}")
+                  for key, value in supplied.items():
+                      if isinstance(key, str):
+                          caller_values.setdefault(key.replace("-", "_"), []).append(str(value) if value is not None else "")
+
+          def protected_pin(key):
+              if key in pins:
+                  return pins[key]
+              # Older callers may precede the table or omit a newer table key.
+              # Only an unambiguous trusted canonical literal is compatible.
+              values = caller_values.get(key, [])
+              if len(values) != 1 or SHA.fullmatch(values[0]) is None:
+                  fail(f"{key} requires a protected table pin or canonical literal input")
+              return values[0]
+
+          for key, environment in INPUTS.items():
+              if os.environ[environment] != protected_pin(key):
+                  fail(f"effective {key} must match the protected configuration")
+          compose = os.environ["AXIOM_COMPOSE_REF"]
+          compose_enabled = any(caller_values.get("axiom_compose_ref", []))
+          if not compose and "axiom_compose_ref" in pins:
+              # A staged composer pin remains compatible with an older encoder
+              # only for the actual protected canonical caller, whose parsed
+              # jobs must call the validator directly and omit the input.
+              repository = os.environ["REPOSITORY"]
+              caller_ref = os.environ["CALLER_WORKFLOW_REF"]
+              canonical_invocation = any(
+                  caller_ref.startswith(f"{repository}/{path}@")
+                  and len(caller_ref) > len(f"{repository}/{path}@")
+                  for path in CALLER_PATHS
+              )
+              if not canonical_invocation or not direct_caller or opaque_caller:
+                  fail("empty axiom_compose_ref requires a protected direct validator caller")
+          if not compose and compose_enabled:
+              fail("effective axiom_compose_ref cannot disable the protected composer input")
+          if compose and "axiom_compose_ref" not in pins:
+              fail("effective axiom_compose_ref requires an explicit protected workflow-toolchain.toml pin")
+          if compose and (SHA.fullmatch(compose) is None or compose != protected_pin("axiom_compose_ref")):
+              fail("effective axiom_compose_ref must match the protected configuration")
+          print("Effective dependency inputs match the protected workflow configuration.")
+          PYPINS
+
       - name: Reject unsupported tracked paths
         shell: bash
         env:
@@ -207,14 +441,6 @@ jobs:
                   print(f"unsupported tracked path: {path!r}", file=sys.stderr)
               raise SystemExit(1)
           '
-
-      - name: Set up Python for the RuleSpec pre-check
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Install the ProgramSpec shape-check parser
-        run: python -m pip install --disable-pip-version-check pyyaml==6.0.3
 
       - name: Reject unmanifested RuleSpec content
         shell: bash
@@ -1394,51 +1620,6 @@ jobs:
               print(f"- {key}: {value}")
           PY
 
-      - name: Validate immutable dependency inputs
-        shell: bash
-        env:
-          AXIOM_ENCODE_SHA: ${{ inputs.axiom-encode-ref }}
-          AXIOM_RULES_ENGINE_SHA: ${{ inputs.axiom-rules-engine-ref }}
-          AXIOM_CORPUS_SHA: ${{ inputs.axiom-corpus-ref }}
-          RULESPEC_US_SHA: ${{ inputs.rulespec-us-ref }}
-          RELEASE_BASE_URL: ${{ inputs.corpus-release-base-url }}
-          RELEASE_REGISTRY_URL: ${{ inputs.corpus-release-registry-url }}
-          RELEASE_REGISTRY_ANON_KEY: ${{ inputs.corpus-release-registry-anon-key }}
-          PYTHON_VERSION: ${{ inputs.python-version }}
-        run: |
-          set -euo pipefail
-          for value in "$AXIOM_ENCODE_SHA" "$AXIOM_RULES_ENGINE_SHA" "$AXIOM_CORPUS_SHA" "$RULESPEC_US_SHA"; do
-            if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Dependency inputs must be exact 40-character lowercase commit SHAs: $value" >&2
-              exit 1
-            fi
-          done
-          # python-version is spliced into many run: blocks; bound it to major.minor
-          # so a caller cannot smuggle shell into those steps (fail-open / RCE).
-          if [[ ! "$PYTHON_VERSION" =~ ^3\.[0-9]+$ ]]; then
-            echo "python-version must be a bare major.minor like 3.14: $PYTHON_VERSION" >&2
-            exit 1
-          fi
-          if [ -n "$RELEASE_REGISTRY_URL" ]; then
-            case "$RELEASE_REGISTRY_URL" in
-              https://*) ;;
-              *) echo "corpus-release-registry-url must use HTTPS" >&2; exit 1 ;;
-            esac
-            if [ -z "$RELEASE_REGISTRY_ANON_KEY" ]; then
-              echo "corpus-release-registry-anon-key is required with corpus-release-registry-url" >&2
-              exit 1
-            fi
-          else
-            if [ -n "$RELEASE_REGISTRY_ANON_KEY" ]; then
-              echo "corpus-release-registry-anon-key requires corpus-release-registry-url" >&2
-              exit 1
-            fi
-            case "$RELEASE_BASE_URL" in
-              https://*) ;;
-              *) echo "corpus-release-base-url must use HTTPS" >&2; exit 1 ;;
-            esac
-          fi
-
       - name: Reserve isolated dependency directories
         shell: bash
         run: |
@@ -1576,18 +1757,12 @@ jobs:
           python - <<'PYCOMPOSE'
           import os
           import re
-          import tomllib
-          from pathlib import Path
 
           ref = os.environ["AXIOM_COMPOSE_REF"]
           if re.fullmatch(r"[0-9a-f]{40}", ref) is None:
               raise SystemExit("axiom-compose-ref must be a full lowercase commit SHA")
-          path = Path(".axiom/workflow-toolchain.toml")
-          if path.is_symlink() or not path.is_file() or path.parent.is_symlink():
-              raise SystemExit("a regular workflow-toolchain.toml is required for composer")
-          config = tomllib.loads(path.read_text()).get("workflow_toolchain", {})
-          if not isinstance(config, dict) or config.get("axiom_compose_ref") != ref:
-              raise SystemExit("composer input must match workflow-toolchain.toml")
+          # Protected-base equality was enforced with the other effective inputs
+          # before any dependency checkout. Candidate TOML may be a pin-only bump.
           PYCOMPOSE
           # composer-pin-validation-end
 

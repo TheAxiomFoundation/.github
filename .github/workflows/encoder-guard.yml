@@ -121,6 +121,7 @@ jobs:
               ".github/workflows/repository-checks.yml",
               ".github/workflows/repository-checks.yaml",
           )
+          WORKFLOWS = ".github/workflows"
           BLOBS = {}
 
 
@@ -179,7 +180,7 @@ jobs:
                   metadata, path = entry.split(b"\t", 1)
                   mode, kind, oid = metadata.split(b" ")
                   path = os.fsdecode(path)
-                  entries[path] = oid.decode("ascii")
+                  entries[path] = (mode, kind, oid)
                   if mode in (b"100644", b"100755") and kind == b"blob":
                       regular[path] = oid.decode("ascii")
               return entries, regular
@@ -196,8 +197,13 @@ jobs:
                       BLOBS[oid] = git("show", f"{tree}:{path}", env=env)
                   return BLOBS[oid]
 
-              # Protect the entire caller, including its uses/with/if/needs and
-              # pin-reader code. No candidate YAML or expression is evaluated.
+              # All workflow entries are configuration, including helper and
+              # additional callers. Compare modes/types/OIDs without parsing or
+              # executing candidate YAML, expressions, or indirect pin readers.
+              workflows = {
+                  path: entry for path, entry in entries.items()
+                  if path == WORKFLOWS or path.startswith(WORKFLOWS + "/")
+              }
               callers = tuple(blob(path) for path in VALIDATION_CALLERS)
               raw = blob(WORKFLOW_TOOLCHAIN)
               if raw is not None:
@@ -211,7 +217,7 @@ jobs:
                   for key, value in pins.items():
                       if not isinstance(value, str) or (key.endswith("_ref") and re.fullmatch(r"[0-9a-f]{40}", value) is None):
                           raise SystemExit(f"Invalid workflow toolchain pin: {key!r}")
-                  return WORKFLOW_TOOLCHAIN, pins, callers
+                  return WORKFLOW_TOOLCHAIN, pins, callers, workflows
 
               fallback = []
               for path, raw in zip(VALIDATION_CALLERS, callers):
@@ -233,8 +239,17 @@ jobs:
                   if "axiom-encode-ref" not in pins:
                       raise SystemExit(f"Validation caller requires a literal axiom-encode-ref: {path!r}")
                   fallback.append((path, pins))
-              # Preserve repository initialization when neither source exists.
-              return None, fallback, callers
+              return None, fallback, callers, workflows
+
+
+          def require_established_sources(entries):
+              # Establishment is permanent across all reachable protected-base
+              # ancestry, including merged branches. Candidate history never
+              # decides whether initialization compatibility is available.
+              if established_toolchain and WORKFLOW_TOOLCHAIN not in entries:
+                  raise SystemExit("Established workflow-toolchain.toml must remain at its protected path")
+              if established_caller and not any(path in entries for path in VALIDATION_CALLERS) and WORKFLOW_TOOLCHAIN not in entries:
+                  raise SystemExit("Established validation configuration requires a canonical caller or workflow-toolchain.toml")
 
 
           def validation_content(path):
@@ -256,6 +271,10 @@ jobs:
               raise SystemExit("Base and head must be exact 40-hex commit SHAs")
           if merge and re.fullmatch(r"[0-9a-f]{40}", merge) is None:
               raise SystemExit("Merge must be an exact 40-hex commit SHA")
+          if git("rev-parse", "--is-shallow-repository").strip() != b"false":
+              raise SystemExit("Complete protected base history is required for validation pin protection")
+          established_toolchain = bool(git("log", "--full-history", "--format=%H", "-1", base, "--", WORKFLOW_TOOLCHAIN).strip())
+          established_caller = bool(git("log", "--full-history", "--format=%H", "-1", base, "--", *VALIDATION_CALLERS).strip())
           # Three-dot selects only the candidate change set. Deletions/type changes
           # also matter: removing a manifest cannot silently remove provenance.
           # No attributes, diff drivers, textconv filters, or hooks execute here.
@@ -324,11 +343,6 @@ jobs:
                   if merged_fields[index] != b"D" and guarded(path):
                       changed.append(path)
               merged_configuration = validation_configuration(tree, merged, regular, merge_env)
-              if base_configuration != merged_configuration and content_changes:
-                  print("Validation pins or the validation workflow caller changed alongside modules or provenance receipts:", file=sys.stderr)
-                  for path in content_changes:
-                      print(f"  {path!r}", file=sys.stderr)
-                  raise SystemExit("Pin changes must be their own pull request; keep validation pins and caller edits separate from RuleSpec content and provenance receipts.")
               missing = [path for path in changed if not any(candidate in regular for candidate in manifest_candidates(path))]
               if missing:
                   print(f"Missing encoder apply manifests: {len(missing)} of {len(changed)} changed modules", file=sys.stderr)
@@ -336,6 +350,13 @@ jobs:
                       # repr keeps newlines and control characters inert in logs.
                       print(f"  {path!r}: expected {manifest_candidates(path)!r}", file=sys.stderr)
                   raise SystemExit("RuleSpec must come from the supervised encoder: axiom-encode encode <corpus citation> --backend codex --apply")
+              if base_configuration != merged_configuration and content_changes:
+                  print("Validation pins or the validation workflow caller changed alongside modules or provenance receipts:", file=sys.stderr)
+                  for path in content_changes:
+                      print(f"  {path!r}", file=sys.stderr)
+                  raise SystemExit("Pin changes must be their own pull request; keep validation pins and caller edits separate from RuleSpec content and provenance receipts.")
+              require_established_sources(base_entries)
+              require_established_sources(merged)
 
               # Match the validator's applied_files deletion marker, not a new receipt
               # format. Only a regular receipt changed in this PR may retire a module.

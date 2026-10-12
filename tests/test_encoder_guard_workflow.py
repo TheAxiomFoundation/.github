@@ -741,6 +741,119 @@ class ValidationPinTests(unittest.TestCase):
                 fixture.write(path)
                 self.assert_isolated(fixture.run(fixture.head()))
 
+    def test_canonical_caller_cannot_be_renamed_out_of_protection_even_without_content(self):
+        with Fixture({self.VALIDATION_CALLER: self.caller(self.BASE_PIN)}) as fixture:
+            git(fixture.root, "mv", self.VALIDATION_CALLER, ".github/workflows/validate.yml")
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_two_pr_rename_cannot_restore_initialization_compatibility(self):
+        # Simulate the first rename having landed under an earlier guard. The
+        # second PR must fail even though both canonical snapshots are empty.
+        module = "us/statutes/item.yaml"
+        initial = {
+            self.VALIDATION_CALLER: self.caller(self.BASE_PIN),
+            module: "fixture: protected module\n",
+            ".axiom/encoding-manifests/us/statutes/item.json": "{}\n",
+        }
+        with Fixture(initial) as fixture:
+            renamed = ".github/workflows/validate.yml"
+            git(fixture.root, "mv", self.VALIDATION_CALLER, renamed)
+            first = fixture.commit("Move validation caller")
+            fixture.base = first
+            fixture.write(renamed, self.caller(self.LOWER_PIN))
+            fixture.write(module, "fixture: changed module\n")
+            head = fixture.head()
+            for revision in (first, head):
+                for path in (self.VALIDATION_CALLER, self.TOOLCHAIN):
+                    self.assertEqual(git(fixture.root, "ls-tree", revision, "--", path), "")
+            self.assert_fail(fixture.run(head))
+
+    def test_missing_historical_caller_fails_even_when_workflows_are_unchanged(self):
+        with Fixture({self.VALIDATION_CALLER: self.caller(self.BASE_PIN)}) as fixture:
+            (fixture.root / self.VALIDATION_CALLER).unlink()
+            fixture.base = fixture.commit("Remove validation caller")
+            fixture.write("README.md", "fixture: documentation\n")
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_established_toml_cannot_be_removed_in_a_configuration_only_pr(self):
+        with Fixture(self.initial(literal=True)) as fixture:
+            (fixture.root / self.TOOLCHAIN).unlink()
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_missing_historical_toml_cannot_fall_back_to_literal_caller(self):
+        with Fixture(self.initial(literal=True)) as fixture:
+            (fixture.root / self.TOOLCHAIN).unlink()
+            fixture.base = fixture.commit("Remove validation toolchain")
+            self.module(fixture)
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_additional_validator_caller_is_configuration_even_outside_canonical_paths(self):
+        with Fixture(self.initial()) as fixture:
+            fixture.write(".github/workflows/additional.yml", self.caller(self.LOWER_PIN))
+            self.module(fixture)
+            self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_noncanonical_validator_caller_pin_change_cannot_share_content(self):
+        caller = ".github/workflows/validate.yaml"
+        with Fixture({caller: self.caller(self.BASE_PIN)}) as fixture:
+            fixture.write(caller, self.caller(self.LOWER_PIN))
+            self.module(fixture)
+            self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_helper_workflow_input_defaults_and_env_are_configuration(self):
+        helpers = (
+            'on:\n  workflow_call:\n    inputs:\n      encoder-ref:\n        type: string\n        default: "PIN"\njobs: {}\n',
+            'on: workflow_call\njobs:\n  pins:\n    runs-on: ubuntu-latest\n    env:\n      AXIOM_ENCODE_REF: "PIN"\n    steps: []\n',
+        )
+        for helper in helpers:
+            initial = self.initial()
+            initial[".github/workflows/read-pins.yml"] = helper.replace("PIN", self.BASE_PIN)
+            with self.subTest(helper=helper), Fixture(initial) as fixture:
+                fixture.write(".github/workflows/read-pins.yml", helper.replace("PIN", self.LOWER_PIN))
+                self.module(fixture)
+                self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_workflow_mode_change_cannot_share_content(self):
+        with Fixture(self.initial(literal=True)) as fixture:
+            (fixture.root / self.VALIDATION_CALLER).chmod(0o755)
+            self.module(fixture)
+            self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_protection_includes_source_established_on_merged_base_ancestry(self):
+        with Fixture() as fixture:
+            fixture.write(self.TOOLCHAIN, self.toolchain(self.BASE_PIN))
+            established = fixture.commit("Establish toolchain on merged ancestry")
+            original_tree = git(fixture.root, "rev-parse", f"{fixture.base}^{{tree}}")
+            base = git(fixture.root, "commit-tree", original_tree, "-p", fixture.base,
+                       "-p", established, "-m", "Merge without retaining established toolchain")
+            git(fixture.root, "checkout", "--detach", "-q", base)
+            fixture.base = base
+            self.module(fixture)
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_shallow_base_history_cannot_claim_initialization(self):
+        with Fixture() as fixture:
+            self.module(fixture)
+            head = fixture.head()
+            (fixture.root / ".git/shallow").write_text(fixture.base + "\n")
+            self.assert_fail(fixture.run(head))
+
+    def test_canonical_extension_move_and_toml_migration_remain_configuration_only(self):
+        for change in ("extension", "toml"):
+            with self.subTest(change=change), Fixture({self.VALIDATION_CALLER: self.caller(self.BASE_PIN)}) as fixture:
+                if change == "extension":
+                    git(fixture.root, "mv", self.VALIDATION_CALLER,
+                        self.VALIDATION_CALLER.removesuffix(".yml") + ".yaml")
+                else:
+                    fixture.write(self.TOOLCHAIN, self.toolchain(self.BASE_PIN))
+                    (fixture.root / self.VALIDATION_CALLER).unlink()
+                self.assert_pass(fixture.run(fixture.head()))
+
+    def test_never_established_source_preserves_initialization(self):
+        with Fixture() as fixture:
+            self.module(fixture)
+            self.assert_pass(fixture.run(fixture.head()))
+
 
 class WorkflowSecurityTests(unittest.TestCase):
     def test_required_workflow_has_supported_events_read_only_permissions_and_no_opt_out(self):
@@ -1014,6 +1127,17 @@ jobs:
     def test_readme_drops_unsupported_repository_audit_assertion(self):
         section = (ROOT / "README.md").read_text().split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
         self.assertNotIn("27 active", section)
+
+    def test_adoption_explicitly_requires_effective_pin_and_full_revalidation_evidence(self):
+        text = " ".join((ROOT / "README.md").read_text().split())
+        for requirement in ("input default", "environment pin", "pin-only", "unchanged modules",
+                            "exact validator SHA", "protected base", "after merge"):
+            with self.subTest(requirement=requirement):
+                self.assertTrue(requirement.lower() in text.lower(), f"Missing adoption evidence: {requirement}")
+        self.assertNotIn("436cf3044", text)
+        self.assertNotIn("fabe0b3b", text)
+        self.assertNotIn("#1844 admission rule", text)
+        self.assertNotIn("supplied by [.github#126]", text)
 
     def test_adoption_requires_freshness_and_hosted_acceptance_before_enforcement(self):
         text = " ".join((ROOT / "README.md").read_text().split())

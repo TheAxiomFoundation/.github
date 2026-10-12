@@ -232,6 +232,401 @@ def commit(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD")
 
 
+WORKFLOW_TOOLCHAIN = ".axiom/workflow-toolchain.toml"
+VALIDATION_CALLER = ".github/workflows/repository-checks.yml"
+WORKFLOW_INPUT_PINS = {
+    "axiom_encode_ref": "8" * 40,
+    "axiom_rules_engine_ref": "3" * 40,
+    "axiom_corpus_ref": "6" * 40,
+    "rulespec_us_ref": "7" * 40,
+}
+WORKFLOW_INPUT_ENV = {
+    "axiom_encode_ref": "AXIOM_ENCODE_SHA",
+    "axiom_rules_engine_ref": "AXIOM_RULES_ENGINE_SHA",
+    "axiom_corpus_ref": "AXIOM_CORPUS_SHA",
+    "rulespec_us_ref": "RULESPEC_US_SHA",
+    "axiom_compose_ref": "AXIOM_COMPOSE_REF",
+}
+
+
+def workflow_toolchain(pins: dict[str, str]) -> str:
+    return "[workflow_toolchain]\n" + "".join(
+        f'{key} = "{value}"\n' for key, value in pins.items()
+    )
+
+
+def workflow_input_step() -> dict:
+    import yaml
+
+    steps = [
+        step
+        for job in yaml.safe_load(WORKFLOW.read_text())["jobs"].values()
+        for step in job.get("steps", [])
+    ]
+    return next(step for step in steps if step.get("name") == "Validate immutable dependency inputs")
+
+
+def run_workflow_inputs(
+    root: Path, base: str, *, pins: dict[str, str] | None = None,
+    event: str = "pull_request", head: str | None = None,
+    caller_path: str = VALIDATION_CALLER,
+) -> subprocess.CompletedProcess[str]:
+    actual = {**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "", **(pins or {})}
+    environment = {
+        **os.environ,
+        **{WORKFLOW_INPUT_ENV[key]: value for key, value in actual.items()},
+        "EVENT_NAME": event,
+        "PR_BASE_SHA": base if event in ("pull_request", "pull_request_target") else "",
+        "MERGE_GROUP_BASE_SHA": base if event == "merge_group" else "",
+        "CURRENT_SHA": head or git(root, "rev-parse", "HEAD"),
+        "CURRENT_REF": "refs/heads/main",
+        "DEFAULT_BRANCH": "main",
+        "REPOSITORY": "example/rules",
+        "CALLER_WORKFLOW_REF": f"example/rules/{caller_path}@refs/heads/main",
+        "GITHUB_SHA": head or git(root, "rev-parse", "HEAD"),
+        "RELEASE_BASE_URL": "https://example.invalid",
+        "RELEASE_REGISTRY_URL": "",
+        "RELEASE_REGISTRY_ANON_KEY": "",
+        "PYTHON_VERSION": "3.13",
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+        "PYTHONPATH": str(root),
+    }
+    return subprocess.run(
+        ["bash", "-c", workflow_input_step()["run"]],
+        cwd=root, env=environment, capture_output=True, text=True,
+    )
+
+
+class WorkflowInputFixture:
+    def __init__(self, *, table: str | None = None, caller: str | None = None) -> None:
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="hub-.github-125-inputs-",
+            # Respect an owned external parent so bounded runs can also clean
+            # incomplete fixtures after their subprocess group is terminated.
+            dir=os.environ.get("TMPDIR") or ("/private/tmp" if Path("/private/tmp").is_dir() else None),
+        )
+        self.root = Path(self.temporary.name)
+        git(self.root, "init", "-q")
+        git(self.root, "config", "user.name", "Workflow test")
+        git(self.root, "config", "user.email", "workflow-test@example.com")
+        self.write("fixture.txt", "base\n")
+        if table is not None:
+            self.write(WORKFLOW_TOOLCHAIN, table)
+        if caller is not None:
+            self.write(VALIDATION_CALLER, caller)
+        self.base = commit(self.root, "fixture base")
+
+    def __enter__(self) -> "WorkflowInputFixture":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.temporary.cleanup()
+
+    def write(self, path: str, text: str) -> None:
+        destination = self.root / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(text)
+
+    def module(self) -> None:
+        self.write("us/statutes/item.yaml", "fixture: changed module\n")
+        self.write(".axiom/encoding-manifests/us/statutes/item.json", "{}\n")
+
+
+def indirect_workflow_input_probe(route: str) -> None:
+    """Replay candidate-controlled script/default/env pin sources as effective inputs."""
+    import yaml
+
+    caller = """name: Repository checks
+on: pull_request
+jobs:
+  toolchain:
+    USE_HELPER
+  validate:
+    needs: toolchain
+    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    with:
+      axiom-encode-ref: ${{ needs.toolchain.outputs.axiom_encode_ref }}
+      axiom-rules-engine-ref: 3333333333333333333333333333333333333333
+      axiom-corpus-ref: 6666666666666666666666666666666666666666
+      rulespec-us-ref: 7777777777777777777777777777777777777777
+      corpus-release-base-url: https://example.invalid
+"""
+    reader = """runs-on: ubuntu-latest
+    outputs:
+      axiom_encode_ref: ${{ steps.pins.outputs.axiom_encode_ref }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - id: pins
+        run: python scripts/read_pins.py >> "$GITHUB_OUTPUT"
+""".rstrip()
+    caller = caller.replace(
+        "USE_HELPER", reader if route == "script" else "uses: ./.github/workflows/read-pins.yml",
+    )
+    lowered = "1" * 40
+    with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS), caller=caller) as fixture:
+        if route == "script":
+            helper = "scripts/read_pins.py"
+            original = f'print("axiom_encode_ref={WORKFLOW_INPUT_PINS["axiom_encode_ref"]}")\n'
+            proposed = f'print("axiom_encode_ref={lowered}")\n'
+        elif route == "input-default":
+            helper = ".github/workflows/read-pins.yml"
+            original = (
+                "name: Read pins\non:\n  workflow_call:\n    inputs:\n"
+                "      encoder-ref:\n        type: string\n        required: false\n"
+                f'        default: "{WORKFLOW_INPUT_PINS["axiom_encode_ref"]}"\n'
+                "    outputs:\n      axiom_encode_ref:\n"
+                "        value: ${{ jobs.pins.outputs.axiom_encode_ref }}\n"
+                "jobs:\n  pins:\n    runs-on: ubuntu-latest\n    outputs:\n"
+                "      axiom_encode_ref: ${{ steps.output.outputs.axiom_encode_ref }}\n"
+                "    env:\n      AXIOM_ENCODE_REF: ${{ inputs.encoder-ref }}\n"
+                "    steps:\n      - id: output\n"
+                '        run: echo "axiom_encode_ref=$AXIOM_ENCODE_REF" >> "$GITHUB_OUTPUT"\n'
+            )
+            proposed = original.replace(WORKFLOW_INPUT_PINS["axiom_encode_ref"], lowered)
+        else:
+            assert route == "env"
+            helper = ".github/workflows/read-pins.yml"
+            original = (
+                "name: Read pins\non:\n  workflow_call:\n    outputs:\n"
+                "      axiom_encode_ref:\n        value: ${{ jobs.pins.outputs.axiom_encode_ref }}\n"
+                "jobs:\n  pins:\n    runs-on: ubuntu-latest\n    outputs:\n"
+                "      axiom_encode_ref: ${{ steps.output.outputs.axiom_encode_ref }}\n"
+                f'    env:\n      AXIOM_ENCODE_REF: "{WORKFLOW_INPUT_PINS["axiom_encode_ref"]}"\n'
+                "    steps:\n      - id: output\n"
+                '        run: echo "axiom_encode_ref=$AXIOM_ENCODE_REF" >> "$GITHUB_OUTPUT"\n'
+            )
+            proposed = original.replace(WORKFLOW_INPUT_PINS["axiom_encode_ref"], lowered)
+        fixture.write(helper, original)
+        fixture.base = commit(fixture.root, "fixture helper")
+        fixture.write(helper, proposed)
+        fixture.module()
+        head = commit(fixture.root, "fixture candidate")
+        if route == "script":
+            output = subprocess.run(
+                [sys.executable, "-I", str(fixture.root / helper)],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            effective = output.split("=", 1)[1]
+        elif route == "input-default":
+            payload = yaml.safe_load(proposed)
+            effective = payload.get("on", payload.get(True))["workflow_call"]["inputs"]["encoder-ref"]["default"]
+        else:
+            effective = yaml.safe_load(proposed)["jobs"]["pins"]["env"]["AXIOM_ENCODE_REF"]
+        for path in (WORKFLOW_TOOLCHAIN, VALIDATION_CALLER):
+            assert git(fixture.root, "rev-parse", f"{fixture.base}:{path}") == git(fixture.root, "rev-parse", f"{head}:{path}")
+        control = run_workflow_inputs(fixture.root, fixture.base)
+        assert control.returncode == 0, control.stderr
+        result = run_workflow_inputs(fixture.root, fixture.base, pins={"axiom_encode_ref": effective})
+        assert result.returncode != 0, f"{route} pin rollback passed: {result.stdout}"
+        assert "axiom_encode_ref" in result.stderr
+
+
+def test_indirect_script_encoder_pin_cannot_validate_changed_module() -> None:
+    indirect_workflow_input_probe("script")
+
+
+def test_reusable_workflow_input_default_cannot_validate_changed_module() -> None:
+    indirect_workflow_input_probe("input-default")
+
+
+def test_reusable_workflow_env_pin_cannot_validate_changed_module() -> None:
+    indirect_workflow_input_probe("env")
+
+
+def test_every_effective_dependency_matches_protected_workflow_toolchain() -> None:
+    pins = {**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "2" * 40}
+    direct = (
+        "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
+        "    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "    with:\n      axiom-encode-ref: ${{ needs.toolchain.outputs.axiom_encode_ref }}\n"
+    )
+    with WorkflowInputFixture(table=workflow_toolchain(pins), caller=direct) as fixture:
+        for key in pins:
+            actual = {"axiom_compose_ref": pins["axiom_compose_ref"], key: "1" * 40}
+            result = run_workflow_inputs(fixture.root, fixture.base, pins=actual)
+            assert result.returncode != 0, f"unprotected input: {key}"
+            assert key in result.stderr
+        for actual in ({}, {"axiom_compose_ref": pins["axiom_compose_ref"]}):
+            result = run_workflow_inputs(fixture.root, fixture.base, pins=actual)
+            assert result.returncode == 0, result.stderr
+        noncanonical = run_workflow_inputs(fixture.root, fixture.base, caller_path=".github/workflows/wrapper.yml")
+        assert noncanonical.returncode != 0
+    # A staged composer pin is compatible with an older encoder only while the
+    # trusted caller has not enabled the composer input. Once enabled, a helper
+    # cannot disable it by supplying an empty effective value.
+    caller = (
+        "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
+        "    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "    with:\n      axiom-compose-ref: ${{ needs.toolchain.outputs.axiom_compose_ref }}\n"
+    )
+    with WorkflowInputFixture(table=workflow_toolchain(pins), caller=caller) as fixture:
+        disabled = run_workflow_inputs(fixture.root, fixture.base)
+        assert disabled.returncode != 0
+        assert "axiom_compose_ref" in disabled.stderr
+        enabled = run_workflow_inputs(fixture.root, fixture.base, pins={"axiom_compose_ref": pins["axiom_compose_ref"]})
+        assert enabled.returncode == 0, enabled.stderr
+    wrapper = "name: Repository checks\non: pull_request\njobs:\n  validate:\n    uses: ./.github/workflows/wrapper.yml\n"
+    with WorkflowInputFixture(table=workflow_toolchain(pins), caller=wrapper) as fixture:
+        fixture.write(".github/workflows/wrapper.yml", caller)
+        fixture.base = commit(fixture.root, "fixture composer wrapper")
+        assert run_workflow_inputs(fixture.root, fixture.base).returncode != 0
+    with WorkflowInputFixture(table=workflow_toolchain(pins), caller=direct) as fixture:
+        fixture.write(".github/workflows/wrapper.yml", caller)
+        fixture.base = commit(fixture.root, "fixture additional composer caller")
+        assert run_workflow_inputs(fixture.root, fixture.base, caller_path=".github/workflows/wrapper.yml").returncode != 0
+
+
+def test_protected_workflow_toolchain_fails_closed() -> None:
+    variants = (
+        "not TOML [\n",
+        "[other_table]\n",
+        workflow_toolchain({"axiom_encode_ref": WORKFLOW_INPUT_PINS["axiom_encode_ref"]}),
+        workflow_toolchain({**WORKFLOW_INPUT_PINS, "axiom_corpus_ref": "main"}),
+        workflow_toolchain(WORKFLOW_INPUT_PINS) + 'axiom_encode_ref = "' + "1" * 40 + '"\n',
+    )
+    for table in variants:
+        with WorkflowInputFixture(table=table) as fixture:
+            result = run_workflow_inputs(fixture.root, fixture.base)
+            assert result.returncode != 0, table
+    with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
+        fixture.write("pins.toml", workflow_toolchain(WORKFLOW_INPUT_PINS))
+        path = fixture.root / WORKFLOW_TOOLCHAIN
+        path.unlink()
+        path.symlink_to("../pins.toml")
+        symlink_base = commit(fixture.root, "fixture symlink")
+        assert run_workflow_inputs(fixture.root, symlink_base).returncode != 0
+    with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
+        (fixture.root / WORKFLOW_TOOLCHAIN).unlink()
+        deleted_base = commit(fixture.root, "fixture removal")
+        assert run_workflow_inputs(fixture.root, deleted_base).returncode != 0
+    with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
+        assert run_workflow_inputs(fixture.root, "a" * 40).returncode != 0
+
+
+def test_pin_only_candidate_uses_protected_base_and_landed_pin_uses_new_base() -> None:
+    with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
+        changed = {**WORKFLOW_INPUT_PINS, "axiom_encode_ref": "e" * 40}
+        fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain(changed))
+        head = commit(fixture.root, "fixture pin change")
+        for event in ("pull_request", "pull_request_target", "merge_group"):
+            protected = run_workflow_inputs(fixture.root, fixture.base, event=event)
+            assert protected.returncode == 0, protected.stderr
+            premature = run_workflow_inputs(fixture.root, fixture.base, pins=changed, event=event)
+            assert premature.returncode != 0
+        landed = run_workflow_inputs(fixture.root, head, pins=changed, event="push", head=head)
+        assert landed.returncode == 0, landed.stderr
+
+
+def test_legacy_literal_workflow_inputs_preserve_old_encoder_compatibility() -> None:
+    caller = (
+        "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
+        "    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "    with:\n" + "".join(
+            f"      {key.replace('_', '-')}: {value}\n" for key, value in WORKFLOW_INPUT_PINS.items()
+        )
+    )
+    with WorkflowInputFixture(caller=caller) as fixture:
+        result = run_workflow_inputs(fixture.root, fixture.base)
+        assert result.returncode == 0, result.stderr
+        fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain({**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "2" * 40}))
+        initialized = run_workflow_inputs(fixture.root, fixture.base)
+        assert initialized.returncode == 0, initialized.stderr
+        rollback = run_workflow_inputs(fixture.root, fixture.base, pins={"axiom_encode_ref": "1" * 40})
+        assert rollback.returncode != 0
+        (fixture.root / VALIDATION_CALLER).rename(fixture.root / ".github/workflows/validate.yml")
+        (fixture.root / WORKFLOW_TOOLCHAIN).unlink()
+        removed = commit(fixture.root, "fixture moved caller")
+        assert run_workflow_inputs(fixture.root, removed).returncode != 0
+    # Existing tables can predate the canonical-target pin key; the trusted
+    # literal caller still binds that effective input without an encoder bump.
+    legacy_table = {key: value for key, value in WORKFLOW_INPUT_PINS.items() if key != "rulespec_us_ref"}
+    with WorkflowInputFixture(table=workflow_toolchain(legacy_table), caller=caller) as fixture:
+        result = run_workflow_inputs(fixture.root, fixture.base)
+        assert result.returncode == 0, result.stderr
+        rollback = run_workflow_inputs(fixture.root, fixture.base, pins={"rulespec_us_ref": "1" * 40})
+        assert rollback.returncode != 0
+
+
+def test_workflow_input_protection_precedes_dependency_checkout() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    steps = workflow["jobs"]["shards"]["steps"]
+    step = workflow_input_step()
+    assert step["env"]["PR_BASE_SHA"] == "${{ github.event.pull_request.base.sha || '' }}"
+    assert step["env"]["MERGE_GROUP_BASE_SHA"] == "${{ github.event.merge_group.base_sha || '' }}"
+    assert step["env"]["CURRENT_SHA"] == "${{ github.sha }}"
+    assert step["env"]["EVENT_NAME"] == "${{ github.event_name }}"
+    assert "python -I - <<'PYPINS'" in step["run"]
+    assert steps.index(step) == 3
+    assert steps[2]["name"] == "Install the ProgramSpec shape-check parser"
+    assert "python -I -m pip install" in steps[2]["run"]
+    assert workflow["jobs"]["validate"]["needs"] == "shards"
+    assert WORKFLOW.read_text().index("      - name: Validate immutable dependency inputs") < WORKFLOW.read_text().index("      - name: Checkout axiom-encode")
+
+
+def test_protected_workflow_yaml_cannot_disguise_active_composer() -> None:
+    pins = {**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "2" * 40}
+    direct = (
+        "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
+        "    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "    with:\n"
+    )
+    encoded = direct + r'      "axiom\u002dcompose\u002dref": ${{ needs.toolchain.outputs.compose }}' + "\n"
+    with WorkflowInputFixture(table=workflow_toolchain(pins), caller=encoded) as fixture:
+        result = run_workflow_inputs(fixture.root, fixture.base)
+        assert result.returncode != 0, "escaped input key disabled protected composer"
+        assert "axiom_compose_ref" in result.stderr
+    disguised = (
+        "name: Repository checks\non: pull_request\nenv:\n  CALLER_DESCRIPTION: |\n"
+        "    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "jobs:\n  validate:\n    uses: ./.github/workflows/wrapper.yml\n"
+    )
+    with WorkflowInputFixture(table=workflow_toolchain(pins), caller=disguised) as fixture:
+        result = run_workflow_inputs(fixture.root, fixture.base)
+        assert result.returncode != 0, "block scalar spoofed direct validator caller"
+    duplicates = (
+        direct + "      axiom-compose-ref: " + "2" * 40 + "\n      axiom-compose-ref: ''\n",
+        direct + "      <<: {axiom-compose-ref: " + "2" * 40 + "}\n",
+    )
+    for caller in duplicates:
+        with WorkflowInputFixture(table=workflow_toolchain(pins), caller=caller) as fixture:
+            assert run_workflow_inputs(fixture.root, fixture.base).returncode != 0
+
+
+def test_protected_workflow_inputs_reject_untrusted_event_sources() -> None:
+    with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
+        for event in ("workflow_run", "repository_dispatch", "pull_request_review"):
+            result = run_workflow_inputs(fixture.root, fixture.base, event=event)
+            assert result.returncode != 0, event
+        shell = workflow_input_step()["run"]
+        for event in ("push", "workflow_dispatch"):
+            # Mutate only context fixtures, never the protected-input source.
+            environment = {
+                **os.environ,
+                **{WORKFLOW_INPUT_ENV[key]: value for key, value in WORKFLOW_INPUT_PINS.items()},
+                "AXIOM_COMPOSE_REF": "", "EVENT_NAME": event,
+                "PR_BASE_SHA": "", "MERGE_GROUP_BASE_SHA": "",
+                "CURRENT_SHA": fixture.base, "CURRENT_REF": "refs/heads/candidate",
+                "DEFAULT_BRANCH": "main", "RELEASE_BASE_URL": "https://example.invalid",
+                "RELEASE_REGISTRY_URL": "", "RELEASE_REGISTRY_ANON_KEY": "",
+                "PYTHON_VERSION": "3.13",
+                "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+            }
+            result = subprocess.run(["bash", "-c", shell], cwd=fixture.root, env=environment, capture_output=True, text=True)
+            assert result.returncode != 0, event
+
+
+def test_protected_workflow_input_imports_ignore_candidate_python() -> None:
+    with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
+        source = 'from pathlib import Path\nPath("candidate-executed").write_text("executed")\n'
+        for path in ("sitecustomize.py", "tomllib.py", "yaml.py"):
+            fixture.write(path, source)
+        result = run_workflow_inputs(fixture.root, fixture.base)
+        assert result.returncode == 0, result.stderr
+        assert not (fixture.root / "candidate-executed").exists()
+
+
 def authorization_source() -> str:
     workflow = WORKFLOW.read_text()
     start = workflow.index("# reviewed-migration-authorization-start")
@@ -1237,6 +1632,18 @@ def test_conflicted_merge_is_rejected() -> None:
 
 
 def main() -> None:
+    test_indirect_script_encoder_pin_cannot_validate_changed_module()
+    test_reusable_workflow_input_default_cannot_validate_changed_module()
+    test_reusable_workflow_env_pin_cannot_validate_changed_module()
+    test_every_effective_dependency_matches_protected_workflow_toolchain()
+    test_protected_workflow_toolchain_fails_closed()
+    test_pin_only_candidate_uses_protected_base_and_landed_pin_uses_new_base()
+    test_legacy_literal_workflow_inputs_preserve_old_encoder_compatibility()
+    test_workflow_input_protection_precedes_dependency_checkout()
+    test_protected_workflow_yaml_cannot_disguise_active_composer()
+    test_protected_workflow_inputs_reject_untrusted_event_sources()
+    test_protected_workflow_input_imports_ignore_candidate_python()
+    print("protected effective workflow inputs: 11 regression checks passed")
     test_corpus_placement_runs_before_supervised_gates_with_step_only_credentials()
     test_pre_switch_corpus_skips_placement_without_invoking_old_encoder()
     test_post_switch_corpus_rejects_encoder_without_corpus_fetch()

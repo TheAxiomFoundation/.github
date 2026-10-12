@@ -66,28 +66,26 @@ tables in it. Before running the encoder, the workflow downloads the exact
 signed object from
 `<corpus-release-base-url>/releases/<name>/<content_sha256>.json` into the
 corpus checkout's matching `releases/<name>/<content_sha256>.json` path. It
-checks the content address and release name immediately; the protected
-verification supervisor then verifies its Ed25519 signature and supplies all
-three public trust roots without exposing signing capability.
+checks the content address and release name immediately. It builds the pinned
+encoder's verification supervisor and provisions it with public trust roots.
+Audit that external implementation at the adopted encoder SHA for its signature
+verification and process-isolation behavior.
 
-After authenticating the corpus provenance commit, the workflow checks for
+After checking the release provenance commit's ancestry, the workflow checks for
 `.axiom/corpus-locks/` in the corpus checkout. When it is absent, the workflow
 logs a skip and preserves the existing behavior for pre-switch corpus pins.
-When it is present, the pinned encoder must include `axiom-encode corpus-fetch`
-([axiom-encode#1742](https://github.com/TheAxiomFoundation/axiom-encode/pull/1742)).
+When it is present, the pinned encoder must include `axiom-encode corpus-fetch`.
 The workflow runs that command outside the protected supervisor to place the
 pinned release's provisions before provisioning the supervisor or running its
-gates. It uses the release object already acquired above, and places only bytes
-whose size and SHA-256 match both that release and the checkout's scope locks.
+gates. It supplies the release object already acquired above. Audit the pinned
+command for its release, scope-lock, size and SHA-256 checks before adoption.
 
 For provisions available only in R2, configure read-only organization or
 repository secrets `R2_CORPUS_READ_ACCESS_KEY_ID` and
 `R2_CORPUS_READ_SECRET_ACCESS_KEY`, and pass them with `secrets: inherit` as in
-the example. The placement step exposes them only as `R2_ACCESS_KEY_ID` and
-`R2_SECRET_ACCESS_KEY`; supervised gates receive no cloud credentials. Releases
-whose provisions are available from the checkout's git history do not need
-these secrets. The bucket comes from the release object, and the command uses
-the built-in R2 account endpoint; no endpoint or account secret is required.
+the example. The placement step exposes them as `R2_ACCESS_KEY_ID` and
+`R2_SECRET_ACCESS_KEY`. The external command determines supported retrieval
+sources and endpoints; verify its credential requirements at the adopted pin.
 
 Configure those protected roots as `AXIOM_ENCODE_APPLY_SIGNING_PUBLIC_KEY`,
 `AXIOM_ENCODE_EVAL_SIGNING_PUBLIC_KEY`, and
@@ -96,32 +94,23 @@ are deliberately not workflow-call inputs, so a caller change cannot replace
 its own verification roots.
 
 `known-validation-gaps.yaml` is mandatory and its exact bytes must hash to
-`validation_waiver_set_sha256`. On a pull request, the encoder's typed waiver
-audit compares it with the protected base revision and rejects any new or
-broadened waiver; entries may only be removed. A toolchain or caller-workflow
-change runs full RuleSpec validation so a release or waiver-set change cannot
-hide behind changed-file selection.
+`validation_waiver_set_sha256`. On a pull request, the workflow invokes the
+pinned encoder's typed waiver audit with the protected base revision. Audit
+that command for rejection of new or broadened waivers. Pin-only updates require
+full RuleSpec revalidation; the acceptance checklist specifies the hosted
+evidence to retain at the exact adopted validator SHA.
 
-The workflow rejects singular rule roots, separate parameter or test fixture
-files, YAML fixtures under `tests/`, non-RuleSpec YAML outside the approved
-roots, obsolete generated formula artifacts, manual RuleSpec YAML edits without
-an Ed25519-signed `axiom-encode --apply` manifest, and unclassified PolicyEngine
-oracle coverage. New executable outputs must either have
-an exact PolicyEngine mapping or a harness-side `not_comparable` classification
-with a rationale.
+The workflow checks repository layout and runs the pinned encoder's generated
+content and PolicyEngine oracle-coverage gates. The local precheck requires
+manifest presence for changed atomic modules in its roots. Manifest signatures,
+manual exceptions and oracle classifications depend on the external encoder's
+implementation and must be audited at the adopted pin.
 
-The encoder behavior in this paragraph is historical documentation for
-axiom-encode `436cf3044` (2026-10-08), not an audit of the current external
-implementation. Its guard rejected a `backend: manual` apply manifest that introduced a
-*new* rule file unless it declares `manual_exception: composition | repair |
-fixtures | <issue-ref>`. Net-new statutory encoding required an encoder
-run; hand-authoring was permitted only for composition/oracle plumbing,
-validator-driven repairs, and fixtures, and only by declaring itself. The local
-`axiom-encode sign-applied-files` attestation command was removed in the
-encoder hard cut (axiom-encode#1108, commit `bebfee404`); at the documented
-`436cf3044` revision, signed manifests came from its protected
-`targeted-signed-reencode` workflow. `axiom-encode manifest-census`
-reported each repo's encoder-generated / manual / unmanifested coverage.
+The shared workflow invokes the pinned encoder's supervised `guard-generated`
+command. This checkout does not contain that encoder implementation, its
+manifest producer, or historical execution evidence. Before adoption, audit
+the exact encoder SHA for its manifest, signature, manual-exception and
+retirement behavior, and retain the code references and test results.
 
 `programs/` holds axiom-compose ProgramSpecs, which are assembled rather than
 encoded. The local validator's default precheck shape-checks them instead of
@@ -131,14 +120,12 @@ included, must have the ProgramSpec shape:
 - only ProgramSpec keys, and a `program` of `<jurisdiction>/<name>...`;
 - import scope keys `federal`, `state` or a jurisdiction, with at least one
   import entry;
-- every import entry resolves using the order documented for axiom-compose
-  `fabe0b3b` and the artifact engine `98af0dce` (the pins documented for
-  rulespec-us on 2026-10-09: the checkout's own prefix at the root then under
-  `<prefix>/`, any other prefix
-  under `rulespec-<prefix>/` then `<prefix>/`), to an existing regular-file
+- every import entry resolves using the local precheck's search order: the
+  checkout's own prefix at the root then under `<prefix>/`, any other prefix
+  under `rulespec-<prefix>/` then `<prefix>/`, to an existing regular-file
   encoded module at the local precheck's allowed depth (`<root>/...` or
   `<jurisdiction>/<root>/...`), with no symlink on the way. Callers on other
-  compose or engine pins should confirm their resolution order matches;
+  compose or engine pins must confirm their resolution order matches;
 - known compose patterns, and plain-identifier or date rule metadata;
 - no quotes or backslashes, and no numeric literals other than 0, 1 and 12,
   in any other transformation value (`#` comments are ignored).
@@ -193,9 +180,11 @@ The enforcement point is an **organization ruleset** using
 [rulesets/rulespec-encoder-guard.json](rulesets/rulespec-encoder-guard.json)
 after this workflow merges: replace its **40-zero release placeholder** in
 `sha` with the full 40-character commit SHA containing the reviewed workflow.
-The JSON selects this public repository (repository ID `1146671719`),
-`.github/workflows/encoder-guard.yml`, and that immutable source SHA. It is
-active, has no bypass actors, and targets the default branch of every
+The JSON records repository ID `1146671719`,
+`.github/workflows/encoder-guard.yml`, and that immutable source SHA. Adopters
+must verify the ID identifies the intended source repository and confirm its
+visibility and workflow access. The template sets enforcement to active, has
+no bypass actors, and targets the default branch of every
 `rulespec-*` repository except `rulespec-graph-viewer`. The placeholder cannot
 resolve; this file is an adoption definition, not evidence of an applied
 organization setting. Its `do_not_enforce_on_create: true` permits repository
@@ -258,35 +247,64 @@ blobs from that exact event base and proposed merge result. When
 `[workflow_toolchain]` table, including the encoder and other validation pins.
 Otherwise it reads literal validation ref inputs, including `axiom-encode-ref`,
 from `.github/workflows/repository-checks.yml` or its `.yaml` counterpart. It
-compares the pin source, the full table, and both caller files' exact bytes.
-Malformed or nonregular TOML and invalid literal pins fail closed; repositories
-with neither source retain initialization compatibility. No candidate workflow
-expression or head content is executed.
+compares the pin source, the full table, and the entire `.github/workflows/` Git
+tree, including each entry's mode, type and object ID. Every workflow addition,
+edit, move or deletion is therefore a configuration change, including another
+caller of the shared validator. Malformed or nonregular TOML and invalid literal
+pins fail closed. No candidate YAML, workflow expression or head code is
+evaluated to discover callers.
+
+Initialization compatibility applies only when neither a canonical caller nor
+workflow-toolchain TOML has ever appeared in the trusted base's complete reachable
+ancestry. The history scan includes merged branches; shallow or unreadable
+history fails closed. Once TOML has appeared, it must remain a regular blob.
+Once a canonical caller has appeared, at least one canonical `.yml` or `.yaml`
+caller, or workflow-toolchain TOML, must remain. A caller-only rename outside
+those paths is rejected even without content changes. An isolated move between
+the canonical extensions or migration to TOML is allowed. Absence in both base
+and merge result cannot restore initialization compatibility after either source
+has established protection.
+
+Restore any missing established source on the protected branch before adoption;
+ordinary PR validation fails while its trusted base lacks that source.
 
 **Pin changes must be their own pull request.** A pin source, pin value, or
-caller-workflow change cannot share a PR with any changed content under
+workflow-tree change cannot share a PR with any changed content under
 `statutes/`, `regulations/`, `policies/`, `legislation/`, or `programs/`, at the
 top level or under a jurisdiction. This also covers encoding manifests and
 other provenance receipts: the guard conservatively protects all root or
 jurisdiction-root `.axiom/` metadata except `workflow-toolchain.toml` and
-`toolchain.toml`, plus `known-validation-gaps.yaml` evidence. Caller edits are
-compared by exact bytes, so cosmetic edits to those files must also be isolated
+`toolchain.toml`, plus `known-validation-gaps.yaml` evidence. Workflow entries are
+compared by exact object identity, so cosmetic workflow edits must also be isolated
 from these content changes. Pin-only PRs and module-only PRs with unchanged pins
 pass this isolation check, subject to the existing manifest checks. ProgramSpecs
 retain their manifest exemption below, but their content changes must still be
 separate from pin changes.
 
-This protects the trust anchor for the proposed
-[axiom-encode#1844 admission rule](https://github.com/TheAxiomFoundation/axiom-encode/pull/1844),
-which would accept production-signed manifests from encoder-main commits that
-descend from the repository's encoder pin. Without this isolation, a PR could
-lower its own pin while changing the modules or receipts validated against it.
-The protected-base comparison prevents that choice in the same PR. Pin-only
-updates need full repository revalidation; the workflow-toolchain bump behavior
-is supplied by [.github#126](https://github.com/TheAxiomFoundation/.github/pull/126).
-Callers must use a validator revision that includes that behavior. This
-description does not establish that the external admission proposal is deployed
-or audited.
+The shared validator also checks the effective inputs before acquiring toolchain
+dependencies. Encoder, rules-engine, corpus and canonical RuleSpec dependency
+refs must equal the protected configuration, read from the exact PR or merge
+group base rather than candidate files. A caller script, reusable-workflow input
+default or environment pin cannot select a different SHA. Older tables may
+obtain missing dependency refs from unambiguous literal inputs in the trusted
+canonical caller. A nonempty composer input requires a matching protected TOML
+pin. When that pin is staged but inactive, omission requires the actual canonical
+caller to invoke the validator directly and omit composer in its protected YAML.
+Opaque reusable-workflow wrappers fail closed for that compatibility case.
+The caller identity comes from GitHub's inherited workflow context; retain
+hosted evidence that this context identifies the intended caller. See
+[reusable workflow context](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#github-context).
+Callers must pin a shared validator revision containing this check. It adds no
+encoder command requirement for older encoder pins.
+
+Pin-only configuration PRs must continue supplying the protected base's inputs
+until their new configuration is merged. A caller that reads pins from candidate
+TOML must first support reading that exact protected base for PR validation.
+Then callers may supply the newly protected pins after merge. Adopters must
+verify full repository revalidation in both stages at their exact shared
+validator SHA; the guard's presence check does not provide that behavior.
+These local checks do not establish the external encoder's manifest-admission
+policy.
 
 Module selection compares the exact event base with the proposed merge result,
 so candidate edits are checked at their final paths after any base-side rename,
@@ -342,12 +360,10 @@ head code or configuration and install no packages. See
 and [event SHA/ref semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
 
 Merge-group payloads are supported regardless of current repository queue
-settings. No dated repository/queue inventory or historical CI evidence is
-attached here; this section makes no organization-wide audit or historical
-validation claim. Historical PR-body observations must name the tested
-revision and link retained evidence, or be omitted. Hosted rule enforcement
-and the external implementation have not been exercised by local tests;
-record its audited revision separately before adoption.
+settings. Local fixtures test workflow code against Git objects and event
+payloads. They do not establish hosted merge enforcement, organization-wide
+settings, or external encoder behavior; record the audited revision and hosted
+acceptance evidence separately before adoption.
 
 #### ADOPTION CHECKLIST
 
@@ -388,6 +404,33 @@ adoption work; passing local fixtures does not complete these items.
   disabling the source workflow/Actions. Record which supported option was
   tested. See [source-workflow prerequisites](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules#supported-directory)
   and [workflow visibility/access](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#using-a-workflow-file).
+- [ ] Verify the template's repository ID against the intended source repository,
+  and retain its actual visibility and source workflow SHA. Establish regular
+  toolchain TOML or a supported literal canonical caller on the protected base
+  before upgrading validation; a candidate-only source cannot supply trusted
+  pins. Move every caller to an exact shared validator SHA implementing
+  protected-input binding before adopting the guard;
+  the guard alone cannot bind inputs passed to an older validator. Retain that
+  validator SHA. Audit the encoder at each adopted pin for its signature,
+  module-hash and retirement-receipt contract; local presence fixtures do not
+  establish those external checks.
+- [ ] Run a hosted effective-input rollback case with a manifested module edit:
+  leave the protected TOML and canonical caller unchanged, lower the supplied
+  encoder SHA through a helper script, a reusable-workflow input default, and
+  an environment pin, and require rejection for every route. Repeat for the
+  other protected toolchain inputs. Attempt a caller-only rename outside the
+  canonical paths without migrating to TOML and require rejection. Also test
+  an already-moved caller on the base followed by a PR that lowers its pin and
+  edits content; historical protection must reject that PR.
+  Retain both the required workflow and shared validator SHAs with the run
+  results and merge decisions.
+- [ ] Run an explicit pin-only full-revalidation case: change only a toolchain
+  pin while leaving unchanged modules and manifests in place. Continue supplying
+  the protected base's inputs for that PR. Confirm every unchanged module and its
+  manifest is revalidated. After merge, supply the newly protected inputs and
+  confirm full revalidation at the new pin, including
+  rejection of an unchanged module or manifest that violates its policy. Retain
+  the exact validator SHA, selected target inventories and both hosted runs.
 - [ ] Keep `do_not_enforce_on_create: true` and test repository initialization
   in the sandbox; required workflows cannot run while a repository is being
   initialized. Replace the zero-SHA placeholder only with the reviewed release
@@ -403,14 +446,12 @@ workflow test CI.
 Each `validate` matrix leg stops after 180 minutes. Within a leg, "Validate
 RuleSpec YAML" stops after 120 minutes, "Enforce validation waiver ratchet"
 after 150, and "Execute RuleSpec companion tests" after 60. One run starts
-at most 20 legs at a time. The org plan allows 60 concurrent hosted jobs, so
-two runs of one repository still leave runners for the rest of the org.
+at most 20 legs at a time. Check the organization's current concurrency limits
+before adoption.
 
 A leg that reaches a limit is stopped, and the aggregate `validate` check
-fails. Treat that as a hang to fix, not a limit to raise. In September 2026,
-green rulespec-us legs took at most 153 minutes; those steps took at most
-85, 125, and 33 minutes. A caller gets these bounds only when it moves its
-pin to a workflow commit that has them.
+fails. Treat that as a hang to fix, not a limit to raise. A caller gets these
+bounds only when it moves its pin to a workflow commit that has them.
 
 ## Links
 
