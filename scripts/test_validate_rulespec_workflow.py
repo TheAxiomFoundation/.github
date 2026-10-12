@@ -232,6 +232,127 @@ def commit(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD")
 
 
+SELECTOR_TOOLCHAIN = (
+    '[toolchain]\n'
+    'axiom_corpus_release = "before"\n'
+    f'axiom_corpus_release_content_sha256 = "{"a" * 64}"\n'
+    f'validation_waiver_set_sha256 = "{"b" * 64}"\n'
+)
+SELECTOR_WORKFLOW_TOOLCHAIN = (
+    '[workflow_toolchain]\n'
+    f'axiom_encode_ref = "{"a" * 40}"\n'
+    f'axiom_rules_engine_ref = "{"b" * 40}"\n'
+    f'axiom_compose_ref = "{"c" * 40}"\n'
+)
+SELECTOR_MODULES = ["us/regulations/two.yml", "us/statutes/one.yaml"]
+SELECTOR_COMPANIONS = ["us/regulations/two.test.yml", "us/statutes/one.test.yaml"]
+
+
+def run_validation_targets(
+    changes: dict[str, str], *, event: str = "pull_request"
+) -> tuple[str, list[str], list[str]]:
+    """Execute the workflow's real selector against a synthetic Git diff."""
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    step = next(s for s in steps if s.get("id") == "validation_targets")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+
+        def write(path: str, content: str) -> None:
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+
+        files = {
+            ".axiom/toolchain.toml": SELECTOR_TOOLCHAIN,
+            ".axiom/workflow-toolchain.toml": SELECTOR_WORKFLOW_TOOLCHAIN,
+            "README.md": "before\n",
+            **{path: "fixture\n" for path in SELECTOR_MODULES + SELECTOR_COMPANIONS},
+        }
+        for path, content in files.items():
+            write(path, content)
+        base = commit(root, "selector base")
+        for path, content in changes.items():
+            write(path, content)
+        head = commit(root, "selector head")
+        assert git(root, "diff", "--name-only", base, head).splitlines() == sorted(changes)
+
+        runner_temp = root / "runner-temp"
+        runner_temp.mkdir()
+        output = runner_temp / "output"
+        source = (
+            step["run"]
+            .replace("${{ github.event_name }}", event)
+            .replace("${{ github.event.pull_request.base.sha }}", base)
+        )
+        assert "${{" not in source
+        result = subprocess.run(
+            ["bash", "-c", source],
+            cwd=root,
+            env={
+                **os.environ,
+                "GITHUB_SHA": head,
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_ENV": str(runner_temp / "env"),
+                "GITHUB_OUTPUT": str(output),
+                "VALIDATE_ROOTS": "us",
+                "VALIDATE_ROOTS_INPUT": "auto",
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        mode = dict(line.split("=", 1) for line in output.read_text().splitlines())["mode"]
+        return (
+            mode,
+            (runner_temp / "rulespec-files.txt").read_text().splitlines(),
+            (runner_temp / "rulespec-test-files.txt").read_text().splitlines(),
+        )
+
+
+def test_validation_targets_workflow_toolchain_pin_only_requires_full_validation() -> None:
+    for pin in ("a", "b", "c"):
+        changed = SELECTOR_WORKFLOW_TOOLCHAIN.replace(pin * 40, "d" * 40)
+        assert run_validation_targets({".axiom/workflow-toolchain.toml": changed}) == (
+            "full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS
+        ), pin
+
+    # A corpus-only shortcut must not suppress a workflow dependency re-pin.
+    assert run_validation_targets({
+        ".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace('"before"', '"after"'),
+        ".axiom/workflow-toolchain.toml": changed,
+    }) == ("full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS)
+
+
+def test_validation_targets_preserve_other_path_classifications() -> None:
+    full = ("full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS)
+    corpus_only = SELECTOR_TOOLCHAIN.replace('"before"', '"after"')
+    cases = [
+        ({".github/workflows/validate.yml": "changed\n"}, full),
+        ({".github/workflows/validate.yaml": "changed\n"}, full),
+        ({".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace("b" * 64, "c" * 64)}, full),
+        ({".axiom/toolchain.toml": corpus_only}, ("changed-corpus-toolchain-bump", [], [])),
+        ({"README.md": "changed\n"}, ("changed", [], [])),
+        ({".axiom/other.toml": "changed\n"}, ("changed", [], [])),
+        ({"us/statutes/one.yaml": "changed\n"},
+         ("changed", ["us/statutes/one.yaml"], ["us/statutes/one.test.yaml"])),
+        ({"us/statutes/one.test.yaml": "changed\n"},
+         ("changed", ["us/statutes/one.yaml"], ["us/statutes/one.test.yaml"])),
+        ({".axiom/toolchain.toml": corpus_only, "us/statutes/one.yaml": "changed\n"},
+         ("changed-corpus-toolchain-bump", ["us/statutes/one.yaml"], ["us/statutes/one.test.yaml"])),
+    ]
+    for changes, expected in cases:
+        assert run_validation_targets(changes) == expected, changes
+    assert run_validation_targets({"README.md": "changed\n"}, event="push") == (
+        "full-push", SELECTOR_MODULES, SELECTOR_COMPANIONS
+    )
+
+
 def authorization_source() -> str:
     workflow = WORKFLOW.read_text()
     start = workflow.index("# reviewed-migration-authorization-start")
@@ -1237,6 +1358,9 @@ def test_conflicted_merge_is_rejected() -> None:
 
 
 def main() -> None:
+    test_validation_targets_workflow_toolchain_pin_only_requires_full_validation()
+    test_validation_targets_preserve_other_path_classifications()
+    print("validation target selection: 14 regression cases passed")
     test_corpus_placement_runs_before_supervised_gates_with_step_only_credentials()
     test_pre_switch_corpus_skips_placement_without_invoking_old_encoder()
     test_post_switch_corpus_rejects_encoder_without_corpus_fetch()

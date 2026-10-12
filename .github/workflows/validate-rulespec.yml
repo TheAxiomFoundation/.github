@@ -2752,7 +2752,7 @@ jobs:
             mode="changed"
             for path in "${all_changed_paths[@]}"; do
               case "$path" in
-                .github/workflows/*.yml|.github/workflows/*.yaml)
+                .github/workflows/*.yml|.github/workflows/*.yaml|.axiom/workflow-toolchain.toml)
                   mode="full-toolchain-bump"
                   break
                   ;;
