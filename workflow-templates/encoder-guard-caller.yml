@@ -1,0 +1,14 @@
+name: Encoder guard
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  encoder-guard:
+    # RELEASE PLACEHOLDER: replace all 40 zeros with the full SHA of the merged
+    # shared-workflow commit before installing this caller. Never use @main.
+    uses: TheAxiomFoundation/.github/.github/workflows/encoder-guard.yml@0000000000000000000000000000000000000000

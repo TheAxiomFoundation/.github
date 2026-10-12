@@ -1,0 +1,185 @@
+name: Encoder guard
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve immutable event revisions
+        id: revisions
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json
+          import os
+          import re
+
+          # Reject ordinary pull_request callers: their definition is editable
+          # by the very head we are judging. No caller-controlled inputs exist.
+          if os.environ["EVENT_NAME"] != "pull_request_target":
+              raise SystemExit("Encoder guard requires pull_request_target")
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+          pull_request = event["pull_request"]
+          revisions = {side: pull_request[side]["sha"] for side in ("base", "head")}
+          for side, sha in revisions.items():
+              if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+                  raise SystemExit(f"Invalid {side} commit SHA")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for side, sha in revisions.items():
+                  output.write(f"{side}-sha={sha}\n")
+          PY
+
+      - name: Check out the base commit only
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.revisions.outputs.base-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Fetch the head commit as Git objects only
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.revisions.outputs.head-sha }}
+          GH_READ_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          # GitHub serves a fork PR's head object through the base repository.
+          # The read-only built-in token is scoped to this fetch, including for
+          # private repos; it is never persisted or given to the check below.
+          auth="$(printf 'x-access-token:%s' "$GH_READ_TOKEN" | base64 -w 0)"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+              fetch --no-tags --no-recurse-submodules origin "$HEAD_SHA"
+          git cat-file -e "$HEAD_SHA^{commit}"
+
+      - name: Reject RuleSpec modules without encoder manifests
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.revisions.outputs.base-sha }}
+          HEAD_SHA: ${{ steps.revisions.outputs.head-sha }}
+        run: |
+          set -euo pipefail
+          # This script belongs to the SHA-pinned shared workflow, never to
+          # the caller's head. -I prevents imports from the checkout or ambient
+          # PYTHONPATH. Git reads commit objects; no head checkout is created.
+          python3 -I - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          ROOTS = {"statutes", "regulations", "policies", "legislation", "programs"}
+          JURISDICTION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*")
+          MANIFEST_DIR = ".axiom/encoding-manifests"
+
+
+          def git(*args):
+              result = subprocess.run(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              if result.returncode:
+                  raise SystemExit("Git object read failed: " + result.stderr.decode("utf-8", "replace"))
+              return result.stdout
+
+
+          def guarded(path):
+              # Same path exemptions as validate-rulespec's cheap pre-check.
+              # .axiom metadata at the checkout/jurisdiction root lies outside
+              # the module roots. Programs and legislation are always covered
+              # here, as required by the encoding regime.
+              if not path.endswith((".yaml", ".yml")):
+                  return False
+              if path.endswith((".test.yaml", ".test.yml")) or "/composed/" in path:
+                  return False
+              parts = path.split("/")
+              return (
+                  len(parts) >= 2 and parts[0] in ROOTS
+              ) or (
+                  len(parts) >= 3 and parts[1] in ROOTS
+                  and JURISDICTION.fullmatch(parts[0]) is not None
+              )
+
+
+          def manifest_candidates(path):
+              stem = path.rsplit(".", 1)[0]
+              candidates = [f"{MANIFEST_DIR}/{stem}.json"]
+              parts = path.split("/")
+              if (
+                  len(parts) >= 3 and parts[1] in ROOTS
+                  and JURISDICTION.fullmatch(parts[0]) is not None
+              ):
+                  inner = stem.split("/", 1)[1]
+                  candidates.extend([
+                      f"{MANIFEST_DIR}/{inner}.json",
+                      f"{parts[0]}/{MANIFEST_DIR}/{inner}.json",
+                  ])
+              return candidates
+
+
+          base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+          if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in (base, head)):
+              raise SystemExit("Base and head must be exact 40-hex commit SHAs")
+          # Three-dot excludes changes that landed only on the base branch.
+          # Never fall back to a two-dot diff or a shallow/incomplete history.
+          # --no-renames treats renamed destinations as additions. No Git
+          # attributes, diff drivers, textconv filters, or hooks execute.
+          fields = git(
+              "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff",
+              "--no-textconv", "--diff-filter=ACMRT", f"{base}...{head}", "--",
+          ).split(b"\0")
+          if fields[-1] != b"" or len(fields) % 2 != 1:
+              raise SystemExit("Invalid Git name-status output")
+          changed = []
+          for index in range(0, len(fields) - 1, 2):
+              if fields[index] not in (b"A", b"C", b"M", b"R", b"T"):
+                  raise SystemExit("Unexpected Git change status")
+              path = os.fsdecode(fields[index + 1])
+              if guarded(path):
+                  changed.append(path)
+
+          # Only regular blobs in HEAD count as manifests. A symlink, subtree,
+          # submodule, deleted manifest, or untracked worktree file cannot count.
+          regular_files = set()
+          for entry in git("ls-tree", "-r", "-z", "--full-tree", head).split(b"\0"):
+              if not entry:
+                  continue
+              metadata, path = entry.split(b"\t", 1)
+              mode, kind, _ = metadata.split(b" ")
+              if mode in (b"100644", b"100755") and kind == b"blob":
+                  regular_files.add(os.fsdecode(path))
+          missing = [
+              path for path in changed
+              if not any(candidate in regular_files for candidate in manifest_candidates(path))
+          ]
+          if missing:
+              print(f"Missing encoder apply manifests: {len(missing)} of {len(changed)} changed modules", file=sys.stderr)
+              for path in missing:
+                  # repr keeps newlines and control characters inert in logs.
+                  print(f"  {path!r}: expected {manifest_candidates(path)!r}", file=sys.stderr)
+              raise SystemExit(
+                  "RuleSpec must come from the supervised encoder: "
+                  "axiom-encode encode <corpus citation> --backend codex --apply"
+              )
+          print(f"Encoder manifest provenance passed for {len(changed)} changed module(s).")
+          PY

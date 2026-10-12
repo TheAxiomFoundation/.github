@@ -181,6 +181,68 @@ path_rules:
     allow_extensions: [".py"]
 ```
 
+### Base-anchored encoder guard
+
+Add [the encoder guard caller](workflow-templates/encoder-guard-caller.yml) to
+each RuleSpec repository as `.github/workflows/encoder-guard.yml`. After this
+shared workflow has merged, replace the template's **40-zero release
+placeholder** with that commit's full 40-character SHA before installing it.
+The placeholder deliberately cannot resolve. Keep the caller job ID
+`encoder-guard` and require the
+exact status-check context **`encoder-guard / guard`** in branch protection,
+alongside the existing `validate / validate`. Run a PR through the installed
+caller before selecting its check in branch protection.
+
+`pull_request_target` reads the caller from the base repository's default
+branch (`main`). A PR that
+edits or deletes its own caller, re-pins `validate-rulespec.yml`, or switches
+off its existing guard still runs the base caller's SHA-pinned encoder guard
+for that PR. All four lifecycle events are enabled without path filters:
+`opened`, `synchronize`, `reopened`, and `ready_for_review`. The shared guard
+rejects other event types and has no caller inputs that disable enforcement.
+See GitHub's
+[event reference](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target).
+
+The check compares the event payload's exact base and head SHAs using a
+three-dot merge-base diff. Added, modified, type-changed and renamed `.yaml`
+or `.yml` modules under `<jurisdiction>/(statutes|regulations|policies|legislation|programs)/`
+require a regular manifest blob in the head commit; top-level module roots
+are covered too. For `us/statutes/title/foo.yaml`, any of these mirrors counts:
+
+- `.axiom/encoding-manifests/us/statutes/title/foo.json`
+- `.axiom/encoding-manifests/statutes/title/foo.json`
+- `us/.axiom/encoding-manifests/statutes/title/foo.json`
+
+Existing tracked manifests count as well as newly changed ones. The same path
+exemptions as the validator's cheap pre-check apply: companion `.test.yaml`
+and `.test.yml` files and `/composed/` pipelines. Checkout-root and
+jurisdiction-root `.axiom/` metadata is outside module roots; deletions are
+outside this presence check. There is no exception file or programs opt-out.
+This is option **(b)**, a provenance pre-check embedded in the trusted shared
+workflow. It checks mirror presence; the existing supervised validator remains
+responsible for manifest contents, signatures and module hashes. Its
+`guard-generated` path delegates through toolchain, corpus and protected
+supervisor verification, so this check uses a smaller Git-object-only path.
+
+Both workflows grant only `contents: read`, declare no secrets, and use no
+`secrets: inherit`. Only the base commit is checked out. A SHA-pinned checkout
+action acquires it; a read-only built-in GitHub token fetches head Git objects
+without persisting credentials. Isolated Python and hardened Git object queries
+execute no head code or configuration and install no packages.
+
+No merge queue is configured in the 27 active country/subdivision RuleSpec
+repositories inspected for this build. The caller therefore has no
+`merge_group` trigger. Before enabling queues, establish a trusted required
+workflow policy: a merge-group caller comes from the merge-group ref and can
+contain PR edits, so merely adding that trigger would lose this guarantee.
+GitHub describes
+[workflow selection by event SHA/ref](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows#workflow-triggers)
+and [the merge-group event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#merge_group).
+
+Run the Git fixture and workflow security tests with
+`python3 tests/test_encoder_guard_workflow.py`; they also run in the shared
+workflow test CI.
+
 ### Run bounds
 
 Each `validate` matrix leg stops after 180 minutes. Within a leg, "Validate
