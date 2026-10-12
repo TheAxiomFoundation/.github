@@ -1598,3 +1598,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Keep registry regressions in the existing shared-workflow CI entry point.
+    subprocess.run([sys.executable, str(ROOT / "scripts/test_generate_lanes.py")], check=True, timeout=300)
