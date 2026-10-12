@@ -111,10 +111,17 @@ jobs:
           import subprocess
           import sys
           import tempfile
+          import tomllib
 
           ROOTS = {"statutes", "regulations", "policies", "legislation"}
           JURISDICTION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*")
           MANIFEST_DIR = ".axiom/encoding-manifests"
+          WORKFLOW_TOOLCHAIN = ".axiom/workflow-toolchain.toml"
+          VALIDATION_CALLERS = (
+              ".github/workflows/repository-checks.yml",
+              ".github/workflows/repository-checks.yaml",
+          )
+          BLOBS = {}
 
 
           def git(*args, env=None):
@@ -178,6 +185,71 @@ jobs:
               return entries, regular
 
 
+          def validation_configuration(tree, entries, regular, env=None):
+              def blob(path):
+                  if path not in entries:
+                      return None
+                  if path not in regular:
+                      raise SystemExit(f"Validation pin source must be a regular Git blob: {path!r}")
+                  oid = regular[path]
+                  if oid not in BLOBS:
+                      BLOBS[oid] = git("show", f"{tree}:{path}", env=env)
+                  return BLOBS[oid]
+
+              # Protect the entire caller, including its uses/with/if/needs and
+              # pin-reader code. No candidate YAML or expression is evaluated.
+              callers = tuple(blob(path) for path in VALIDATION_CALLERS)
+              raw = blob(WORKFLOW_TOOLCHAIN)
+              if raw is not None:
+                  try:
+                      payload = tomllib.loads(raw.decode("utf-8"))
+                  except (UnicodeError, tomllib.TOMLDecodeError):
+                      raise SystemExit("Validation pins require valid UTF-8 TOML in workflow-toolchain.toml")
+                  pins = payload.get("workflow_toolchain")
+                  if set(payload) != {"workflow_toolchain"} or not isinstance(pins, dict) or "axiom_encode_ref" not in pins:
+                      raise SystemExit("Validation pins require a [workflow_toolchain] table with axiom_encode_ref")
+                  for key, value in pins.items():
+                      if not isinstance(value, str) or (key.endswith("_ref") and re.fullmatch(r"[0-9a-f]{40}", value) is None):
+                          raise SystemExit(f"Invalid workflow toolchain pin: {key!r}")
+                  return WORKFLOW_TOOLCHAIN, pins, callers
+
+              fallback = []
+              for path, raw in zip(VALIDATION_CALLERS, callers):
+                  if raw is None:
+                      continue
+                  try:
+                      text = raw.decode("utf-8")
+                  except UnicodeError:
+                      raise SystemExit(f"Validation caller must be UTF-8: {path!r}")
+                  pins = {}
+                  for match in re.finditer(r"(?m)^[ \t]+(axiom-[a-z0-9-]+-ref|rulespec-us-ref)[ \t]*:[ \t]*(.*)$", text):
+                      key, value = match.groups()
+                      value = value.split("#", 1)[0].strip()
+                      if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+                          value = value[1:-1]
+                      if key in pins or (re.fullmatch(r"[0-9a-f]{40}", value) is None and not (key == "axiom-compose-ref" and value == "")):
+                          raise SystemExit(f"Validation caller requires unambiguous literal commit pins: {key!r}")
+                      pins[key] = value
+                  if "axiom-encode-ref" not in pins:
+                      raise SystemExit(f"Validation caller requires a literal axiom-encode-ref: {path!r}")
+                  fallback.append((path, pins))
+              # Preserve repository initialization when neither source exists.
+              return None, fallback, callers
+
+
+          def validation_content(path):
+              parts = path.split("/")
+              if len(parts) > 1 and JURISDICTION.fullmatch(parts[0]):
+                  parts = parts[1:]
+              if parts[0] in ROOTS | {"programs"}:
+                  return True
+              if parts[0] == ".axiom":
+                  # Include all provenance metadata, whatever its receipt name or
+                  # extension. The two toolchain files are configuration instead.
+                  return parts != [".axiom", "workflow-toolchain.toml"] and parts != [".axiom", "toolchain.toml"]
+              return parts == ["known-validation-gaps.yaml"]
+
+
           base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
           merge = os.environ.get("MERGE_SHA", "")
           if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in (base, head)):
@@ -200,6 +272,8 @@ jobs:
               changes[os.fsdecode(fields[index + 1])] = fields[index]
           ancestor = git("merge-base", base, head).strip().decode("ascii")
           original, original_regular = inventory(ancestor)
+          base_entries, base_regular = (original, original_regular) if base == ancestor else inventory(base)
+          base_configuration = validation_configuration(base, base_entries, base_regular)
 
           with tempfile.TemporaryDirectory(prefix="encoder-guard-") as scratch:
               merge_env = None
@@ -235,17 +309,26 @@ jobs:
               # a candidate edit by moving it away from the head's original filename.
               merged_fields = git(
                   "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff",
-                  "--no-textconv", "--diff-filter=ACMRT", base, tree, "--", env=merge_env,
+                  "--no-textconv", "--diff-filter=ACMRTD", base, tree, "--", env=merge_env,
               ).split(b"\0")
               if merged_fields[-1] != b"" or len(merged_fields) % 2 != 1:
                   raise SystemExit("Invalid merged Git name-status output")
               changed = []
+              content_changes = []
               for index in range(0, len(merged_fields) - 1, 2):
-                  if merged_fields[index] not in (b"A", b"C", b"M", b"R", b"T"):
+                  if merged_fields[index] not in (b"A", b"C", b"M", b"R", b"T", b"D"):
                       raise SystemExit("Unexpected merged Git change status")
                   path = os.fsdecode(merged_fields[index + 1])
-                  if guarded(path):
+                  if validation_content(path):
+                      content_changes.append(path)
+                  if merged_fields[index] != b"D" and guarded(path):
                       changed.append(path)
+              merged_configuration = validation_configuration(tree, merged, regular, merge_env)
+              if base_configuration != merged_configuration and content_changes:
+                  print("Validation pins or the validation workflow caller changed alongside modules or provenance receipts:", file=sys.stderr)
+                  for path in content_changes:
+                      print(f"  {path!r}", file=sys.stderr)
+                  raise SystemExit("Pin changes must be their own pull request; keep validation pins and caller edits separate from RuleSpec content and provenance receipts.")
               missing = [path for path in changed if not any(candidate in regular for candidate in manifest_candidates(path))]
               if missing:
                   print(f"Missing encoder apply manifests: {len(missing)} of {len(changed)} changed modules", file=sys.stderr)

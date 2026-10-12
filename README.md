@@ -252,6 +252,42 @@ the merge in a scratch index from Git objects only. Merge groups use their
 actual group head and require the event base to be its ancestor. Conflicts
 fail the guard.
 
+The guard also protects the repository's validation pins. It reads regular Git
+blobs from that exact event base and proposed merge result. When
+`.axiom/workflow-toolchain.toml` is present, it parses the complete
+`[workflow_toolchain]` table, including the encoder and other validation pins.
+Otherwise it reads literal validation ref inputs, including `axiom-encode-ref`,
+from `.github/workflows/repository-checks.yml` or its `.yaml` counterpart. It
+compares the pin source, the full table, and both caller files' exact bytes.
+Malformed or nonregular TOML and invalid literal pins fail closed; repositories
+with neither source retain initialization compatibility. No candidate workflow
+expression or head content is executed.
+
+**Pin changes must be their own pull request.** A pin source, pin value, or
+caller-workflow change cannot share a PR with any changed content under
+`statutes/`, `regulations/`, `policies/`, `legislation/`, or `programs/`, at the
+top level or under a jurisdiction. This also covers encoding manifests and
+other provenance receipts: the guard conservatively protects all root or
+jurisdiction-root `.axiom/` metadata except `workflow-toolchain.toml` and
+`toolchain.toml`, plus `known-validation-gaps.yaml` evidence. Caller edits are
+compared by exact bytes, so cosmetic edits to those files must also be isolated
+from these content changes. Pin-only PRs and module-only PRs with unchanged pins
+pass this isolation check, subject to the existing manifest checks. ProgramSpecs
+retain their manifest exemption below, but their content changes must still be
+separate from pin changes.
+
+This protects the trust anchor for the proposed
+[axiom-encode#1844 admission rule](https://github.com/TheAxiomFoundation/axiom-encode/pull/1844),
+which would accept production-signed manifests from encoder-main commits that
+descend from the repository's encoder pin. Without this isolation, a PR could
+lower its own pin while changing the modules or receipts validated against it.
+The protected-base comparison prevents that choice in the same PR. Pin-only
+updates need full repository revalidation; the workflow-toolchain bump behavior
+is supplied by [.github#126](https://github.com/TheAxiomFoundation/.github/pull/126).
+Callers must use a validator revision that includes that behavior. This
+description does not establish that the external admission proposal is deployed
+or audited.
+
 Module selection compares the exact event base with the proposed merge result,
 so candidate edits are checked at their final paths after any base-side rename,
 and base-only changes are outside that diff. Three-dot comparison of base and

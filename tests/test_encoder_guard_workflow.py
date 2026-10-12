@@ -532,6 +532,216 @@ class GuardDecisionTests(unittest.TestCase):
             self.assert_fail(fixture.run(head, base=advanced, event="merge_group"))
 
 
+class ValidationPinTests(unittest.TestCase):
+    """A candidate cannot choose validation pins for content in the same change."""
+
+    assert_pass = GuardDecisionTests.assert_pass
+    assert_fail = GuardDecisionTests.assert_fail
+    TOOLCHAIN = ".axiom/workflow-toolchain.toml"
+    VALIDATION_CALLER = ".github/workflows/repository-checks.yml"
+    BASE_PIN = "8" * 40
+    LOWER_PIN = "1" * 40
+    HIGHER_PIN = "e" * 40
+
+    @staticmethod
+    def toolchain(encoder: str, **changes: str) -> str:
+        pins = {
+            "axiom_encode_version": "0.1.0",
+            "axiom_encode_ref": encoder,
+            "axiom_compose_ref": "2" * 40,
+            "axiom_rules_engine_ref": "3" * 40,
+            "axiom_artifact_rules_engine_ref": "4" * 40,
+            "source_staleness_axiom_encode_ref": "5" * 40,
+            "axiom_corpus_ref": "6" * 40,
+            "rulespec_us_ref": "7" * 40,
+        }
+        pins.update(changes)
+        return "[workflow_toolchain]\n" + "".join(f'{key} = "{value}"\n' for key, value in pins.items())
+
+    @staticmethod
+    def caller(encoder: str, validator: str = "a" * 40) -> str:
+        return (
+            "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
+            f"    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@{validator}\n"
+            f"    with:\n      axiom-encode-ref: {encoder}\n"
+        )
+
+    def initial(self, *, literal: bool = False) -> dict[str, str]:
+        return {
+            self.TOOLCHAIN: self.toolchain(self.BASE_PIN),
+            self.VALIDATION_CALLER: self.caller(
+                self.BASE_PIN if literal else "${{ needs.toolchain.outputs.axiom_encode_ref }}"
+            ),
+        }
+
+    def module(self, fixture: Fixture, path: str = "us/statutes/item.yaml") -> None:
+        fixture.write(path, "fixture: candidate module\n")
+        fixture.manifest(".axiom/encoding-manifests/" + path.rsplit(".", 1)[0] + ".json")
+
+    def assert_isolated(self, result) -> None:
+        self.assert_fail(result)
+        self.assertIn("pin changes must be their own pull request", result.stderr.lower())
+
+    def test_lowered_pin_with_every_atomic_root_is_rejected_for_supported_events(self):
+        cases = (
+            ("statutes", "pull_request"),
+            ("regulations", "pull_request_target"),
+            ("policies", "merge_group"),
+            ("legislation", "pull_request"),
+            ("programs", "pull_request"),
+        )
+        for root, event in cases:
+            with self.subTest(root=root, event=event), Fixture(self.initial()) as fixture:
+                fixture.write(self.TOOLCHAIN, self.toolchain(self.LOWER_PIN))
+                self.module(fixture, f"us/{root}/item.yaml")
+                self.assert_isolated(fixture.run(fixture.head(), event=event))
+
+    def test_raised_pin_with_manifest_change_is_rejected_in_both_root_layouts(self):
+        for path in (
+            ".axiom/encoding-manifests/statutes/item.json",
+            "us/.axiom/encoding-manifests/statutes/item.json",
+        ):
+            with self.subTest(path=path), Fixture(self.initial()) as fixture:
+                fixture.write(self.TOOLCHAIN, self.toolchain(self.HIGHER_PIN))
+                fixture.manifest(path)
+                self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_pin_only_changes_pass_with_toolchain_and_literal_fallback(self):
+        for source_path in (self.TOOLCHAIN, self.VALIDATION_CALLER):
+            initial = self.initial() if source_path == self.TOOLCHAIN else {
+                self.VALIDATION_CALLER: self.caller(self.BASE_PIN)
+            }
+            with self.subTest(source_path=source_path), Fixture(initial) as fixture:
+                content = self.toolchain(self.HIGHER_PIN) if source_path == self.TOOLCHAIN else self.caller(self.HIGHER_PIN)
+                fixture.write(source_path, content)
+                self.assert_pass(fixture.run(fixture.head()))
+
+    def test_unchanged_pin_with_module_or_programspec_passes(self):
+        for path in ("us/statutes/item.yaml", "us/programs/item.yaml"):
+            with self.subTest(path=path), Fixture(self.initial()) as fixture:
+                self.module(fixture, path)
+                self.assert_pass(fixture.run(fixture.head()))
+
+    def test_workflow_literal_pin_change_with_module_is_rejected_for_both_extensions(self):
+        for path in (self.VALIDATION_CALLER, self.VALIDATION_CALLER.removesuffix(".yml") + ".yaml"):
+            with self.subTest(path=path), Fixture({path: self.caller(self.BASE_PIN)}) as fixture:
+                fixture.write(path, self.caller(self.LOWER_PIN))
+                self.module(fixture)
+                self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_base_without_toolchain_uses_unchanged_workflow_literal(self):
+        with Fixture({self.VALIDATION_CALLER: self.caller(self.BASE_PIN)}) as fixture:
+            self.module(fixture)
+            self.assert_pass(fixture.run(fixture.head()))
+
+    def test_other_validation_pin_and_version_changes_with_module_are_rejected(self):
+        for key, value in (("source_staleness_axiom_encode_ref", "f" * 40), ("axiom_encode_version", "0.2.0")):
+            with self.subTest(key=key), Fixture(self.initial()) as fixture:
+                fixture.write(self.TOOLCHAIN, self.toolchain(self.BASE_PIN, **{key: value}))
+                self.module(fixture)
+                self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_validation_workflow_call_change_or_removal_with_module_is_rejected(self):
+        for change in ("replace", "remove"):
+            with self.subTest(change=change), Fixture(self.initial(literal=True)) as fixture:
+                if change == "remove":
+                    (fixture.root / self.VALIDATION_CALLER).unlink()
+                else:
+                    fixture.write(self.VALIDATION_CALLER, self.caller(self.BASE_PIN, validator="b" * 40))
+                self.module(fixture)
+                self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_malformed_toml_in_base_or_merge_fails_closed(self):
+        malformed = "[workflow_toolchain\naxiom_encode_ref = invalid\n"
+        for side in ("base", "merge"):
+            initial = self.initial()
+            if side == "base":
+                initial[self.TOOLCHAIN] = malformed
+            with self.subTest(side=side), Fixture(initial) as fixture:
+                fixture.write("README.md", "Fixture documentation change.\n")
+                if side == "merge":
+                    fixture.write(self.TOOLCHAIN, malformed)
+                self.assert_fail(fixture.run(fixture.head()))
+
+    def test_invalid_candidate_toolchain_pin_schema_fails_closed(self):
+        invalid = (
+            "[workflow_toolchain]\n",
+            "[workflow_toolchain]\naxiom_encode_ref = 8\n",
+            '[workflow_toolchain]\naxiom_encode_ref = "' + "8" * 39 + '"\n',
+        )
+        for content in invalid:
+            with self.subTest(content=content), Fixture(self.initial()) as fixture:
+                fixture.write(self.TOOLCHAIN, content)
+                self.assert_fail(fixture.run(fixture.head()))
+
+    def test_candidate_symlink_toolchain_fails_closed(self):
+        with Fixture(self.initial()) as fixture:
+            fixture.write("pin-data.toml", self.toolchain(self.BASE_PIN))
+            (fixture.root / self.TOOLCHAIN).unlink()
+            (fixture.root / self.TOOLCHAIN).symlink_to("../pin-data.toml")
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_advanced_base_pin_is_compared_with_merged_tree_instead_of_candidate_head(self):
+        initial = self.initial()
+        initial.update({
+            "us/statutes/item.yaml": "fixture: base module\n",
+            ".axiom/encoding-manifests/us/statutes/item.json": "{}\n",
+        })
+        with Fixture(initial) as fixture:
+            fixture.write("us/statutes/item.yaml", "fixture: candidate module\n")
+            head = fixture.head()
+            fixture.write(self.TOOLCHAIN, self.toolchain(self.HIGHER_PIN))
+            advanced = fixture.commit("Advance protected base validation pin")
+            tree = git(fixture.root, "merge-tree", "--write-tree", advanced, head)
+            self.assertEqual(git(fixture.root, "show", f"{head}:{self.TOOLCHAIN}"), self.toolchain(self.BASE_PIN).strip())
+            self.assertEqual(git(fixture.root, "show", f"{tree}:{self.TOOLCHAIN}"), self.toolchain(self.HIGHER_PIN).strip())
+            self.assert_pass(fixture.run(head, base=advanced))
+            merge = git(fixture.root, "commit-tree", tree, "-p", advanced, "-p", head, "-m", "Event test merge")
+            self.assert_pass(fixture.run(head, base=advanced, merge=merge))
+
+    def test_toolchain_addition_or_removal_with_module_cannot_bypass_isolation(self):
+        for change in ("add", "remove"):
+            initial = self.initial(literal=True)
+            if change == "add":
+                del initial[self.TOOLCHAIN]
+            with self.subTest(change=change), Fixture(initial) as fixture:
+                if change == "remove":
+                    (fixture.root / self.TOOLCHAIN).unlink()
+                else:
+                    fixture.write(self.TOOLCHAIN, self.toolchain(self.BASE_PIN))
+                self.module(fixture)
+                self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_pin_changes_with_other_provenance_receipts_are_rejected(self):
+        for path in (
+            ".axiom/receipts/apply.json",
+            "us/.axiom/provenance/receipt.json",
+            "known-validation-gaps.yaml",
+        ):
+            with self.subTest(path=path), Fixture(self.initial()) as fixture:
+                fixture.write(self.TOOLCHAIN, self.toolchain(self.HIGHER_PIN))
+                fixture.write(path, "{}\n")
+                self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_pin_change_with_atomic_module_deletion_is_rejected(self):
+        initial = self.initial()
+        initial.update({
+            "us/statutes/item.yaml": "fixture: base module\n",
+            ".axiom/encoding-manifests/us/statutes/item.json": "{}\n",
+        })
+        with Fixture(initial) as fixture:
+            fixture.write(self.TOOLCHAIN, self.toolchain(self.LOWER_PIN))
+            (fixture.root / "us/statutes/item.yaml").unlink()
+            self.assert_isolated(fixture.run(fixture.head()))
+
+    def test_pin_isolation_includes_companions_and_composed_paths(self):
+        for path in ("us/statutes/item.test.yaml", "us/policies/composed/item.yaml"):
+            with self.subTest(path=path), Fixture(self.initial()) as fixture:
+                fixture.write(self.TOOLCHAIN, self.toolchain(self.LOWER_PIN))
+                fixture.write(path)
+                self.assert_isolated(fixture.run(fixture.head()))
+
+
 class WorkflowSecurityTests(unittest.TestCase):
     def test_required_workflow_has_supported_events_read_only_permissions_and_no_opt_out(self):
         workflow = document(WORKFLOW)
@@ -582,7 +792,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             "EVENT_NAME": "${{ github.event_name }}",
         })
         imports = re.findall(r"^import (\w+)$", source(workflow), re.MULTILINE)
-        self.assertEqual(set(imports), {"json", "os", "re", "subprocess", "sys", "tempfile"})
+        self.assertEqual(set(imports), {"json", "os", "re", "subprocess", "sys", "tempfile", "tomllib"})
         for item in workflow["jobs"]["guard"]["steps"]:
             shell = item.get("run", "")
             self.assertNotRegex(shell, r"\bgit\s+(?:checkout|switch|worktree)\b")
