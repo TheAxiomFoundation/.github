@@ -67,6 +67,14 @@ on:
         required: false
         type: number
         default: 1
+      import-aware-selection:
+        description: >-
+          Opt in to PR jurisdiction selection using base and head module
+          imports, program scopes, proof provenance, and manifest applied_files.
+          Unchanged importers receive full atomic validation in their shard.
+        required: false
+        type: boolean
+        default: false
       run-pytest:
         description: Whether to run pytest when the repository has a tests directory.
         required: false
@@ -153,6 +161,8 @@ jobs:
       first: ${{ steps.compute.outputs.first }}
       roots: ${{ steps.compute.outputs.roots }}
       allowed-extra: ${{ steps.compute.outputs.allowed-extra }}
+      revalidate-shards: ${{ steps.compute.outputs.revalidate-shards }}
+      full-targets: ${{ steps.compute.outputs.full-targets }}
     steps:
       - name: Checkout rules repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -935,8 +945,14 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           HEAD_SHA: ${{ github.sha }}
+          IMPORT_AWARE_SELECTION: ${{ inputs.import-aware-selection }}
         run: |
           set -euo pipefail
+          # Safe defaults also cover callers using explicit validation roots.
+          {
+            echo 'revalidate-shards=[]'
+            echo 'full-targets=false'
+          } >> "$GITHUB_OUTPUT"
           if [ "$VALIDATE_ROOTS_INPUT" = "auto" ]; then
             all_shards=()
             for dir in */; do
@@ -970,14 +986,9 @@ jobs:
               allowed_extra="sources programs"
             fi
 
-            # Shard-on-demand: a pull request whose diff is confined to exactly
-            # one jurisdiction subtree (the bulk-encoding case) validates only
-            # that jurisdiction's shard. Multi-tree diffs, pushes, scheduled
-            # runs, and any change that touches shared infrastructure fall back
-            # to the full matrix, which stays the honesty backstop against
-            # cross-shard drift (a daily scheduled full run lives in the
-            # calling repo). The repo-wide gates still run because they are
-            # pinned to the first shard, so no gate is skipped when scoped.
+            # Default callers retain single-subtree selection. Opted-in callers
+            # classify the complete diff and expand dependencies from both Git
+            # trees. Global gates always use all roots on the first selected leg.
             mapfile -t selected_shards < <(
               ALL_SHARDS="${all_shards[*]}" \
               EVENT_NAME="$EVENT_NAME" \
@@ -985,17 +996,32 @@ jobs:
               HEAD_SHA="$HEAD_SHA" \
               python3 <<'PY'
           import os
+          import json
+          import re
+          import io
           import subprocess
           import sys
 
           all_shards = os.environ["ALL_SHARDS"].split()
           shard_set = set(all_shards)
+          import_aware = os.environ.get("IMPORT_AWARE_SELECTION", "false") == "true"
 
 
-          def full(reason: str) -> None:
-              print(f"scope=full ({reason})", file=sys.stderr)
+          def emit(selected, revalidate=(), full_targets=False):
+              # Emit only after complete analysis; never publish a partial graph.
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("revalidate-shards=" + json.dumps([
+                      shard for shard in all_shards if shard in revalidate
+                  ]) + "\n")
+                  output.write(f"full-targets={str(full_targets).lower()}\n")
               for shard in all_shards:
-                  print(shard)
+                  if shard in selected:
+                      print(shard)
+
+
+          def full(reason: str, full_targets=False) -> None:
+              print(f"scope=full ({reason})", file=sys.stderr)
+              emit(shard_set, full_targets=import_aware and full_targets)
               raise SystemExit
 
 
@@ -1003,8 +1029,10 @@ jobs:
           base = os.environ.get("PR_BASE_SHA", "").strip()
           head = os.environ.get("HEAD_SHA", "").strip()
 
-          if event != "pull_request" or not base or not head:
+          if event != "pull_request":
               full(f"event={event or 'unknown'}")
+          if not base or not head:
+              full("missing refs", full_targets=True)
 
           diff = subprocess.run(
               ["git", "diff", "--name-only", "-z", "--no-renames",
@@ -1012,13 +1040,287 @@ jobs:
               stdout=subprocess.PIPE,
           )
           if diff.returncode != 0:
-              full("git diff failed")
+              full("git diff failed", full_targets=True)
 
           changed = [
               os.fsdecode(path) for path in diff.stdout.split(b"\0") if path
           ]
           if not changed:
               full("empty diff")
+
+          if import_aware:
+              try:
+                  import yaml
+
+                  atomic_roots = {"statutes", "regulations", "policies", "legislation"}
+                  jurisdiction = re.compile(r"[a-z]{2}(?:-[a-z0-9-]+)*")
+
+                  def clean_path(path):
+                      if not isinstance(path, str) or not path or path.startswith("/"):
+                          raise ValueError("invalid repository path")
+                      if any(part in {"", ".", ".."} for part in path.split("/")):
+                          raise ValueError("ambiguous repository path")
+                      if "\\" in path or any(ord(c) < 32 for c in path):
+                          raise ValueError("unsupported repository path")
+                      return path
+
+                  def atomic_owner(path):
+                      parts = clean_path(path).split("/")
+                      if (len(parts) >= 3 and jurisdiction.fullmatch(parts[0])
+                              and parts[1] in atomic_roots
+                              and path.endswith((".yaml", ".yml"))):
+                          return parts[0]
+                      return None
+
+                  def is_companion(path):
+                      return path.endswith((".test.yaml", ".test.yml"))
+
+                  def module_path(path):
+                      return path[:-10] + ".yaml" if path.endswith(".test.yaml") else (
+                          path[:-9] + ".yml" if path.endswith(".test.yml") else path
+                      )
+
+                  def identity(path):
+                      owner = atomic_owner(path)
+                      if owner is None or is_companion(path):
+                          raise ValueError(f"not an atomic module: {path}")
+                      return owner + ":" + path.split("/", 1)[1].rsplit(".", 1)[0]
+
+                  def program_owner(path):
+                      parts = clean_path(path).split("/")
+                      if len(parts) >= 3 and parts[0] == "programs" and jurisdiction.fullmatch(parts[1]):
+                          return parts[1]
+                      if len(parts) >= 3 and jurisdiction.fullmatch(parts[0]) and parts[1] == "programs":
+                          return parts[0]
+                      return None
+
+                  def manifest_prefix(path):
+                      parts = clean_path(path).split("/")
+                      if path.endswith(".json") and parts[:2] == [".axiom", "encoding-manifests"]:
+                          return ""
+                      if (path.endswith(".json") and len(parts) >= 4
+                              and jurisdiction.fullmatch(parts[0])
+                              and parts[1:3] == [".axiom", "encoding-manifests"]):
+                          return parts[0]
+                      return None
+
+                  def tree(ref):
+                      result = subprocess.run(["git", "ls-tree", "-r", "-z", ref],
+                                              check=True, stdout=subprocess.PIPE)
+                      entries = {}
+                      for item in result.stdout.split(b"\0"):
+                          if item:
+                              metadata, path = item.split(b"\t", 1)
+                              mode, kind, oid = metadata.decode("ascii").split()
+                              entries[os.fsdecode(path)] = (mode, kind, oid)
+                      return entries
+
+                  trees = [tree(base), tree(head)]
+                  # Batch object reads: graph construction does not spawn one
+                  # Git process per module and never reads the checkout in place
+                  # of a protected base or exact head tree.
+                  needed = set()
+                  for entries in trees:
+                      for path, (mode, kind, oid) in entries.items():
+                          if ((atomic_owner(path) and not is_companion(path))
+                                  or (program_owner(path) and path.endswith((".yaml", ".yml")))
+                                  or (path in changed and manifest_prefix(path) is not None)):
+                              if kind != "blob" or mode not in {"100644", "100755"}:
+                                  raise ValueError(f"non-regular graph input: {path}")
+                              needed.add(oid)
+                  batch = subprocess.run(["git", "cat-file", "--batch"], check=True,
+                                         input="".join(oid + "\n" for oid in sorted(needed)).encode(),
+                                         stdout=subprocess.PIPE)
+                  stream = io.BytesIO(batch.stdout)
+                  blobs = {}
+                  for oid in sorted(needed):
+                      actual, kind, size = stream.readline().decode("ascii").split()
+                      if actual != oid or kind != "blob":
+                          raise ValueError("failed graph object read")
+                      payload = stream.read(int(size))
+                      if len(payload) != int(size) or stream.read(1) != b"\n":
+                          raise ValueError("incomplete graph object read")
+                      blobs[oid] = payload
+
+                  class UniqueLoader(yaml.SafeLoader):
+                      pass
+
+                  def unique_mapping(loader, node, deep=False):
+                      loader.flatten_mapping(node)
+                      mapping = {}
+                      for key_node, value_node in node.value:
+                          key = loader.construct_object(key_node, deep=deep)
+                          if key in mapping:
+                              raise ValueError("duplicate YAML key")
+                          mapping[key] = loader.construct_object(value_node, deep=deep)
+                      return mapping
+
+                  UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+
+                  def document(entries, path):
+                      payload = yaml.load(blobs[entries[path][2]], Loader=UniqueLoader)
+                      if not isinstance(payload, dict):
+                          raise ValueError(f"not a module/program mapping: {path}")
+                      return payload
+
+                  reverse = {}
+                  node_owners = {}
+
+                  def edge(provider, importer):
+                      reverse.setdefault(provider, set()).add(importer)
+
+                  for entries in trees:
+                      modules = {}
+                      for path in entries:
+                          if atomic_owner(path) and not is_companion(path):
+                              key = identity(path)
+                              if key in modules:
+                                  raise ValueError(f"ambiguous module identity: {key}")
+                              modules[key] = path
+                              node_owners[key] = atomic_owner(path)
+
+                      def resolve(target):
+                          if not isinstance(target, str):
+                              raise ValueError("non-string import")
+                          key = target.split("#", 1)[0]
+                          prefix, separator, relative = key.partition(":")
+                          if not separator or not jurisdiction.fullmatch(prefix):
+                              raise ValueError(f"invalid import: {target}")
+                          clean_path(relative)
+                          if relative.endswith((".yaml", ".yml")):
+                              relative = relative.rsplit(".", 1)[0]
+                          key = prefix + ":" + relative
+                          if key not in modules or prefix not in shard_set:
+                              raise ValueError(f"unresolved import: {target}")
+                          return key
+
+                      def proof_edges(value, importer, in_proof=False):
+                          if isinstance(value, dict):
+                              if in_proof and value.get("kind") == "import":
+                                  imported = value.get("import")
+                                  if not isinstance(imported, dict) or "target" not in imported:
+                                      raise ValueError("malformed proof import")
+                                  edge(resolve(imported["target"]), importer)
+                              for key, child in value.items():
+                                  proof_edges(child, importer, in_proof or key == "proof")
+                          elif isinstance(value, list):
+                              for child in value:
+                                  proof_edges(child, importer, in_proof)
+
+                      for key, path in modules.items():
+                          if node_owners[key] not in shard_set:
+                              raise ValueError(f"undiscovered module owner: {path}")
+                          payload = document(entries, path)
+                          imports = payload.get("imports")
+                          if imports is None:
+                              imports = []
+                          if not isinstance(imports, list):
+                              raise ValueError(f"imports is not a list: {path}")
+                          for target in imports:
+                              edge(resolve(target), key)
+                          proof_edges(payload, key)
+
+                      for path in entries:
+                          owner = program_owner(path)
+                          if owner is None or not path.endswith((".yaml", ".yml")):
+                              continue
+                          if owner not in shard_set:
+                              raise ValueError(f"undiscovered program owner: {path}")
+                          payload = document(entries, path)
+                          name = payload.get("program")
+                          if not isinstance(name, str) or name.split("/", 1)[0] != owner or "/" not in name:
+                              raise ValueError(f"ambiguous program owner: {path}")
+                          node = "program:" + path
+                          node_owners[node] = owner
+                          scope = payload.get("scope")
+                          if not isinstance(scope, dict):
+                              raise ValueError(f"missing/invalid program scope: {path}")
+                          count = 0
+                          for label, targets in scope.items():
+                              if label in {"jurisdictions", "include", "exclude"}:
+                                  continue
+                              prefix = {"federal": "us", "state": owner}.get(label, label)
+                              if not isinstance(prefix, str) or not jurisdiction.fullmatch(prefix):
+                                  raise ValueError(f"unknown program scope: {label}")
+                              for target in targets if isinstance(targets, list) else [targets]:
+                                  if not isinstance(target, str):
+                                      raise ValueError("non-string program target")
+                                  edge(resolve(target if ":" in target else prefix + ":" + target), node)
+                                  count += 1
+                          if not count:
+                              raise ValueError(f"program scope resolves across entire checkout: {path}")
+
+                  owners = set()
+                  seeds = set()
+                  force_full = False
+                  changed_modules = {identity(path) for path in changed
+                                     if atomic_owner(path) and not is_companion(path)}
+                  manifest_modules = set()
+
+                  def unique_json(pairs):
+                      mapping = {}
+                      for key, value in pairs:
+                          if key in mapping:
+                              raise ValueError("duplicate manifest key")
+                          mapping[key] = value
+                      return mapping
+
+                  for path in changed:
+                      owner = atomic_owner(path) or program_owner(path)
+                      prefix = manifest_prefix(path)
+                      if prefix is not None:
+                          found = False
+                          for entries in trees:
+                              if path not in entries:
+                                  continue
+                              found = True
+                              payload = json.loads(blobs[entries[path][2]], object_pairs_hook=unique_json)
+                              applied = payload.get("applied_files") if isinstance(payload, dict) else None
+                              if not isinstance(applied, list) or not applied:
+                                  raise ValueError(f"missing/invalid applied_files: {path}")
+                              for item in applied:
+                                  recorded = item.get("path") if isinstance(item, dict) else None
+                                  clean_path(recorded)
+                                  resolved_path = prefix + "/" + recorded if prefix else recorded
+                                  applied_owner = atomic_owner(resolved_path) or program_owner(resolved_path)
+                                  if applied_owner not in shard_set or resolved_path not in entries:
+                                      raise ValueError(f"shared/unresolved manifest applied path: {recorded}")
+                                  owners.add(applied_owner)
+                                  if atomic_owner(resolved_path):
+                                      key = identity(module_path(resolved_path))
+                                      if module_path(resolved_path) not in entries:
+                                          raise ValueError("manifest companion has no module")
+                                      manifest_modules.add(key)
+                                      seeds.add(key)
+                          if not found:
+                              raise ValueError("unreadable changed manifest")
+                      elif owner is not None:
+                          if owner not in shard_set:
+                              raise ValueError(f"undiscovered changed owner: {owner}")
+                          owners.add(owner)
+                          if atomic_owner(path) and not is_companion(path):
+                              seeds.add(identity(path))
+                      elif not path.startswith(".axiom/index/"):
+                          force_full = True
+
+                  affected = set(seeds)
+                  pending = list(seeds)
+                  while pending:
+                      for importer in reverse.get(pending.pop(), ()):
+                          if importer not in affected:
+                              affected.add(importer)
+                              pending.append(importer)
+                  selected = owners | {node_owners[node] for node in affected if node in node_owners}
+                  revalidate = {node_owners[node] for node in affected
+                                if node in node_owners and node not in changed_modules}
+                  revalidate |= {node_owners[node] for node in manifest_modules - changed_modules}
+                  if force_full or not selected:
+                      selected = shard_set
+                  print("scope=import-aware", file=sys.stderr)
+                  emit(selected, revalidate)
+                  raise SystemExit
+              except Exception as error:
+                  full(f"import analysis failed: {error}", full_targets=True)
 
           touched: set[str] = set()
           for path in changed:
@@ -1050,6 +1352,9 @@ jobs:
             if [ "${#selected_shards[@]}" -eq 0 ]; then
               echo "Scope selection produced no shards; falling back to full matrix." >&2
               selected_shards=("${all_shards[@]}")
+              if [ "${IMPORT_AWARE_SELECTION:-false}" = "true" ]; then
+                echo 'full-targets=true' >> "$GITHUB_OUTPUT"
+              fi
             fi
             shards=("${selected_shards[@]}")
           else
@@ -2615,6 +2920,9 @@ jobs:
         env:
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           VALIDATE_ROOTS_INPUT: ${{ inputs.validate-roots }}
+          REVALIDATE_SHARDS: ${{ needs.shards.outputs.revalidate-shards }}
+          FULL_TARGETS: ${{ needs.shards.outputs.full-targets }}
+          VALIDATION_SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
 
@@ -2768,6 +3076,12 @@ jobs:
             done
 
             if [ "$mode" = "full-toolchain-bump" ]; then
+              add_all_rulespec_targets
+            elif [ "${FULL_TARGETS:-false}" = "true" ]; then
+              mode="full-selection-fallback"
+              add_all_rulespec_targets
+            elif python3 -c 'import json, os, sys; sys.exit(os.environ.get("VALIDATION_SHARD", "") not in json.loads(os.environ.get("REVALIDATE_SHARDS") or "[]"))'; then
+              mode="full-dependencies"
               add_all_rulespec_targets
             else
               for path in "${all_changed_paths[@]}"; do
