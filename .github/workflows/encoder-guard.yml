@@ -1,6 +1,13 @@
 name: Encoder guard
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+    types: [checks_requested]
+  # Optional caller support provides local visibility, not enforcement.
   workflow_call:
 
 permissions:
@@ -26,14 +33,18 @@ jobs:
           import os
           import re
 
-          # Reject ordinary pull_request callers: their definition is editable
-          # by the very head we are judging. No caller-controlled inputs exist.
-          if os.environ["EVENT_NAME"] != "pull_request_target":
-              raise SystemExit("Encoder guard requires pull_request_target")
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
               event = json.load(event_file)
-          pull_request = event["pull_request"]
-          revisions = {side: pull_request[side]["sha"] for side in ("base", "head")}
+          # The organization ruleset pins this workflow's source independently
+          # of the target repository. Never select revisions from mutable refs,
+          # GITHUB_SHA (a PR test merge), or edited.changes (the previous base).
+          event_name = os.environ["EVENT_NAME"]
+          if event_name in ("pull_request", "pull_request_target"):
+              revisions = {side: event["pull_request"][side]["sha"] for side in ("base", "head")}
+          elif event_name == "merge_group":
+              revisions = {side: event["merge_group"][f"{side}_sha"] for side in ("base", "head")}
+          else:
+              raise SystemExit("Encoder guard requires a pull request or merge group event")
           for side, sha in revisions.items():
               if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
                   raise SystemExit(f"Invalid {side} commit SHA")
@@ -45,6 +56,8 @@ jobs:
       - name: Check out the base commit only
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # Ruleset source selection does not select the checkout repository.
+          repository: ${{ github.repository }}
           ref: ${{ steps.revisions.outputs.base-sha }}
           fetch-depth: 0
           persist-credentials: false
@@ -77,8 +90,8 @@ jobs:
           HEAD_SHA: ${{ steps.revisions.outputs.head-sha }}
         run: |
           set -euo pipefail
-          # This script belongs to the SHA-pinned shared workflow, never to
-          # the caller's head. -I prevents imports from the checkout or ambient
+          # This script belongs to the ruleset's SHA-pinned workflow, never to
+          # the target's head. -I prevents imports from the checkout or ambient
           # PYTHONPATH. Git reads commit objects; no head checkout is created.
           python3 -I - <<'PY'
           import os
@@ -104,7 +117,8 @@ jobs:
 
 
           def guarded(path):
-              # Same path exemptions as validate-rulespec's cheap pre-check.
+              # Companion/composed exemptions for this presence check only;
+              # the validator's separate ProgramSpec shape check differs.
               # .axiom metadata at the checkout/jurisdiction root lies outside
               # the module roots. Programs and legislation are always covered
               # here, as required by the encoding regime.

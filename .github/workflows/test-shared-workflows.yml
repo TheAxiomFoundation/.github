@@ -10,6 +10,8 @@ on:
       - "scripts/test_external_dependency_layout.py"
       - "tests/test_encoder_guard_workflow.py"
       - "workflow-templates/encoder-guard-caller.yml"
+      - "rulesets/rulespec-encoder-guard.json"
+      - "README.md"
   push:
     branches: [main]
     paths:
@@ -20,6 +22,8 @@ on:
       - "scripts/test_external_dependency_layout.py"
       - "tests/test_encoder_guard_workflow.py"
       - "workflow-templates/encoder-guard-caller.yml"
+      - "rulesets/rulespec-encoder-guard.json"
+      - "README.md"
 
 permissions:
   contents: read
@@ -42,5 +46,5 @@ jobs:
         run: python scripts/test_composer_verification_workflow.py
       - name: Test external dependency layout
         run: python scripts/test_external_dependency_layout.py
-      - name: Test base-anchored encoder guard
+      - name: Test ruleset encoder guard
         run: python tests/test_encoder_guard_workflow.py

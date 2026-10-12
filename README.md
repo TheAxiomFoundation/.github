@@ -183,28 +183,49 @@ path_rules:
 
 ### Base-anchored encoder guard
 
-Add [the encoder guard caller](workflow-templates/encoder-guard-caller.yml) to
-each RuleSpec repository as `.github/workflows/encoder-guard.yml`. After this
-shared workflow has merged, replace the template's **40-zero release
-placeholder** with that commit's full 40-character SHA before installing it.
-The placeholder deliberately cannot resolve. Keep the caller job ID
-`encoder-guard` and require the
-exact status-check context **`encoder-guard / guard`** in branch protection,
-alongside the existing `validate / validate`. Run a PR through the installed
-caller before selecting its check in branch protection.
+The enforcement point is an **organization ruleset** using
+**Require workflows to pass before merging**, not a required status-check name. Adopt
+[rulesets/rulespec-encoder-guard.json](rulesets/rulespec-encoder-guard.json)
+after this workflow merges: replace its **40-zero release placeholder** in
+`sha` with the full 40-character commit SHA containing the reviewed workflow.
+The JSON selects this public repository (repository ID `1146671719`),
+`.github/workflows/encoder-guard.yml`, and that immutable source SHA. It is
+active, has no bypass actors, and targets the default branch of every
+`rulespec-*` repository except `rulespec-graph-viewer`. The placeholder cannot
+resolve; this file is an adoption definition, not an applied organization
+setting. See GitHub's
+[required-workflow rule](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#require-workflows-to-pass-before-merging)
+and [ruleset API schema](https://docs.github.com/en/rest/orgs/rules#create-an-organization-repository-ruleset).
 
-`pull_request_target` reads the caller from the base repository's default
-branch (`main`). A PR that
-edits or deletes its own caller, re-pins `validate-rulespec.yml`, or switches
-off its existing guard still runs the base caller's SHA-pinned encoder guard
-for that PR. All four lifecycle events are enabled without path filters:
-`opened`, `synchronize`, `reopened`, and `ready_for_review`. The shared guard
-rejects other event types and has no caller inputs that disable enforcement.
-See GitHub's
-[event reference](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target).
+A RuleSpec PR cannot edit, delete, or impersonate that pinned workflow through
+its own workflow files. GitHub records the required workflow's run conclusion
+in the target repository; the ruleset requires that workflow identity. A job
+named `encoder-guard / guard` is insufficient: required status checks do not
+identify their workflow or event. Keep the existing validator enabled for its
+additional checks. The [caller template](workflow-templates/encoder-guard-caller.yml)
+is optional and only provides local visibility. If installed, replace its
+separate release placeholder with the same full SHA. It is not an enforcement
+point. See GitHub's
+[status-check matching documentation](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules#troubleshooting-required-status-checks).
 
-The check compares the event payload's exact base and head SHAs using a
-three-dot merge-base diff. Added, modified, type-changed and renamed `.yaml`
+The workflow declares `pull_request`, `pull_request_target`, and `merge_group`,
+without branch or path filters. PR activity types include `edited` for
+retargeting, along with `opened`, `synchronize`, `reopened`, and
+`ready_for_review`; merge groups use `checks_requested`. **GitHub currently
+ignores event filters, including `types`, for ruleset workflows** and runs
+only the default PR activities (`opened`, `synchronize`, `reopened`) and
+`merge_group.checks_requested`. Thus declaring `edited` enables ordinary
+workflow/caller runs but does not guarantee a fresh ruleset run after
+retargeting. After changing a PR's base, push/update its branch or close and
+reopen it to obtain a fresh required-workflow run against the current base.
+Verify hosted retarget/check-freshness behavior before adoption; local tests
+verify payload handling, not GitHub's merge acceptance. See
+[supported ruleset events](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers).
+
+The check compares the event payload's exact PR `base.sha` / `head.sha`, or
+merge group's `base_sha` / `head_sha`, using a three-dot merge-base diff.
+It ignores mutable refs, `GITHUB_SHA`, and the previous base in `changes` on
+an edited event. Added, modified, type-changed and renamed `.yaml`
 or `.yml` modules under `<jurisdiction>/(statutes|regulations|policies|legislation|programs)/`
 require a regular manifest blob in the head commit; top-level module roots
 are covered too. For `us/statutes/title/foo.yaml`, any of these mirrors counts:
@@ -213,31 +234,40 @@ are covered too. For `us/statutes/title/foo.yaml`, any of these mirrors counts:
 - `.axiom/encoding-manifests/statutes/title/foo.json`
 - `us/.axiom/encoding-manifests/statutes/title/foo.json`
 
-Existing tracked manifests count as well as newly changed ones. The same path
-exemptions as the validator's cheap pre-check apply: companion `.test.yaml`
-and `.test.yml` files and `/composed/` pipelines. Checkout-root and
+Existing tracked manifests count as well as newly changed ones. This presence
+check exempts companion `.test.yaml` and `.test.yml` files and `/composed/`
+pipelines. The validator's separate
+ProgramSpec shape check also covers companion files under `programs/`.
+It checks their shape even when this guard exempts them. Checkout-root and
 jurisdiction-root `.axiom/` metadata is outside module roots; deletions are
 outside this presence check. There is no exception file or programs opt-out.
-This is option **(b)**, a provenance pre-check embedded in the trusted shared
-workflow. It checks mirror presence; the existing supervised validator remains
-responsible for manifest contents, signatures and module hashes. Its
-`guard-generated` path delegates through toolchain, corpus and protected
-supervisor verification, so this check uses a smaller Git-object-only path.
+It checks mirror presence only. The validator's supervised `guard-generated`
+step verifies manifest contents, signatures and module hashes for its encoded
+atomic module roots (statutes, regulations, policies, legislation).
+ProgramSpecs are excluded from the supervised generated guard; requiring a
+manifest here does not establish their authenticity. This change adds no
+ProgramSpec manifest producer or signer. See the existing
+[validator implementation](.github/workflows/validate-rulespec.yml).
 
-Both workflows grant only `contents: read`, declare no secrets, and use no
-`secrets: inherit`. Only the base commit is checked out. A SHA-pinned checkout
-action acquires it; a read-only built-in GitHub token fetches head Git objects
-without persisting credentials. Isolated Python and hardened Git object queries
-execute no head code or configuration and install no packages.
+The guard and optional caller grant only `contents: read`, declare no secrets,
+and use no `secrets: inherit`. The ruleset pins the workflow source; checkout
+explicitly selects the target event's `github.repository` and validated base
+SHA, rather than this shared repository or a PR merge ref. The event's built-in
+`github.token` is limited to read-only repository contents; unspecified token
+permissions are disabled. A SHA-pinned checkout action acquires only base and
+does not persist credentials. A transient authenticated fetch obtains head
+Git objects. Actions reports the job conclusion without granting the job
+`checks: write`. Isolated Python and hardened Git object queries execute no
+head code or configuration and install no packages. See
+[checkout's repository/token defaults](https://github.com/actions/checkout#usage),
+[token permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions),
+and [event SHA/ref semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
 
-No merge queue is configured in the 27 active country/subdivision RuleSpec
-repositories inspected for this build. The caller therefore has no
-`merge_group` trigger. Before enabling queues, establish a trusted required
-workflow policy: a merge-group caller comes from the merge-group ref and can
-contain PR edits, so merely adding that trigger would lose this guarantee.
-GitHub describes
-[workflow selection by event SHA/ref](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows#workflow-triggers)
-and [the merge-group event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#merge_group).
+Merge-group payloads are supported regardless of current repository queue
+settings. No dated repository/queue inventory or historical CI evidence is
+attached here; this section makes no organization-wide audit or historical
+validation claim. Hosted rule enforcement and external encoder implementation
+status have not been exercised by these local tests.
 
 Run the Git fixture and workflow security tests with
 `python3 tests/test_encoder_guard_workflow.py`; they also run in the shared

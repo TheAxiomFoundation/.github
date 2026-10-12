@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -17,9 +18,18 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/encoder-guard.yml"
 CALLER = ROOT / "workflow-templates/encoder-guard-caller.yml"
+RULESET = ROOT / "rulesets/rulespec-encoder-guard.json"
 GUARD_STEP = "Reject RuleSpec modules without encoder manifests"
 REVISION_STEP = "Resolve immutable event revisions"
 GUARD_EVALUATIONS = 0
+PR_EVENT_TYPES = ["opened", "synchronize", "reopened", "ready_for_review", "edited"]
+
+
+def temporary_fixture_directory():
+    # Keep Git fixtures outside the checkout; /private/tmp is the local fleet's
+    # scratch directory, while hosted Linux runners use their system temp dir.
+    parent = "/private/tmp" if Path("/private/tmp").is_dir() else None
+    return tempfile.TemporaryDirectory(prefix="hub-.github-125-fixture-", dir=parent)
 
 
 def document(path: Path) -> dict:
@@ -53,7 +63,7 @@ class Fixture:
     """Only fixture commits change; the shared workspace's Git history stays intact."""
 
     def __init__(self, initial: dict[str, str] | None = None):
-        self.temporary = tempfile.TemporaryDirectory(prefix=".encoder-guard-fixture-", dir=ROOT / "tests")
+        self.temporary = temporary_fixture_directory()
         self.root = Path(self.temporary.name)
         git(self.root, "init", "-q")
         git(self.root, "config", "user.name", "Encoder guard fixture")
@@ -312,9 +322,14 @@ class GuardDecisionTests(unittest.TestCase):
 
 
 class WorkflowSecurityTests(unittest.TestCase):
-    def test_reusable_workflow_has_read_only_permissions_no_secrets_or_opt_out(self):
+    def test_required_workflow_has_supported_events_read_only_permissions_and_no_opt_out(self):
         workflow = document(WORKFLOW)
-        self.assertEqual(events(workflow), {"workflow_call": None})
+        self.assertEqual(events(workflow), {
+            "pull_request": {"types": PR_EVENT_TYPES},
+            "pull_request_target": {"types": PR_EVENT_TYPES},
+            "merge_group": {"types": ["checks_requested"]},
+            "workflow_call": None,
+        })
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(set(workflow["jobs"]), {"guard"})
         job = workflow["jobs"]["guard"]
@@ -333,6 +348,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         checkout = [item for item in steps if item.get("uses", "").startswith("actions/checkout@")]
         self.assertEqual(len(checkout), 1)
         settings = checkout[0]["with"]
+        self.assertEqual(settings.get("repository"), "${{ github.repository }}")
         self.assertEqual(settings["ref"], "${{ steps.revisions.outputs.base-sha }}")
         self.assertEqual(settings["fetch-depth"], 0)
         self.assertIs(settings["persist-credentials"], False)
@@ -363,17 +379,20 @@ class WorkflowSecurityTests(unittest.TestCase):
     def test_revision_resolution_reads_event_base_and_head_and_rejects_other_events(self):
         workflow = document(WORKFLOW)
         resolver = source(workflow, REVISION_STEP)
-        with tempfile.TemporaryDirectory(prefix=".encoder-guard-fixture-", dir=ROOT / "tests") as directory:
+        with temporary_fixture_directory() as directory:
             root = Path(directory)
             payload = root / "event.json"
             output = root / "outputs"
             revisions = {"base": "a" * 40, "head": "b" * 40}
             payload.write_text(json.dumps({"pull_request": {side: {"sha": sha} for side, sha in revisions.items()}}))
             env = {**os.environ, "EVENT_NAME": "pull_request_target", "GITHUB_EVENT_PATH": str(payload), "GITHUB_OUTPUT": str(output)}
-            result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=root, env=env, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(output.read_text(), "base-sha=" + revisions["base"] + "\nhead-sha=" + revisions["head"] + "\n")
-            for event in ("pull_request", "workflow_dispatch", "push"):
+            for event in ("pull_request", "pull_request_target"):
+                with self.subTest(event=event):
+                    output.unlink(missing_ok=True)
+                    result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=root, env={**env, "EVENT_NAME": event}, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(output.read_text(), "base-sha=" + revisions["base"] + "\nhead-sha=" + revisions["head"] + "\n")
+            for event in ("workflow_dispatch", "push", "workflow_call"):
                 with self.subTest(event=event):
                     output.unlink(missing_ok=True)
                     result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=root, env={**env, "EVENT_NAME": event}, capture_output=True, text=True)
@@ -388,9 +407,66 @@ class WorkflowSecurityTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(output.exists())
 
-    def test_caller_is_unfiltered_base_anchored_and_declares_exact_context(self):
+    def test_merge_group_resolution_uses_payload_shas_not_checkout_or_environment_refs(self):
+        resolver = source(document(WORKFLOW), REVISION_STEP)
+        with temporary_fixture_directory() as directory:
+            root = Path(directory)
+            payload = root / "event.json"
+            output = root / "outputs"
+            base, head = "c" * 40, "d" * 40
+            event = {
+                "action": "checks_requested",
+                "merge_group": {"base_sha": base, "head_sha": head, "base_ref": "refs/heads/main", "head_ref": "refs/heads/gh-readonly-queue/main/group"},
+                "pull_request": {"base": {"sha": "a" * 40}, "head": {"sha": "b" * 40}},
+            }
+            env = {
+                **os.environ, "EVENT_NAME": "merge_group", "GITHUB_EVENT_PATH": str(payload),
+                "GITHUB_OUTPUT": str(output), "GITHUB_SHA": "e" * 40,
+                "GITHUB_BASE_REF": "untrusted-ref", "GITHUB_HEAD_REF": "untrusted-ref",
+            }
+            payload.write_text(json.dumps(event))
+            result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_text(), f"base-sha={base}\nhead-sha={head}\n")
+            for side in ("base", "head"):
+                with self.subTest(side=side):
+                    output.unlink(missing_ok=True)
+                    invalid = {**event, "merge_group": {**event["merge_group"], f"{side}_sha": "main"}}
+                    payload.write_text(json.dumps(invalid))
+                    result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=root, env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
+
+    def test_retargeting_is_configured_and_uses_current_base_with_unchanged_head(self):
+        for workflow_path, event_name in ((WORKFLOW, "pull_request"), (WORKFLOW, "pull_request_target"), (CALLER, "pull_request_target")):
+            with self.subTest(workflow=workflow_path.name, event=event_name):
+                self.assertIn("edited", events(document(workflow_path)).get(event_name, {}).get("types", []))
+        resolver = source(document(WORKFLOW), REVISION_STEP)
+        with Fixture() as fixture:
+            fixture.write("us/statutes/retargeted.yaml")
+            alternate_base = fixture.commit("Alternate base already has module")
+            fixture.write("README.md", "Candidate docs only on alternate base.\n")
+            head = fixture.head()
+            payload, output = fixture.root / "event.json", fixture.root / "outputs"
+            env = {**os.environ, "EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": str(payload), "GITHUB_OUTPUT": str(output)}
+            payload.write_text(json.dumps({
+                "action": "edited",
+                "changes": {"base": {"ref": {"from": "alternate"}, "sha": {"from": alternate_base}}},
+                "pull_request": {"base": {"sha": fixture.base}, "head": {"sha": head}},
+            }))
+            result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=fixture.root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_text(), f"base-sha={fixture.base}\nhead-sha={head}\n")
+            alternate_result = fixture.run(head, base=alternate_base)
+            self.assertEqual(alternate_result.returncode, 0, alternate_result.stdout + alternate_result.stderr)
+            self.assertIn("passed for 0 changed module(s)", alternate_result.stdout)
+            default_result = fixture.run(head)
+            self.assertNotEqual(default_result.returncode, 0)
+            self.assertIn("Missing encoder apply manifests: 1 of 1", default_result.stderr)
+
+    def test_optional_visibility_caller_is_unfiltered_base_anchored_and_pinned(self):
         caller = document(CALLER)
-        self.assertEqual(events(caller), {"pull_request_target": {"types": ["opened", "synchronize", "reopened", "ready_for_review"]}})
+        self.assertEqual(events(caller), {"pull_request_target": {"types": PR_EVENT_TYPES}})
         self.assertEqual(caller["permissions"], {"contents": "read"})
         self.assertEqual(set(caller["jobs"]), {"encoder-guard"})
         job = caller["jobs"]["encoder-guard"]
@@ -399,6 +475,97 @@ class WorkflowSecurityTests(unittest.TestCase):
         # The unreleased template deliberately fails closed until a real SHA exists.
         self.assertEqual(job["uses"].split("@", 1)[1], "0" * 40)
         self.assertEqual(document(WORKFLOW)["jobs"]["guard"]["name"], "guard")
+
+
+class RulesetPolicyTests(unittest.TestCase):
+    def test_ruleset_is_active_identity_required_and_has_exact_repository_and_branch_scope(self):
+        self.assertTrue(RULESET.is_file(), "Required-workflow ruleset must be tracked")
+        ruleset = json.loads(RULESET.read_text())
+        self.assertEqual(ruleset["target"], "branch")
+        self.assertEqual(ruleset["enforcement"], "active")
+        self.assertEqual(ruleset["bypass_actors"], [])
+        self.assertEqual(ruleset["conditions"], {
+            "repository_name": {"include": ["rulespec-*"], "exclude": ["rulespec-graph-viewer"], "protected": False},
+            "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
+        })
+        names = ruleset["conditions"]["repository_name"]
+        for name, included in (
+            ("rulespec-us", True), ("rulespec-us-ca", True), ("rulespec-future", True),
+            ("rulespec-graph-viewer", False), ("rulespec", False), (".github", False),
+            ("prefix-rulespec-us", False),
+        ):
+            with self.subTest(repository=name):
+                selected = any(fnmatch.fnmatchcase(name, pattern) for pattern in names["include"]) and not any(
+                    fnmatch.fnmatchcase(name, pattern) for pattern in names["exclude"]
+                )
+                self.assertEqual(selected, included)
+        self.assertEqual(len(ruleset["rules"]), 1)
+        rule = ruleset["rules"][0]
+        self.assertEqual(rule["type"], "workflows")
+        self.assertIs(rule["parameters"]["do_not_enforce_on_create"], False)
+        workflows = rule["parameters"]["workflows"]
+        self.assertEqual(len(workflows), 1)
+        required = workflows[0]
+        self.assertEqual(required["repository_id"], 1146671719)
+        self.assertEqual(required["path"], ".github/workflows/encoder-guard.yml")
+        self.assertRegex(required["sha"], r"^[0-9a-f]{40}$")
+        self.assertEqual(required["sha"], "0" * 40)
+        self.assertNotIn("ref", required)
+
+    def test_caller_removal_and_counterfeit_job_do_not_replace_required_workflow_identity(self):
+        self.assertTrue(RULESET.is_file(), "Caller-independent required workflow policy must exist")
+        rule = json.loads(RULESET.read_text())["rules"][0]
+        self.assertEqual(rule["type"], "workflows")
+        self.assertEqual(rule["parameters"]["workflows"], [{
+            "repository_id": 1146671719,
+            "path": ".github/workflows/encoder-guard.yml",
+            "sha": "0" * 40,
+        }])
+        with Fixture() as fixture:
+            (fixture.root / ".github/workflows/encoder-guard.yml").unlink()
+            caller_deleted = fixture.head()
+            deletion_result = fixture.run(caller_deleted)
+            self.assertEqual(deletion_result.returncode, 0, deletion_result.stdout + deletion_result.stderr)
+            self.assertIn("passed for 0 changed module(s)", deletion_result.stdout)
+            # Model caller deletion reaching the base before a later candidate.
+            git(fixture.root, "checkout", "--detach", "-q", caller_deleted)
+            fixture.base = caller_deleted
+            git(fixture.root, "checkout", "-qb", "counterfeit-candidate")
+            fixture.write("us/statutes/unmanifested.yaml")
+            fixture.write(".github/workflows/counterfeit.yml", """name: encoder-guard
+on: pull_request
+jobs:
+  guard:
+    name: encoder-guard / guard
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 0
+""")
+            head = fixture.head()
+            self.assertFalse((fixture.root / ".github/workflows/encoder-guard.yml").exists())
+            counterfeit = yaml.safe_load(git(fixture.root, "show", f"{head}:.github/workflows/counterfeit.yml"))
+            self.assertEqual(counterfeit["jobs"]["guard"]["name"], "encoder-guard / guard")
+            trusted_result = fixture.run(head)
+            self.assertNotEqual(trusted_result.returncode, 0)
+            self.assertIn("Missing encoder apply manifests: 1 of 1", trusted_result.stderr)
+
+    def test_readme_uses_ruleset_workflow_identity_as_enforcement_point(self):
+        section = (ROOT / "README.md").read_text().split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
+        self.assertIn("rulesets/rulespec-encoder-guard.json", section)
+        self.assertIn("Require workflows to pass before merging", section)
+        self.assertRegex(section.lower(), r"(?:optional|only).{0,100}(?:visibility|local)")
+        self.assertNotIn("exact status-check context **`encoder-guard / guard`** in branch protection", section)
+
+    def test_readme_qualifies_program_signatures_and_companion_exemptions(self):
+        section = (ROOT / "README.md").read_text().split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
+        text = " ".join(section.split())
+        self.assertRegex(text, r"ProgramSpecs? (?:are|is) excluded from (?:its|the) supervised generated guard")
+        self.assertRegex(text, r"(?i)ProgramSpec.{0,200}companion.{0,200}(?:checks|covers|includes|applies)")
+        self.assertNotIn("the existing supervised validator remains responsible for manifest contents, signatures and module hashes", text)
+
+    def test_readme_drops_unsupported_repository_audit_assertion(self):
+        section = (ROOT / "README.md").read_text().split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
+        self.assertNotIn("27 active", section)
 
 
 if __name__ == "__main__":
