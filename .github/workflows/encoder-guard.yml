@@ -37,15 +37,20 @@ jobs:
               event = json.load(event_file)
           # The organization ruleset pins this workflow's source independently
           # of the target repository. Never select revisions from mutable refs,
-          # GITHUB_SHA (a PR test merge), or edited.changes (the previous base).
+          # GITHUB_SHA (event-dependent), or edited.changes (the previous base).
           event_name = os.environ["EVENT_NAME"]
           if event_name in ("pull_request", "pull_request_target"):
               revisions = {side: event["pull_request"][side]["sha"] for side in ("base", "head")}
+              merge = event["pull_request"].get("merge_commit_sha")
+              revisions["merge"] = "" if merge is None else merge
           elif event_name == "merge_group":
               revisions = {side: event["merge_group"][f"{side}_sha"] for side in ("base", "head")}
+              revisions["merge"] = ""
           else:
               raise SystemExit("Encoder guard requires a pull request or merge group event")
           for side, sha in revisions.items():
+              if side == "merge" and sha == "":
+                  continue
               if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
                   raise SystemExit(f"Invalid {side} commit SHA")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -64,10 +69,11 @@ jobs:
           submodules: false
           lfs: false
 
-      - name: Fetch the head commit as Git objects only
+      - name: Fetch candidate and event merge commits as Git objects only
         shell: bash
         env:
           HEAD_SHA: ${{ steps.revisions.outputs.head-sha }}
+          MERGE_SHA: ${{ steps.revisions.outputs.merge-sha }}
           GH_READ_TOKEN: ${{ github.token }}
           GIT_TERMINAL_PROMPT: "0"
         run: |
@@ -76,40 +82,45 @@ jobs:
           # The read-only built-in token is scoped to this fetch, including for
           # private repos; it is never persisted or given to the check below.
           auth="$(printf 'x-access-token:%s' "$GH_READ_TOKEN" | base64 -w 0)"
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
-            git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-              fetch --no-tags --no-recurse-submodules origin "$HEAD_SHA"
-          git cat-file -e "$HEAD_SHA^{commit}"
+          for revision in "$HEAD_SHA" "$MERGE_SHA"; do
+            if [ -z "$revision" ]; then continue; fi
+            GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+                fetch --no-tags --no-recurse-submodules origin "$revision"
+            git cat-file -e "$revision^{commit}"
+          done
 
       - name: Reject RuleSpec modules without encoder manifests
         shell: bash
         env:
           BASE_SHA: ${{ steps.revisions.outputs.base-sha }}
           HEAD_SHA: ${{ steps.revisions.outputs.head-sha }}
+          MERGE_SHA: ${{ steps.revisions.outputs.merge-sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # This script belongs to the ruleset's SHA-pinned workflow, never to
           # the target's head. -I prevents imports from the checkout or ambient
           # PYTHONPATH. Git reads commit objects; no head checkout is created.
           python3 -I - <<'PY'
+          import json
           import os
           import re
           import subprocess
           import sys
+          import tempfile
 
-          ROOTS = {"statutes", "regulations", "policies", "legislation", "programs"}
+          ROOTS = {"statutes", "regulations", "policies", "legislation"}
           JURISDICTION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*")
           MANIFEST_DIR = ".axiom/encoding-manifests"
 
 
-          def git(*args):
+          def git(*args, env=None):
               result = subprocess.run(
                   ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-                  check=False,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=env,
               )
               if result.returncode:
                   raise SystemExit("Git object read failed: " + result.stderr.decode("utf-8", "replace"))
@@ -117,19 +128,14 @@ jobs:
 
 
           def guarded(path):
-              # Companion/composed exemptions for this presence check only;
-              # the validator's separate ProgramSpec shape check differs.
-              # .axiom metadata at the checkout/jurisdiction root lies outside
-              # the module roots. Programs and legislation are always covered
-              # here, as required by the encoding regime.
+              # ProgramSpecs are assembled content: the existing validator separately
+              # shape-checks programs/, including companions, before its manifest gate.
               if not path.endswith((".yaml", ".yml")):
                   return False
               if path.endswith((".test.yaml", ".test.yml")) or "/composed/" in path:
                   return False
               parts = path.split("/")
-              return (
-                  len(parts) >= 2 and parts[0] in ROOTS
-              ) or (
+              return (len(parts) >= 2 and parts[0] in ROOTS) or (
                   len(parts) >= 3 and parts[1] in ROOTS
                   and JURISDICTION.fullmatch(parts[0]) is not None
               )
@@ -139,10 +145,7 @@ jobs:
               stem = path.rsplit(".", 1)[0]
               candidates = [f"{MANIFEST_DIR}/{stem}.json"]
               parts = path.split("/")
-              if (
-                  len(parts) >= 3 and parts[1] in ROOTS
-                  and JURISDICTION.fullmatch(parts[0]) is not None
-              ):
+              if len(parts) >= 3 and parts[1] in ROOTS and JURISDICTION.fullmatch(parts[0]) is not None:
                   inner = stem.split("/", 1)[1]
                   candidates.extend([
                       f"{MANIFEST_DIR}/{inner}.json",
@@ -151,49 +154,136 @@ jobs:
               return candidates
 
 
+          def manifest_prefix(path):
+              parts = path.split("/")
+              if path.endswith(".json"):
+                  if parts[:2] == MANIFEST_DIR.split("/"):
+                      return ""
+                  if len(parts) > 3 and parts[1:3] == MANIFEST_DIR.split("/") and JURISDICTION.fullmatch(parts[0]):
+                      return parts[0] + "/"
+              return None
+
+
+          def inventory(tree, env=None):
+              entries, regular = {}, {}
+              for entry in git("ls-tree", "-r", "-t", "-z", "--full-tree", tree, env=env).split(b"\0"):
+                  if not entry:
+                      continue
+                  metadata, path = entry.split(b"\t", 1)
+                  mode, kind, oid = metadata.split(b" ")
+                  path = os.fsdecode(path)
+                  entries[path] = oid.decode("ascii")
+                  if mode in (b"100644", b"100755") and kind == b"blob":
+                      regular[path] = oid.decode("ascii")
+              return entries, regular
+
+
           base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+          merge = os.environ.get("MERGE_SHA", "")
           if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in (base, head)):
               raise SystemExit("Base and head must be exact 40-hex commit SHAs")
-          # Three-dot excludes changes that landed only on the base branch.
-          # Never fall back to a two-dot diff or a shallow/incomplete history.
-          # --no-renames treats renamed destinations as additions. No Git
-          # attributes, diff drivers, textconv filters, or hooks execute.
+          if merge and re.fullmatch(r"[0-9a-f]{40}", merge) is None:
+              raise SystemExit("Merge must be an exact 40-hex commit SHA")
+          # Three-dot selects only the candidate change set. Deletions/type changes
+          # also matter: removing a manifest cannot silently remove provenance.
+          # No attributes, diff drivers, textconv filters, or hooks execute here.
           fields = git(
               "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff",
-              "--no-textconv", "--diff-filter=ACMRT", f"{base}...{head}", "--",
+              "--no-textconv", "--diff-filter=ACMRTD", f"{base}...{head}", "--",
           ).split(b"\0")
           if fields[-1] != b"" or len(fields) % 2 != 1:
               raise SystemExit("Invalid Git name-status output")
-          changed = []
+          changes = {}
           for index in range(0, len(fields) - 1, 2):
-              if fields[index] not in (b"A", b"C", b"M", b"R", b"T"):
+              if fields[index] not in (b"A", b"C", b"M", b"R", b"T", b"D"):
                   raise SystemExit("Unexpected Git change status")
-              path = os.fsdecode(fields[index + 1])
-              if guarded(path):
-                  changed.append(path)
+              changes[os.fsdecode(fields[index + 1])] = fields[index]
+          ancestor = git("merge-base", base, head).strip().decode("ascii")
+          original, original_regular = inventory(ancestor)
 
-          # Only regular blobs in HEAD count as manifests. A symlink, subtree,
-          # submodule, deleted manifest, or untracked worktree file cannot count.
-          regular_files = set()
-          for entry in git("ls-tree", "-r", "-z", "--full-tree", head).split(b"\0"):
-              if not entry:
-                  continue
-              metadata, path = entry.split(b"\t", 1)
-              mode, kind, _ = metadata.split(b" ")
-              if mode in (b"100644", b"100755") and kind == b"blob":
-                  regular_files.add(os.fsdecode(path))
-          missing = [
-              path for path in changed
-              if not any(candidate in regular_files for candidate in manifest_candidates(path))
-          ]
-          if missing:
-              print(f"Missing encoder apply manifests: {len(missing)} of {len(changed)} changed modules", file=sys.stderr)
-              for path in missing:
-                  # repr keeps newlines and control characters inert in logs.
-                  print(f"  {path!r}: expected {manifest_candidates(path)!r}", file=sys.stderr)
-              raise SystemExit(
-                  "RuleSpec must come from the supervised encoder: "
-                  "axiom-encode encode <corpus citation> --backend codex --apply"
-              )
+          with tempfile.TemporaryDirectory(prefix="encoder-guard-") as scratch:
+              merge_env = None
+              if os.environ.get("EVENT_NAME") == "merge_group":
+                  # The queue supplies the result already. Do not synthesize a different
+                  # tree, and fail closed if that group is not based on its event base.
+                  git("merge-base", "--is-ancestor", base, head)
+                  tree = head
+              elif merge:
+                  # Never accept a cached test merge computed from a different base/head.
+                  parents = git("rev-list", "--parents", "-n", "1", merge).split()
+                  if parents != [merge.encode(), base.encode(), head.encode()]:
+                      raise SystemExit("Event merge commit does not match exact base and head")
+                  tree = merge
+              else:
+                  # A bare scratch repository isolates merge config/drivers from the
+                  # checkout and global config. Its alternates only read existing Git
+                  # objects; synthesized trees/blobs and the index stay in scratch.
+                  objects = os.path.abspath(os.fsdecode(git("rev-parse", "--git-path", "objects").strip()))
+                  merge_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+                  merge_env.update({
+                      "GIT_DIR": os.path.join(scratch, "repo.git"),
+                      "GIT_INDEX_FILE": os.path.join(scratch, "index"),
+                      "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects,
+                      "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                  })
+                  git("init", "--bare", "--template=", merge_env["GIT_DIR"], env=merge_env)
+                  tree = git("merge-tree", "--write-tree", base, head, env=merge_env).splitlines()[0].decode("ascii")
+                  git("read-tree", tree, env=merge_env)
+                  tree = git("write-tree", env=merge_env).strip().decode("ascii")
+              merged, regular = inventory(tree, merge_env)
+              # Select modules at their final paths, so a base-side rename cannot hide
+              # a candidate edit by moving it away from the head's original filename.
+              merged_fields = git(
+                  "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff",
+                  "--no-textconv", "--diff-filter=ACMRT", base, tree, "--", env=merge_env,
+              ).split(b"\0")
+              if merged_fields[-1] != b"" or len(merged_fields) % 2 != 1:
+                  raise SystemExit("Invalid merged Git name-status output")
+              changed = []
+              for index in range(0, len(merged_fields) - 1, 2):
+                  if merged_fields[index] not in (b"A", b"C", b"M", b"R", b"T"):
+                      raise SystemExit("Unexpected merged Git change status")
+                  path = os.fsdecode(merged_fields[index + 1])
+                  if guarded(path):
+                      changed.append(path)
+              missing = [path for path in changed if not any(candidate in regular for candidate in manifest_candidates(path))]
+              if missing:
+                  print(f"Missing encoder apply manifests: {len(missing)} of {len(changed)} changed modules", file=sys.stderr)
+                  for path in missing:
+                      # repr keeps newlines and control characters inert in logs.
+                      print(f"  {path!r}: expected {manifest_candidates(path)!r}", file=sys.stderr)
+                  raise SystemExit("RuleSpec must come from the supervised encoder: axiom-encode encode <corpus citation> --backend codex --apply")
+
+              # Match the validator's applied_files deletion marker, not a new receipt
+              # format. Only a regular receipt changed in this PR may retire a module.
+              # Its signature/content authenticity remains the supervised guard's job.
+              retired = set()
+              for path, status in changes.items():
+                  prefix = manifest_prefix(path)
+                  if status == b"D" or prefix is None or path not in regular:
+                      continue
+                  try:
+                      receipt = json.loads(git("cat-file", "blob", regular[path], env=merge_env))
+                  except (ValueError, UnicodeDecodeError):
+                      continue
+                  if not isinstance(receipt, dict) or not isinstance(receipt.get("applied_files"), list):
+                      continue
+                  for entry in receipt["applied_files"]:
+                      if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry.get("sha256") == "deleted":
+                          retired.add(prefix + entry["path"])
+              removed = {
+                  path for path, status in changes.items()
+                  if status in (b"D", b"T") and path in original_regular and path not in regular
+              }
+              orphaned = [
+                  path for path in original if guarded(path)
+                  and any(candidate in removed for candidate in manifest_candidates(path))
+                  and (path in merged or changes.get(path) != b"D" or path not in retired)
+              ]
+              if orphaned:
+                  print("Removed encoder manifests without module retirement receipts:", file=sys.stderr)
+                  for path in orphaned:
+                      print(f"  {path!r}: retain its manifest or delete the module with a changed encoder retirement receipt", file=sys.stderr)
+                  raise SystemExit(1)
           print(f"Encoder manifest provenance passed for {len(changed)} changed module(s).")
           PY

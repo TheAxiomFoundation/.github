@@ -103,14 +103,14 @@ class Fixture:
         git(self.root, "checkout", "--detach", "-q", self.base)
         return head
 
-    def run(self, head: str, *, base: str | None = None) -> subprocess.CompletedProcess[str]:
+    def run(self, head: str, *, base: str | None = None, merge: str = "", event: str = "pull_request") -> subprocess.CompletedProcess[str]:
         global GUARD_EVALUATIONS
         GUARD_EVALUATIONS += 1
         # Extract executable code from BASE, never from the candidate tree.
         trusted = yaml.safe_load(git(self.root, "show", f"{self.base}:.github/workflows/trusted-guard.yml"))
         return subprocess.run(
             [sys.executable, "-I", "-c", source(trusted)], cwd=self.root,
-            env={**os.environ, "BASE_SHA": self.base if base is None else base, "HEAD_SHA": head},
+            env={**os.environ, "BASE_SHA": self.base if base is None else base, "HEAD_SHA": head, "MERGE_SHA": merge, "EVENT_NAME": event},
             capture_output=True, text=True,
         )
 
@@ -123,7 +123,7 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_every_module_root_requires_a_manifest_with_and_without_jurisdiction(self):
-        for root in ("statutes", "regulations", "policies", "legislation", "programs"):
+        for root in ("statutes", "regulations", "policies", "legislation"):
             for prefix in ("", "us/"):
                 with self.subTest(root=root, prefix=prefix), Fixture() as fixture:
                     fixture.write(f"{prefix}{root}/bare.yaml")
@@ -158,6 +158,42 @@ class GuardDecisionTests(unittest.TestCase):
             fixture.write("us/statutes/title/item.test.yaml")
             fixture.write("us/programs/item.test.yml")
             self.assert_pass(fixture.run(fixture.head()))
+
+    def test_shape_checked_programspecs_keep_default_validator_contract(self):
+        validator = document(ROOT / ".github/workflows/validate-rulespec.yml")
+        precheck = next(
+            item for job in validator["jobs"].values() for item in job.get("steps", [])
+            if item.get("name") == "Reject unmanifested RuleSpec content"
+        )["run"]
+        initial = {
+            "statutes/7/2014/a.yaml": "format: rulespec/v1\nrules: []\n",
+            "us-xx/policies/manual/page-1.yaml": "format: rulespec/v1\nrules: []\n",
+        }
+        program = (
+            "program: us-xx/tanf\nperiod: 2026-01\noutputs:\n  - eligible\n"
+            "scope:\n  federal:\n    - us:statutes/7/2014/a\n"
+            "  state:\n    - us-xx:policies/manual/page-1\n"
+            "transformations:\n  - pattern: derived_formula\n    name: eligible\n"
+            "    effective_from: '2026-01-01'\n    formula: imported_eligible\n"
+        )
+        for path in ("programs/us-xx/tanf/fy-2026.yaml", "us-xx/programs/tanf/fy-2026.yaml"):
+            with self.subTest(path=path), Fixture(initial) as fixture:
+                fixture.write(path, program)
+                head = fixture.head()
+                git(fixture.root, "checkout", "--detach", "-q", head)
+                result = subprocess.run(
+                    ["bash", "-c", precheck], cwd=fixture.root,
+                    env={**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+                         "BASE_SHA": fixture.base, "GITHUB_SHA": head,
+                         "GITHUB_REPOSITORY": "TheAxiomFoundation/rulespec-us", "EVENT_NAME": "pull_request",
+                         "RUN_GENERATED_GUARD": "true", "GUARD_PROGRAMS_ROOT": "false"},
+                    capture_output=True, text=True,
+                )
+                self.assert_pass(result)
+                self.assertIn("1 changed ProgramSpec file(s) have the ProgramSpec shape", result.stdout)
+                self.assertIn("No guarded RuleSpec content in scope", result.stdout)
+                git(fixture.root, "checkout", "--detach", "-q", fixture.base)
+                self.assert_pass(fixture.run(head))
 
     def test_composed_paths_are_exempt(self):
         with Fixture() as fixture:
@@ -320,6 +356,181 @@ class GuardDecisionTests(unittest.TestCase):
         with Fixture() as fixture:
             self.assert_pass(fixture.run(fixture.base))
 
+    def test_base_advance_cannot_remove_candidate_manifest_from_merge_result(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        for removal in ("delete", "rename", "symlink"):
+            with self.subTest(removal=removal), Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+                fixture.write(module, "fixture: candidate\n")
+                head = fixture.head()
+                self.assert_pass(fixture.run(head))
+                if removal == "rename":
+                    git(fixture.root, "mv", manifest, ".axiom/encoding-manifests/archive.json")
+                else:
+                    (fixture.root / manifest).unlink()
+                    if removal == "symlink":
+                        (fixture.root / manifest).symlink_to("../../../../README.md")
+                advanced = fixture.commit("Base removes manifest")
+                tree = git(fixture.root, "merge-tree", "--write-tree", advanced, head)
+                self.assertIn(module, git(fixture.root, "ls-tree", "-r", "--name-only", tree))
+                entry = git(fixture.root, "ls-tree", tree, "--", manifest)
+                self.assertFalse(entry.startswith("100644 blob"))
+                result = fixture.run(head, base=advanced)
+                self.assert_fail(result)
+                self.assertIn("Missing encoder apply manifests: 1", result.stderr)
+
+    def test_manifest_removal_alone_is_rejected_for_every_mirror_layout(self):
+        module = "us/statutes/item.yaml"
+        for manifest in (
+            ".axiom/encoding-manifests/us/statutes/item.json",
+            ".axiom/encoding-manifests/statutes/item.json",
+            "us/.axiom/encoding-manifests/statutes/item.json",
+        ):
+            for removal in ("delete", "rename", "symlink"):
+                with self.subTest(manifest=manifest, removal=removal), Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+                    if removal == "rename":
+                        git(fixture.root, "mv", manifest, "archived-manifest.json")
+                    else:
+                        (fixture.root / manifest).unlink()
+                        if removal == "symlink":
+                            (fixture.root / manifest).symlink_to("../../../../README.md")
+                    self.assert_fail(fixture.run(fixture.head()))
+
+    def test_removing_one_of_multiple_mirrors_still_requires_retirement(self):
+        module = "us/statutes/item.yaml"
+        short = ".axiom/encoding-manifests/statutes/item.json"
+        full = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "fixture: base\n", short: "{}\n", full: "{}\n"}) as fixture:
+            (fixture.root / full).unlink()
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_base_side_rename_does_not_hide_modified_merge_destination(self):
+        module = "us/statutes/item.yaml"
+        destination = "statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: candidate\n")
+            head = fixture.head()
+            (fixture.root / destination).parent.mkdir(parents=True, exist_ok=True)
+            git(fixture.root, "mv", module, destination)
+            (fixture.root / manifest).unlink()
+            advanced = fixture.commit("Base relocates module and removes manifest")
+            tree = git(fixture.root, "merge-tree", "--write-tree", advanced, head)
+            self.assertEqual(git(fixture.root, "show", f"{tree}:{destination}"), "fixture: candidate")
+            self.assert_fail(fixture.run(head, base=advanced))
+
+    def test_base_rename_does_not_allow_retiring_only_the_old_filename(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: candidate\n")
+            (fixture.root / manifest).unlink()
+            fixture.write(".axiom/encoding-manifests/apply-receipt.json", json.dumps({"applied_files": [{"path": module, "sha256": "deleted"}]}))
+            head = fixture.head()
+            (fixture.root / "statutes").mkdir(exist_ok=True)
+            git(fixture.root, "mv", module, "statutes/item.yaml")
+            advanced = fixture.commit("Base relocates module with shared mirror")
+            # The base rename itself preserves a valid mirror.
+            self.assert_pass(fixture.run(advanced))
+            self.assert_fail(fixture.run(head, base=advanced))
+
+    def test_removed_manifest_needs_same_change_retirement_receipt_when_module_deleted(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        receipt = ".axiom/encoding-manifests/apply-receipt.json"
+        deletion = json.dumps({"applied_files": [{"path": module, "sha256": "deleted"}]})
+        for kind in ("absent", "unchanged", "wrong-module", "malformed", "symlink", "valid"):
+            initial = {module: "fixture: base\n", manifest: "{}\n"}
+            if kind == "unchanged":
+                initial[receipt] = deletion
+            with self.subTest(receipt=kind), Fixture(initial) as fixture:
+                (fixture.root / module).unlink()
+                (fixture.root / manifest).unlink()
+                if kind in ("valid", "symlink"):
+                    fixture.write(receipt, deletion)
+                    if kind == "symlink":
+                        fixture.write("receipt-data.json", deletion)
+                        (fixture.root / receipt).unlink()
+                        (fixture.root / receipt).symlink_to("../../receipt-data.json")
+                elif kind == "wrong-module":
+                    fixture.write(receipt, json.dumps({"applied_files": [{"path": "us/statutes/other.yaml", "sha256": "deleted"}]}))
+                elif kind == "malformed":
+                    fixture.write(receipt, "{invalid")
+                result = fixture.run(fixture.head())
+                (self.assert_pass if kind == "valid" else self.assert_fail)(result)
+
+    def test_retirement_receipt_cannot_excuse_a_surviving_module(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            (fixture.root / manifest).unlink()
+            fixture.write(".axiom/encoding-manifests/apply-receipt.json", json.dumps({"applied_files": [{"path": module, "sha256": "deleted"}]}))
+            self.assert_fail(fixture.run(fixture.head()))
+
+    def test_event_merge_commit_is_evaluated_and_bound_to_exact_base_and_head(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: head\n")
+            head = fixture.head()
+            (fixture.root / manifest).unlink()
+            advanced = fixture.commit("Remove manifest on base")
+            tree = git(fixture.root, "merge-tree", "--write-tree", advanced, head)
+            merge = git(fixture.root, "commit-tree", tree, "-p", advanced, "-p", head, "-m", "Event test merge")
+            self.assert_fail(fixture.run(head, base=advanced, merge=merge))
+            # A stale event merge still has a regular manifest but wrong base.
+            stale = git(fixture.root, "commit-tree", f"{head}^{{tree}}", "-p", fixture.base, "-p", head, "-m", "Stale test merge")
+            self.assert_pass(fixture.run(head, merge=stale))
+            self.assert_fail(fixture.run(head, base=advanced, merge=stale))
+            self.assert_fail(fixture.run(head, merge="not-a-sha"))
+
+    def test_jurisdiction_retirement_receipt_uses_relative_module_path(self):
+        module = "us/statutes/item.yaml"
+        manifest = "us/.axiom/encoding-manifests/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            (fixture.root / module).unlink()
+            (fixture.root / manifest).unlink()
+            fixture.write("us/.axiom/encoding-manifests/apply-receipt.json", json.dumps({"applied_files": [{"path": "statutes/item.yaml", "sha256": "deleted"}]}))
+            self.assert_pass(fixture.run(fixture.head()))
+
+    def test_conflicting_merge_fails_closed_even_when_head_has_manifest(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n", ".gitattributes": "*.yaml merge=candidate\n"}) as fixture:
+            git(fixture.root, "config", "merge.candidate.driver", "touch executed-candidate")
+            fixture.write(module, "fixture: head\n")
+            head = fixture.head()
+            fixture.write(module, "fixture: advanced-base\n")
+            advanced = fixture.commit("Conflicting base change")
+            self.assert_fail(fixture.run(head, base=advanced))
+            self.assertFalse((fixture.root / "executed-candidate").exists())
+
+    def test_object_merge_combines_clean_edits_without_running_merge_drivers(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "first: base\n\n\nlast: base\n", manifest: "{}\n", ".gitattributes": "*.yaml merge=candidate\n"}) as fixture:
+            git(fixture.root, "config", "merge.candidate.driver", "touch executed-candidate")
+            fixture.write(module, "first: head\n\n\nlast: base\n")
+            head = fixture.head()
+            fixture.write(module, "first: base\n\n\nlast: advanced\n")
+            advanced = fixture.commit("Clean base edit")
+            before = git(fixture.root, "status", "--porcelain")
+            self.assert_pass(fixture.run(head, base=advanced))
+            self.assertFalse((fixture.root / "executed-candidate").exists())
+            self.assertEqual(git(fixture.root, "status", "--porcelain"), before)
+            self.assertEqual(git(fixture.root, "rev-parse", "HEAD"), advanced)
+
+    def test_merge_group_evaluates_its_actual_head_and_rejects_an_older_base(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: group\n")
+            head = fixture.head()
+            self.assert_pass(fixture.run(head, event="merge_group"))
+            (fixture.root / manifest).unlink()
+            advanced = fixture.commit("Base advances outside group")
+            self.assert_fail(fixture.run(head, base=advanced, event="merge_group"))
+
 
 class WorkflowSecurityTests(unittest.TestCase):
     def test_required_workflow_has_supported_events_read_only_permissions_and_no_opt_out(self):
@@ -358,16 +569,20 @@ class WorkflowSecurityTests(unittest.TestCase):
 
     def test_head_is_only_fetched_and_guard_uses_isolated_standard_library_python(self):
         workflow = document(WORKFLOW)
-        fetch = step(workflow, "Fetch the head commit as Git objects only")
-        self.assertIn('fetch --no-tags --no-recurse-submodules origin "$HEAD_SHA"', fetch["run"])
+        fetch = step(workflow, "Fetch candidate and event merge commits as Git objects only")
+        self.assertIn('for revision in "$HEAD_SHA" "$MERGE_SHA"', fetch["run"])
+        self.assertIn('fetch --no-tags --no-recurse-submodules origin "$revision"', fetch["run"])
         self.assertEqual(fetch["env"]["HEAD_SHA"], "${{ steps.revisions.outputs.head-sha }}")
+        self.assertEqual(fetch["env"]["MERGE_SHA"], "${{ steps.revisions.outputs.merge-sha }}")
         guard = step(workflow, GUARD_STEP)
         self.assertEqual(guard["env"], {
             "BASE_SHA": "${{ steps.revisions.outputs.base-sha }}",
             "HEAD_SHA": "${{ steps.revisions.outputs.head-sha }}",
+            "MERGE_SHA": "${{ steps.revisions.outputs.merge-sha }}",
+            "EVENT_NAME": "${{ github.event_name }}",
         })
         imports = re.findall(r"^import (\w+)$", source(workflow), re.MULTILINE)
-        self.assertEqual(set(imports), {"os", "re", "subprocess", "sys"})
+        self.assertEqual(set(imports), {"json", "os", "re", "subprocess", "sys", "tempfile"})
         for item in workflow["jobs"]["guard"]["steps"]:
             shell = item.get("run", "")
             self.assertNotRegex(shell, r"\bgit\s+(?:checkout|switch|worktree)\b")
@@ -391,7 +606,7 @@ class WorkflowSecurityTests(unittest.TestCase):
                     output.unlink(missing_ok=True)
                     result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=root, env={**env, "EVENT_NAME": event}, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(output.read_text(), "base-sha=" + revisions["base"] + "\nhead-sha=" + revisions["head"] + "\n")
+                    self.assertEqual(output.read_text(), "base-sha=" + revisions["base"] + "\nhead-sha=" + revisions["head"] + "\nmerge-sha=\n")
             for event in ("workflow_dispatch", "push", "workflow_call"):
                 with self.subTest(event=event):
                     output.unlink(missing_ok=True)
@@ -407,6 +622,29 @@ class WorkflowSecurityTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(output.exists())
 
+    def test_revision_resolution_uses_optional_event_merge_sha_and_validates_it(self):
+        resolver = source(document(WORKFLOW), REVISION_STEP)
+        with temporary_fixture_directory() as directory:
+            root = Path(directory)
+            payload, output = root / "event.json", root / "outputs"
+            for event in ("pull_request", "pull_request_target"):
+                for merge in ("c" * 40, None, "main", "c" * 39, "C" * 40, "c" * 40 + "\n"):
+                    with self.subTest(event=event, merge=merge):
+                        output.unlink(missing_ok=True)
+                        payload.write_text(json.dumps({"pull_request": {
+                            "base": {"sha": "a" * 40}, "head": {"sha": "b" * 40}, "merge_commit_sha": merge,
+                        }}))
+                        result = subprocess.run(
+                            [sys.executable, "-I", "-c", resolver], cwd=root,
+                            env={**os.environ, "EVENT_NAME": event, "GITHUB_EVENT_PATH": str(payload), "GITHUB_OUTPUT": str(output)},
+                            capture_output=True, text=True,
+                        )
+                        if merge in ("c" * 40, None):
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(output.read_text(), "base-sha=" + "a" * 40 + "\nhead-sha=" + "b" * 40 + "\nmerge-sha=" + (merge or "") + "\n")
+                        else:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertFalse(output.exists())
     def test_merge_group_resolution_uses_payload_shas_not_checkout_or_environment_refs(self):
         resolver = source(document(WORKFLOW), REVISION_STEP)
         with temporary_fixture_directory() as directory:
@@ -427,7 +665,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             payload.write_text(json.dumps(event))
             result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=root, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(output.read_text(), f"base-sha={base}\nhead-sha={head}\n")
+            self.assertEqual(output.read_text(), f"base-sha={base}\nhead-sha={head}\nmerge-sha=\n")
             for side in ("base", "head"):
                 with self.subTest(side=side):
                     output.unlink(missing_ok=True)
@@ -456,7 +694,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             }))
             result = subprocess.run([sys.executable, "-I", "-c", resolver], cwd=fixture.root, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(output.read_text(), f"base-sha={fixture.base}\nhead-sha={head}\n")
+            self.assertEqual(output.read_text(), f"base-sha={fixture.base}\nhead-sha={head}\nmerge-sha=\n")
             alternate_result = fixture.run(head, base=alternate_base)
             self.assertEqual(alternate_result.returncode, 0, alternate_result.stdout + alternate_result.stderr)
             self.assertIn("passed for 0 changed module(s)", alternate_result.stdout)
@@ -502,7 +740,7 @@ class RulesetPolicyTests(unittest.TestCase):
         self.assertEqual(len(ruleset["rules"]), 1)
         rule = ruleset["rules"][0]
         self.assertEqual(rule["type"], "workflows")
-        self.assertIs(rule["parameters"]["do_not_enforce_on_create"], False)
+        self.assertIs(rule["parameters"]["do_not_enforce_on_create"], True)
         workflows = rule["parameters"]["workflows"]
         self.assertEqual(len(workflows), 1)
         required = workflows[0]
@@ -566,6 +804,23 @@ jobs:
     def test_readme_drops_unsupported_repository_audit_assertion(self):
         section = (ROOT / "README.md").read_text().split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
         self.assertNotIn("27 active", section)
+
+    def test_adoption_requires_freshness_and_hosted_acceptance_before_enforcement(self):
+        text = " ".join((ROOT / "README.md").read_text().split())
+        section = text.split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
+        for requirement in (
+            "Require branches to be up to date before merging", "every targeted repository",
+            "older base", "group head", "ADOPTION CHECKLIST", "caller-free", "sandbox",
+            "retarget", "base-advance", "create and update", "GITHUB_TOKEN",
+            "do not launch ruleset workflows", "GitHub App installation token",
+            "Accessible from repositories", "if: true", "source repository",
+            "merge result", "scratch index", "deletes or renames away", "retirement receipt",
+            "shape-checked ProgramSpecs", "no manifest is required", "audited revision",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, section)
+        self.assertNotIn("no current encoder tool can produce a ProgramSpec manifest", text)
+        self.assertNotIn("statutes|regulations|policies|legislation|programs", section)
 
 
 if __name__ == "__main__":

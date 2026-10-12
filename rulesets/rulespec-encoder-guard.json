@@ -18,7 +18,7 @@
     {
       "type": "workflows",
       "parameters": {
-        "do_not_enforce_on_create": false,
+        "do_not_enforce_on_create": true,
         "workflows": [
           {
             "repository_id": 1146671719,
