@@ -1275,20 +1275,48 @@ jobs:
                                   continue
                               found = True
                               payload = json.loads(blobs[entries[path][2]], object_pairs_hook=unique_json)
-                              applied = payload.get("applied_files") if isinstance(payload, dict) else None
+                              schema = payload.get("schema_version") if isinstance(payload, dict) else None
+                              if not isinstance(schema, str) or not re.fullmatch(
+                                  r"axiom-encode/applied-rulespec/v[1-9][0-9]*", schema
+                              ):
+                                  raise ValueError(f"missing/invalid manifest schema: {path}")
+                              applied = payload.get("applied_files")
                               if not isinstance(applied, list) or not applied:
                                   raise ValueError(f"missing/invalid applied_files: {path}")
+                              applied_paths = set()
                               for item in applied:
                                   recorded = item.get("path") if isinstance(item, dict) else None
                                   clean_path(recorded)
+                                  if recorded in applied_paths:
+                                      raise ValueError(f"duplicate manifest applied path: {recorded}")
+                                  applied_paths.add(recorded)
+                                  digest = item.get("sha256")
+                                  if "deleted" in item and not isinstance(item["deleted"], bool):
+                                      raise ValueError("invalid manifest deletion marker")
+                                  if item.get("deleted") is False and digest == "deleted":
+                                      raise ValueError("contradictory manifest deletion markers")
+                                  deleted = item.get("deleted") is True or digest == "deleted"
+                                  if not deleted and (not isinstance(digest, str)
+                                                      or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                                      raise ValueError("invalid manifest applied hash")
                                   resolved_path = prefix + "/" + recorded if prefix else recorded
                                   applied_owner = atomic_owner(resolved_path) or program_owner(resolved_path)
-                                  if applied_owner not in shard_set or resolved_path not in entries:
+                                  if deleted and resolved_path in entries:
+                                      raise ValueError("manifest deletion names an existing path")
+                                  if (applied_owner not in shard_set
+                                          or (resolved_path not in entries and not (
+                                              deleted and any(resolved_path in other for other in trees)
+                                          ))):
                                       raise ValueError(f"shared/unresolved manifest applied path: {recorded}")
                                   owners.add(applied_owner)
                                   if atomic_owner(resolved_path):
-                                      key = identity(module_path(resolved_path))
-                                      if module_path(resolved_path) not in entries:
+                                      module = module_path(resolved_path)
+                                      key = identity(module)
+                                      # Signed deletions name absent head files; the base
+                                      # still establishes their module and importer edges.
+                                      if module not in entries and not (
+                                          deleted and any(module in other for other in trees)
+                                      ):
                                           raise ValueError("manifest companion has no module")
                                       manifest_modules.add(key)
                                       seeds.add(key)
@@ -3058,7 +3086,8 @@ jobs:
               git diff --name-only -z --no-renames --diff-filter=ACMRTD "$base_ref" "$GITHUB_SHA"
             )
             mode="changed"
-            for path in "${all_changed_paths[@]}"; do
+            # Preserve zero iterations for empty diffs, including on Bash 3.
+            for path in ${all_changed_paths[@]+"${all_changed_paths[@]}"}; do
               case "$path" in
                 .github/workflows/*.yml|.github/workflows/*.yaml|.axiom/workflow-toolchain.toml)
                   mode="full-toolchain-bump"
@@ -3084,7 +3113,7 @@ jobs:
               mode="full-dependencies"
               add_all_rulespec_targets
             else
-              for path in "${all_changed_paths[@]}"; do
+              for path in ${all_changed_paths[@]+"${all_changed_paths[@]}"}; do
                 for root in $VALIDATE_ROOTS; do
                   case "$path" in
                     "$root"/*)
