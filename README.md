@@ -394,8 +394,8 @@ and use no `secrets: inherit`. The ruleset pins the workflow source; checkout
 explicitly selects the target event's `github.repository` and validated base
 SHA, rather than this shared repository or a PR merge ref. The event's built-in
 `github.token` is limited to read-only repository contents; unspecified token
-permissions are disabled. A SHA-pinned checkout action acquires only base and
-does not persist credentials. A transient authenticated fetch obtains head
+permissions are disabled. A SHA-pinned checkout action checks out only the base
+commit and does not persist credentials. A transient authenticated fetch obtains head
 and event merge Git objects. Actions reports the job conclusion without
 granting the job `checks: write`. Isolated Python and hardened Git object queries execute no
 head code or configuration and install no packages. See
