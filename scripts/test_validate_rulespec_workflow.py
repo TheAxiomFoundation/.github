@@ -17,6 +17,7 @@ WORKFLOW = ROOT / ".github/workflows/validate-rulespec.yml"
 RETIRED = "1" * 64
 WAIVER = "2" * 64
 CORPUS_PLACEMENT_STEP = "Place the pinned corpus release's provisions"
+BASE_CORPUS_PREPARATION_STEP = "Prepare protected-base manifest audit"
 
 
 def corpus_placement_step() -> dict:
@@ -58,7 +59,9 @@ def test_corpus_placement_runs_before_supervised_gates_with_step_only_credential
     for job in workflow["jobs"].values():
         assert not any(key in job.get("env", {}) for key in credential_names)
         for other_step in job.get("steps", []):
-            if other_step == step:
+            if other_step == step or other_step.get("name") == BASE_CORPUS_PREPARATION_STEP:
+                assert other_step["env"]["R2_ACCESS_KEY_ID"] == "${{ secrets.R2_CORPUS_READ_ACCESS_KEY_ID }}"
+                assert other_step["env"]["R2_SECRET_ACCESS_KEY"] == "${{ secrets.R2_CORPUS_READ_SECRET_ACCESS_KEY }}"
                 continue
             assert not any(key in other_step.get("env", {}) for key in credential_names)
             assert not any(secret in json.dumps(other_step) for secret in secret_names)
@@ -604,6 +607,47 @@ def test_protected_workflow_yaml_cannot_disguise_active_composer() -> None:
             assert run_workflow_inputs(fixture.root, fixture.base).returncode != 0
 
 
+def test_caller_scalar_loader_matches_ruleset_guard() -> None:
+    """Both isolated consumers embed exactly the same strict caller loader."""
+    import yaml
+
+    guard = yaml.safe_load((ROOT / ".github/workflows/encoder-guard.yml").read_text())
+    guard_run = next(step["run"] for step in guard["jobs"]["guard"]["steps"]
+                     if step.get("name") == "Reject RuleSpec modules without encoder manifests")
+    binding_run = workflow_input_step()["run"]
+    begin, end = "# strict-caller-loader-start", "# strict-caller-loader-end"
+    assert begin in guard_run and begin in binding_run, "caller loaders do not share a strict grammar"
+    assert guard_run.split(begin, 1)[1].split(end, 1)[0] == binding_run.split(begin, 1)[1].split(end, 1)[0]
+
+
+def test_literal_numeric_looking_pins_keep_exact_string_identity() -> None:
+    pins = {key: "0" * 39 + str(index) for index, key in enumerate(WORKFLOW_INPUT_PINS, 1)}
+    caller = literal_pin_caller(pins).replace("'", "")
+    with WorkflowInputFixture(caller=caller) as fixture:
+        result = run_workflow_inputs(fixture.root, fixture.base, pins=pins)
+        assert result.returncode == 0, result.stderr
+
+
+def test_binding_rejects_caller_pin_lines_outside_printable_ascii_lf() -> None:
+    caller = literal_pin_caller(WORKFLOW_INPUT_PINS)
+    line = next(line for line in caller.split("\n") if "axiom-encode-ref:" in line)
+    variants = (
+        caller.replace(line + "\n", line + "\x0c\n"),
+        caller.replace(line + "\n", line + "\x85\n"),
+        caller.replace(line + "\n", line + "\u2028\n"),
+        caller.replace(line + "\n", line + "\x7f\n"),
+        caller.replace(line + "\n", line + "\u00e9\n"),
+        caller.replace(line + "\n", line + "\r\n"),
+        caller.replace("axiom-encode-ref: ", "axiom-encode-ref:\t"),
+    )
+    for proposed in variants:
+        with WorkflowInputFixture(caller=proposed) as fixture:
+            result = run_workflow_inputs(fixture.root, fixture.base)
+            assert result.returncode != 0, repr(proposed)
+            assert "printable ASCII" in result.stderr, result.stderr
+            assert "Traceback" not in result.stderr
+
+
 def test_protected_workflow_inputs_reject_untrusted_event_sources() -> None:
     with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
         for event in ("workflow_run", "repository_dispatch", "pull_request_review"):
@@ -646,6 +690,8 @@ SELECTOR_WORKFLOW_TOOLCHAIN = (
     f'axiom_encode_ref = "{"a" * 40}"\n'
     f'axiom_rules_engine_ref = "{"b" * 40}"\n'
     f'axiom_compose_ref = "{"c" * 40}"\n'
+    f'axiom_corpus_ref = "{"d" * 40}"\n'
+    f'rulespec_us_ref = "{"e" * 40}"\n'
 )
 SELECTOR_MODULES = ["us/regulations/two.yml", "us/statutes/one.yaml"]
 SELECTOR_COMPANIONS = ["us/regulations/two.test.yml", "us/statutes/one.test.yaml"]
@@ -673,6 +719,7 @@ def run_validation_targets(
         files = {
             ".axiom/toolchain.toml": SELECTOR_TOOLCHAIN,
             ".axiom/workflow-toolchain.toml": SELECTOR_WORKFLOW_TOOLCHAIN,
+            VALIDATION_CALLER: literal_pin_caller(WORKFLOW_INPUT_PINS),
             "README.md": "before\n",
             **{path: "fixture\n" for path in SELECTOR_MODULES + SELECTOR_COMPANIONS},
         }
@@ -686,6 +733,13 @@ def run_validation_targets(
 
         runner_temp = root / "runner-temp"
         runner_temp.mkdir()
+        bound_output = runner_temp / "bound-output"
+        import tomllib
+        original_pins = tomllib.loads(SELECTOR_WORKFLOW_TOOLCHAIN)["workflow_toolchain"]
+        binding = run_workflow_inputs(root, base, pins={**original_pins, "axiom_compose_ref": ""},
+                                      event=event, head=head, output=bound_output)
+        assert binding.returncode == 0, binding.stderr
+        bound = dict(line.split("=", 1) for line in bound_output.read_text().splitlines())
         output = runner_temp / "output"
         source = (
             step["run"]
@@ -704,6 +758,7 @@ def run_validation_targets(
                 "GITHUB_OUTPUT": str(output),
                 "VALIDATE_ROOTS": "us",
                 "VALIDATE_ROOTS_INPUT": "auto",
+                "DEPENDENCY_PINS_CHANGED": bound.get("dependency_pins_changed", "false"),
             },
             capture_output=True,
             text=True,
@@ -719,8 +774,8 @@ def run_validation_targets(
 
 
 def test_validation_targets_workflow_toolchain_pin_only_requires_full_validation() -> None:
-    for pin in ("a", "b", "c"):
-        changed = SELECTOR_WORKFLOW_TOOLCHAIN.replace(pin * 40, "d" * 40)
+    for pin in ("a", "b", "c", "d", "e"):
+        changed = SELECTOR_WORKFLOW_TOOLCHAIN.replace(pin * 40, "f" * 40)
         assert run_validation_targets({".axiom/workflow-toolchain.toml": changed}) == (
             "full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS
         ), pin
@@ -732,12 +787,97 @@ def test_validation_targets_workflow_toolchain_pin_only_requires_full_validation
     }) == ("full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS)
 
 
+def test_workflow_edits_without_dependency_pin_changes_use_changed_guard() -> None:
+    for path in (".github/workflows/validate.yml", ".github/workflows/validate.yaml"):
+        assert run_validation_targets({path: "changed\n"}) == ("changed", [], [])
+    commented = SELECTOR_WORKFLOW_TOOLCHAIN + "# unchanged refs\n"
+    assert run_validation_targets({".axiom/workflow-toolchain.toml": commented}) == ("changed", [], [])
+
+
+def test_manifest_audit_flag_tracks_actual_dependency_and_validator_refs() -> None:
+    pins = {**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "7" * 40,
+            "shared_workflow_ref": "842c69d6aa62a0d75a4da850fabc3d0df20701d7"}
+    caller = literal_pin_caller({key: value for key, value in pins.items() if key != "shared_workflow_ref"})
+    caller = caller.replace("@" + "a" * 40, "@" + pins["shared_workflow_ref"])
+    for key in (*pins, "workflow-comment"):
+        with WorkflowInputFixture(table=workflow_toolchain(pins), caller=caller) as fixture:
+            changed = {**pins, key: "9" * 40} if key in pins else pins
+            table = workflow_toolchain(changed)
+            if key == "workflow-comment":
+                table += "# retained dependency pins\n"
+            fixture.write(WORKFLOW_TOOLCHAIN, table)
+            if key == "shared_workflow_ref":
+                fixture.write(VALIDATION_CALLER, caller.replace(pins[key], changed[key]))
+            head = commit(fixture.root, "fixture configuration update")
+            output = fixture.root / "binding-output"
+            result = run_workflow_inputs(fixture.root, fixture.base,
+                                         pins={key: value for key, value in pins.items() if key in WORKFLOW_INPUT_ENV},
+                                         head=head, output=output)
+            assert result.returncode == 0, result.stderr
+            bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            assert bound["dependency_pins_changed"] == ("false" if key == "workflow-comment" else "true"), key
+            assert bound["base_axiom_encode_ref"] == pins["axiom_encode_ref"]
+            assert bound["base_axiom_corpus_ref"] == pins["axiom_corpus_ref"]
+
+
+def test_corpus_release_metadata_companion_preserves_proposed_pin_binding() -> None:
+    pins = {**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "7" * 40, "shared_workflow_ref": "8" * 40}
+    caller = literal_pin_caller(WORKFLOW_INPUT_PINS).replace("@" + "a" * 40, "@" + pins["shared_workflow_ref"])
+    for key in (*pins, "metadata-only"):
+        with WorkflowInputFixture(table=workflow_toolchain(pins), caller=caller) as fixture:
+            fixture.write(".axiom/toolchain.toml", SELECTOR_TOOLCHAIN)
+            fixture.base = commit(fixture.root, "base with corpus release metadata")
+            proposed = {**pins, key: "9" * 40} if key in pins else pins
+            fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain(proposed))
+            fixture.write(".axiom/toolchain.toml", SELECTOR_TOOLCHAIN.replace('"before"', '"after"'))
+            if key == "shared_workflow_ref":
+                fixture.write(VALIDATION_CALLER, caller.replace(pins[key], proposed[key]))
+            head = commit(fixture.root, "configuration with corpus release metadata")
+            output = fixture.root / "binding-output"
+            result = run_workflow_inputs(fixture.root, fixture.base,
+                                         pins={name: value for name, value in proposed.items() if name in WORKFLOW_INPUT_PINS},
+                                         head=head, output=output)
+            assert result.returncode == 0, (key, result.stderr)
+            bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            assert all(bound[name] == proposed[name] for name in WORKFLOW_INPUT_PINS), (key, bound)
+            assert bound["axiom_compose_ref"] == "", "staged composer must remain inactive"
+            assert bound["dependency_pins_changed"] == ("false" if key == "metadata-only" else "true"), key
+            assert bound["base_axiom_encode_ref"] == pins["axiom_encode_ref"]
+            assert bound["base_axiom_corpus_ref"] == pins["axiom_corpus_ref"]
+
+
+def test_legacy_binding_validator_adoption_keeps_encoder_pin_and_enables_ratchet() -> None:
+    for encoder, corpus in (
+        ("a9987a4bc6a58e3f0407972f2e5726b7092b9c4b", "581d60b4af079be27c1758832814b5623fa8ac19"),
+        ("c326d1ac0acdb557f047a3054160b19dd72602fa", "440162d04375a5071f2ac02de94f85def3e74053"),
+    ):
+        pins = {"axiom_encode_ref": encoder, "axiom_rules_engine_ref": "05eac9d2f89dabe5c6673176260762cef3a58f47",
+                "axiom_corpus_ref": corpus, "rulespec_us_ref": "0f291b367bf7e15555f9973112278c5cbf221653",
+                "shared_workflow_ref": "842c69d6aa62a0d75a4da850fabc3d0df20701d7"}
+        caller = literal_pin_caller({key: value for key, value in pins.items() if key != "shared_workflow_ref"})
+        caller = caller.replace("@" + "a" * 40, "@" + pins["shared_workflow_ref"])
+        with WorkflowInputFixture(table=workflow_toolchain(pins), caller=caller) as fixture:
+            fixture.write("statutes/legacy.yaml", "fixture: unchanged\n")
+            fixture.base = commit(fixture.root, "unmanifested legacy base")
+            fixture.write(VALIDATION_CALLER, caller.replace(pins["shared_workflow_ref"], "f" * 40))
+            fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain({**pins, "shared_workflow_ref": "f" * 40}))
+            head = commit(fixture.root, "validator adoption at unchanged encoder")
+            output = fixture.root / "binding-output"
+            result = run_workflow_inputs(fixture.root, fixture.base,
+                                         pins={key: value for key, value in pins.items() if key in WORKFLOW_INPUT_ENV},
+                                         head=head, output=output)
+            assert result.returncode == 0, result.stderr
+            bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            assert bound["base_axiom_encode_ref"] == bound["axiom_encode_ref"] == encoder
+            assert bound["dependency_pins_changed"] == "true"
+
+
 def test_validation_targets_preserve_other_path_classifications() -> None:
     full = ("full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS)
     corpus_only = SELECTOR_TOOLCHAIN.replace('"before"', '"after"')
     cases = [
-        ({".github/workflows/validate.yml": "changed\n"}, full),
-        ({".github/workflows/validate.yaml": "changed\n"}, full),
+        ({".github/workflows/validate.yml": "changed\n"}, ("changed", [], [])),
+        ({".github/workflows/validate.yaml": "changed\n"}, ("changed", [], [])),
         ({".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace("b" * 64, "c" * 64)}, full),
         ({".axiom/toolchain.toml": corpus_only}, ("changed-corpus-toolchain-bump", [], [])),
         ({"README.md": "changed\n"}, ("changed", [], [])),
@@ -804,6 +944,7 @@ def pin_only_binding_and_selection(*, literal: bool) -> None:
             **os.environ, "GITHUB_SHA": head, "RUNNER_TEMP": directory,
             "GITHUB_ENV": str(runner_temp / "env"), "GITHUB_OUTPUT": str(selected_output),
             "VALIDATE_ROOTS": "us", "VALIDATE_ROOTS_INPUT": "auto",
+            "DEPENDENCY_PINS_CHANGED": bound["dependency_pins_changed"],
         }, capture_output=True, text=True, timeout=30)
         assert selected.returncode == 0, selected.stdout + selected.stderr
         assert "mode=full-toolchain-bump" in selected_output.read_text()
@@ -832,11 +973,31 @@ def test_proposed_pin_exception_rejects_content_and_helper_changes() -> None:
         with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
             proposed = {**WORKFLOW_INPUT_PINS, "axiom_encode_ref": "e" * 40}
             fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain(proposed))
+            fixture.write(".axiom/toolchain.toml", SELECTOR_TOOLCHAIN.replace('"before"', '"after"'))
             fixture.write(path, "candidate\n")
             head = commit(fixture.root, "pin and non-configuration candidate")
             result = run_workflow_inputs(fixture.root, fixture.base, pins=proposed, head=head)
             assert result.returncode != 0, path
             assert "axiom_encode_ref" in result.stderr, result.stderr
+
+
+def test_pin_changes_with_other_files_cannot_skip_proposed_pin_audit() -> None:
+    pins = {**WORKFLOW_INPUT_PINS, "shared_workflow_ref": "8" * 40}
+    caller = literal_pin_caller(WORKFLOW_INPUT_PINS).replace("@" + "a" * 40, "@" + pins["shared_workflow_ref"])
+    for pin_source in ("table", "caller"):
+        for path in ("README.md", "scripts/read_pin.py", ".github/workflows/unrelated.yml"):
+            with WorkflowInputFixture(table=workflow_toolchain(pins), caller=caller) as fixture:
+                if pin_source == "table":
+                    fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain({**pins, "axiom_encode_ref": "9" * 40}))
+                else:
+                    fixture.write(VALIDATION_CALLER, caller.replace(pins["shared_workflow_ref"], "9" * 40))
+                fixture.write(path, "candidate\n")
+                head = commit(fixture.root, "pin update with unrelated file")
+                # Supplying the old inputs must not make a real pin change look
+                # like a docs/helper update and evade proposed-pin revalidation.
+                result = run_workflow_inputs(fixture.root, fixture.base, pins=WORKFLOW_INPUT_PINS, head=head)
+                assert result.returncode != 0, (pin_source, path)
+                assert "dependency pin changes require a configuration-only change" in result.stderr, result.stderr
 
 
 def authorization_source() -> str:
@@ -1207,11 +1368,12 @@ def test_generated_guard_resolves_scheduled_base_to_exact_commit() -> None:
     assert "fetch-depth: 0" in checkout_step
     assert checkout < start
 
-    def resolve(root: Path, *, event: str, pr_base: str = "", before: str = ""):
+    def resolve(root: Path, *, event: str, pr_base: str = "", group_base: str = "", before: str = ""):
         source = (
             guard_base_ref_source()
             .replace("${{ github.event_name }}", event)
             .replace("${{ github.event.pull_request.base.sha }}", pr_base)
+            .replace("${{ github.event.merge_group.base_sha }}", group_base)
             .replace("${{ github.event.before }}", before)
         )
         assert "${{" not in source
@@ -1249,8 +1411,11 @@ def test_generated_guard_resolves_scheduled_base_to_exact_commit() -> None:
         assert result.returncode == 0 and result.stdout == first
         result = resolve(root, event="pull_request", pr_base=second)
         assert result.returncode == 0 and result.stdout == second
+        result = resolve(root, event="merge_group", group_base=second)
+        assert result.returncode == 0 and result.stdout == second
         # Anything that is not an exact commit identity is refused up front.
         assert resolve(root, event="pull_request", pr_base="main").returncode != 0
+        assert resolve(root, event="merge_group", group_base="main").returncode != 0
         assert resolve(root, event="push", before="HEAD~1").returncode != 0
 
 
@@ -1647,7 +1812,9 @@ def test_retired_schema_prefreeze_bridge_is_fail_closed() -> None:
 def test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix() -> None:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Enforce validation waiver ratchet")
-    end = workflow.index("      - name: Reject manual RuleSpec changes")
+    # Check the waiver step itself; the following base-manifest preparation
+    # deliberately runs once and must not be mistaken for waiver partitioning.
+    end = workflow.index("\n      - name:", start + 1)
     audit_step = workflow[start:end]
 
     assert "matrix.shard == needs.shards.outputs.first" not in audit_step
@@ -1847,9 +2014,13 @@ def test_conflicted_merge_is_rejected() -> None:
 
 
 def main() -> None:
+    test_caller_scalar_loader_matches_ruleset_guard()
+    test_literal_numeric_looking_pins_keep_exact_string_identity()
+    test_binding_rejects_caller_pin_lines_outside_printable_ascii_lf()
     test_literal_pin_only_binds_proposed_pin_and_selects_every_target()
     test_table_pin_only_binds_proposed_pin_and_selects_every_target()
     test_proposed_pin_exception_rejects_content_and_helper_changes()
+    test_pin_changes_with_other_files_cannot_skip_proposed_pin_audit()
     test_indirect_script_encoder_pin_cannot_validate_changed_module()
     test_reusable_workflow_input_default_cannot_validate_changed_module()
     test_reusable_workflow_env_pin_cannot_validate_changed_module()
@@ -1861,10 +2032,14 @@ def main() -> None:
     test_protected_workflow_yaml_cannot_disguise_active_composer()
     test_protected_workflow_inputs_reject_untrusted_event_sources()
     test_protected_workflow_input_imports_ignore_candidate_python()
-    print("protected effective workflow inputs: 11 regression checks passed")
+    print("protected effective workflow inputs: regression checks passed")
     test_validation_targets_workflow_toolchain_pin_only_requires_full_validation()
+    test_workflow_edits_without_dependency_pin_changes_use_changed_guard()
+    test_manifest_audit_flag_tracks_actual_dependency_and_validator_refs()
+    test_corpus_release_metadata_companion_preserves_proposed_pin_binding()
+    test_legacy_binding_validator_adoption_keeps_encoder_pin_and_enables_ratchet()
     test_validation_targets_preserve_other_path_classifications()
-    print("validation target selection: 14 regression cases passed")
+    print("validation target selection: regression checks passed")
     test_corpus_placement_runs_before_supervised_gates_with_step_only_credentials()
     test_pre_switch_corpus_skips_placement_without_invoking_old_encoder()
     test_post_switch_corpus_rejects_encoder_without_corpus_fetch()

@@ -273,6 +273,7 @@ jobs:
               return None, fallback, callers, workflows
 
 
+          # strict-caller-loader-start
           def caller_mapping(lines):
               # Parse only the block-mapping structure needed by the admission
               # policy. Unsupported YAML is rejected; no candidate parser,
@@ -290,7 +291,7 @@ jobs:
                   match = re.fullmatch(r" *(\"[^\"]*\"|'[^']*'|[A-Za-z0-9_.-]+):(?:[ \t]+(.*))?", line)
                   if match is None:
                       raise SystemExit("Operative canonical validator requires unambiguous mapping keys")
-                  key = match[1].strip("\"'")
+                  key = caller_scalar((match[1], []))
                   if re.fullmatch(r"[A-Za-z0-9_.-]+", key) is None:
                       raise SystemExit("Operative canonical validator requires literal mapping keys")
                   if key in mapping:
@@ -351,16 +352,39 @@ jobs:
               return [value]
 
 
+          def caller_lines(raw):
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeError:
+                  raise SystemExit("Operative canonical validator requires UTF-8 YAML")
+              # LF is the only line separator. Other separators must remain in
+              # the scalar so admission cannot mask them as a normal newline.
+              fragments = text.split("\n")
+              lines = [line + "\n" for line in fragments[:-1]]
+              if fragments[-1]:
+                  lines.append(fragments[-1])
+              for line in lines:
+                  match = re.match(r"[ \t]*(\"[^\"]*\"|'[^']*'|[A-Za-z0-9_.-]+):", line)
+                  if match is None:
+                      continue
+                  name = caller_scalar((match[1], []))
+                  if name in ("uses", "axiom-encode-ref", "axiom-rules-engine-ref", "axiom-corpus-ref", "rulespec-us-ref", "axiom-compose-ref"):
+                      if not line.endswith("\n") or any(not 32 <= ord(character) <= 126 for character in line[:-1]):
+                          raise SystemExit("Operative canonical validator pin lines require printable ASCII and LF endings")
+              return lines
+
+
+          def caller_document(raw):
+              return caller_mapping([line.removesuffix("\n") for line in caller_lines(raw)])
+          # strict-caller-loader-end
+
+
           def canonical_validator(configuration, *, required):
               found = []
               for raw in configuration[2]:
                   if raw is None:
                       continue
-                  try:
-                      text = raw.decode("utf-8")
-                  except UnicodeError:
-                      raise SystemExit("Operative canonical validator requires UTF-8 YAML")
-                  workflow = caller_mapping(text.splitlines())
+                  workflow = caller_document(raw)
                   trigger = workflow.get("on")
                   if trigger is None:
                       raise SystemExit("Operative canonical validator must run on every pull request")
@@ -430,7 +454,7 @@ jobs:
               # bytes. Pin-only updates may alter the admitted validation
               # scalars; every other byte stays identical, including unrelated
               # job bodies that could otherwise invalidate the whole workflow.
-              lines = raw.decode("utf-8").splitlines(keepends=True)
+              lines = caller_lines(raw)
               def indentation(line):
                   return len(line) - len(line.lstrip(" "))
               def key(line):
@@ -455,8 +479,7 @@ jobs:
                       if name == "axiom-compose-ref":
                           lines[index] = ""
                           continue
-                      ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
-                      lines[index] = " " * indentation(lines[index]) + name + ": <admitted-pin>" + ending
+                      lines[index] = " " * indentation(lines[index]) + name + ": <admitted-pin>\n"
               return "".join(lines)
 
 
@@ -467,7 +490,7 @@ jobs:
                   if {caller_identity(raw) for raw in previous} != {caller_identity(raw) for raw in proposed}:
                       raise SystemExit("Operative canonical validator updates may change only admitted validation pins; preserve every other protected caller byte")
                   def binding_values(raw):
-                      workflow = caller_mapping(raw.decode("utf-8").splitlines())
+                      workflow = caller_document(raw)
                       validation = caller_block(caller_block(workflow["jobs"])["validate"])
                       supplied = caller_block(validation["with"])
                       return {name: caller_scalar(supplied[name]) for name in (*BINDING_INPUTS, "axiom-compose-ref") if name in supplied}
@@ -482,7 +505,7 @@ jobs:
               # Bootstrap PRs have no existing caller to authenticate unrelated
               # scripts against. Admit the minimal direct caller shape only.
               for raw in proposed:
-                  workflow = caller_mapping(raw.decode("utf-8").splitlines())
+                  workflow = caller_document(raw)
                   if set(workflow) - {"name", "on", "permissions", "jobs"}:
                       raise SystemExit("Operative canonical validator bootstrap requires a minimal direct caller")
                   if "name" in workflow:
@@ -530,7 +553,9 @@ jobs:
               if git("rev-parse", "--is-shallow-repository", env=source_env).strip() != b"false":
                   raise SystemExit("Complete shared-validator first-parent main history is required")
               main = git("rev-list", "--first-parent", "refs/heads/main", env=source_env).decode("ascii").splitlines()
-              if proposed not in main:
+              positions = {revision: index for index, revision in enumerate(main)}
+              proposed_position = positions.get(proposed)
+              if proposed_position is None:
                   raise SystemExit("Shared validator pin must belong to source first-parent main")
               trusted = git("show", f"{proposed}:{VALIDATOR_PATH}", env=source_env).decode("utf-8")
               # Source main is trusted code. Require the isolated input-binding
@@ -546,7 +571,8 @@ jobs:
                   raise SystemExit("Shared validator pin must retain isolated protected-input binding")
               previous = canonical_validator(base_configuration, required=False)
               if previous is not None and previous != proposed:
-                  if previous not in main or main.index(proposed) > main.index(previous):
+                  previous_position = positions.get(previous)
+                  if previous_position is None or proposed_position is None or proposed_position > previous_position:
                       raise SystemExit("Shared validator pin must advance monotonically on source first-parent main")
 
 

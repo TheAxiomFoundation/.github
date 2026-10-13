@@ -1074,6 +1074,97 @@ class EnforcementContinuityTests(unittest.TestCase):
                 fixture.write(self.VALIDATION_CALLER, candidate)
                 self.assert_fail(fixture.run(fixture.head()))
 
+    def assert_bad_protected_caller_rejects_docs(self, change: str, message: str) -> None:
+        """An unsafe protected caller must not become grandfathered configuration."""
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            caller = yaml.safe_load(self.complete_caller(fixture.validator_pins["binding"]))
+            validation = caller["jobs"]["validate"]
+            if change == "conditional-needs":
+                validation["needs"] = "pins"
+                caller["jobs"]["pins"] = {
+                    "if": "${{ false }}", "runs-on": "ubuntu-latest", "steps": [{"run": "exit 0"}],
+                }
+            elif change == "disabled-guard":
+                validation["with"]["run-generated-guard"] = False
+            elif change == "filtered-pr":
+                caller["on"] = {"pull_request": {"paths": ["README.md"]}}
+            elif change == "conditional":
+                validation["if"] = "${{ false }}"
+            elif change == "side-branch":
+                validation["uses"] = validation["uses"].replace(
+                    fixture.validator_pins["binding"], fixture.validator_pins["side"],
+                )
+            else:
+                self.fail(f"Unknown protected caller fixture: {change}")
+            fixture.write(self.VALIDATION_CALLER, yaml.safe_dump(caller, sort_keys=False))
+            fixture.base = fixture.commit("Protected caller with unsafe validation configuration")
+            fixture.write("README.md", "Documentation-only candidate.\n")
+            result = fixture.run(fixture.head())
+            self.assert_fail(result)
+            self.assertIn(message, result.stderr.lower())
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_protected_base_conditional_needs_rejects_docs_only_pr(self):
+        self.assert_bad_protected_caller_rejects_docs("conditional-needs", "dependencies must remain unconditional")
+
+    def test_protected_base_disabled_generated_guard_rejects_docs_only_pr(self):
+        self.assert_bad_protected_caller_rejects_docs("disabled-guard", "cannot disable the generated guard")
+
+    def test_protected_base_filtered_pull_request_rejects_docs_only_pr(self):
+        self.assert_bad_protected_caller_rejects_docs("filtered-pr", "cannot filter pull-request validation")
+
+    def test_protected_base_job_if_rejects_docs_only_pr(self):
+        self.assert_bad_protected_caller_rejects_docs("conditional", "unconditional direct shared validation call")
+
+    def test_protected_base_non_first_parent_pin_rejects_docs_only_pr(self):
+        self.assert_bad_protected_caller_rejects_docs("side-branch", "first-parent main")
+
+    def test_pin_lines_reject_controls_non_ascii_and_non_lf_endings(self):
+        # No property-test dependency is installed. Exhaust the review's line
+        # separators and representative disallowed bytes in the admitted scalar.
+        suffixes = ("\x0c", "\x0b", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\x7f", "\u00e9", "\r")
+        for suffix in suffixes:
+            with self.subTest(suffix=repr(suffix)), Fixture() as fixture:
+                self.prepare(fixture)
+                caller = fixture.root / self.VALIDATION_CALLER
+                text = caller.read_text()
+                line = next(line for line in text.split("\n") if "axiom-encode-ref:" in line)
+                fixture.write(self.VALIDATION_CALLER, text.replace(line + "\n", line + suffix + "\n"))
+                result = fixture.run(fixture.head())
+                self.assert_fail(result)
+                self.assertIn("printable ascii", result.stderr.lower())
+                self.assertNotIn("Traceback", result.stderr)
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            caller = fixture.root / self.VALIDATION_CALLER
+            fixture.write(self.VALIDATION_CALLER, caller.read_text().replace("axiom-encode-ref: ", "axiom-encode-ref:\t"))
+            result = fixture.run(fixture.head())
+            self.assert_fail(result)
+            self.assertIn("printable ascii", result.stderr.lower())
+
+    def test_changed_validator_pin_line_rejects_non_lf_ending(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            caller = fixture.root / self.VALIDATION_CALLER
+            line = next(line for line in caller.read_text().split("\n") if "uses:" in line)
+            fixture.write(self.VALIDATION_CALLER, caller.read_text().replace(line + "\n", line + "\r\n"))
+            result = fixture.run(fixture.head())
+            self.assert_fail(result)
+            self.assertIn("printable ascii", result.stderr.lower())
+
+    def test_final_caller_pin_requires_lf_ending(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            caller = fixture.root / self.VALIDATION_CALLER
+            protected = caller.read_text() + "      axiom-compose-ref: ''\n"
+            fixture.write(self.VALIDATION_CALLER, protected)
+            fixture.base = fixture.commit("Protected caller with an explicit inactive composer")
+            fixture.write(self.VALIDATION_CALLER, protected.removesuffix("\n"))
+            result = fixture.run(fixture.head())
+            self.assert_fail(result)
+            self.assertIn("printable ascii", result.stderr.lower())
+
     def test_unconditional_dependency_diamond_preserves_validation(self):
         with Fixture() as fixture:
             self.prepare(fixture)
@@ -1185,6 +1276,29 @@ class EnforcementContinuityTests(unittest.TestCase):
 
 
 class WorkflowSecurityTests(unittest.TestCase):
+    def test_strict_caller_loader_rejects_every_ascii_control_on_each_pin_line(self):
+        guard = source(document(WORKFLOW))
+        begin, end = "# strict-caller-loader-start", "# strict-caller-loader-end"
+        self.assertIn(begin, guard, "Admission must use the strict caller loader")
+        loader = guard.split(begin, 1)[1].split(end, 1)[0]
+        namespace = {"json": json, "re": re}
+        exec(loader, namespace)
+        pin_names = ("uses", "axiom-encode-ref", "axiom-rules-engine-ref",
+                     "axiom-corpus-ref", "rulespec-us-ref", "axiom-compose-ref")
+        forbidden = [chr(code) for code in range(32) if code != 10]
+        forbidden += ["\x7f", "\x85", "\u00e9", "\u2028", "\u2029"]
+        for name in pin_names:
+            for key in (name, f"'{name}'", f'"{name}"'):
+                for character in forbidden:
+                    with self.subTest(key=key, character=repr(character)):
+                        raw = f"  {key}: pinned{character}\n".encode()
+                        with self.assertRaisesRegex(SystemExit, "printable ASCII and LF"):
+                            namespace["caller_lines"](raw)
+                for ending in ("", "\r\n"):
+                    with self.subTest(key=key, ending=repr(ending)):
+                        with self.assertRaisesRegex(SystemExit, "printable ASCII and LF"):
+                            namespace["caller_lines"](f"  {key}: pinned{ending}".encode())
+
     def test_validator_source_fetch_is_bare_transient_and_full_history(self):
         workflow = document(WORKFLOW)
         name = "Fetch trusted shared-validator main history as Git objects only"
@@ -1475,6 +1589,22 @@ jobs:
     def test_readme_drops_unsupported_repository_audit_assertion(self):
         section = (ROOT / "README.md").read_text().split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
         self.assertNotIn("27 active", section)
+
+    def test_readme_bounds_manifest_audit_and_installer_claims(self):
+        section = (ROOT / "README.md").read_text().split("### Base-anchored encoder guard", 1)[1].split("### Run bounds", 1)[0]
+        text = " ".join(section.split())
+        for requirement in (
+            "A workflow edit that changes no dependency ref keeps changed-file selection",
+            "protected base with its pins", "proposed tree with its pins",
+            "reject issues present only at the proposed tree",
+            "report inherited issues as information",
+            "open and merge these PRs in order", "842c69d6",
+            "while retaining their current encoder pins",
+            "do not provide filesystem isolation for every installer or later candidate test",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, text)
+        self.assertNotIn("Toolchain installers run outside the candidate checkout", text)
 
     def test_adoption_explicitly_requires_effective_pin_and_full_revalidation_evidence(self):
         text = " ".join((ROOT / "README.md").read_text().split())

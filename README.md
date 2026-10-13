@@ -265,8 +265,10 @@ validator source must contain the isolated effective-input binding check.
 Adoption therefore requires a binding-capable shared validator on the protected
 base; the guard does not supply that check to old shared-validator revisions.
 Canonical caller updates preserve the protected caller's remaining bytes;
-only admitted validator and binding pin scalars may change. This prevents
-unrelated malformed YAML or helper edits from disabling workflow loading.
+only admitted validator and binding pin scalars may change. Admitted pin lines
+must contain printable ASCII and end with a newline; the validator applies the
+same strict caller loading rules. This prevents control characters or
+unrelated helper edits from disabling workflow loading.
 Adoption must start from a tested, valid canonical caller. Initial caller
 establishment uses the guard's supported minimal direct-call form.
 
@@ -311,29 +313,42 @@ hosted evidence that this context identifies the intended caller. See
 Callers must pin a shared validator revision containing this check. It adds no
 encoder command requirement for older encoder pins.
 
-Content-free updates limited to the workflow-toolchain table and canonical
-caller may supply either the base or proposed inputs. The shared validator
+Content-free updates limited to the workflow-toolchain table, canonical
+caller and `.axiom/toolchain.toml` release/waiver metadata may supply either
+the base or proposed inputs. The shared validator
 reads the proposed configuration from the exact event commit's Git objects,
 checks the effective inputs, and passes the resolved proposed refs to dependency
 checkout and every later consumer. Content or helper changes retain exact
-protected-base binding. Both literal-caller and table-only pin updates select
-`full-toolchain-bump`, revalidating every module and companion at the proposed
-pins before merge. The supervised generated guard also receives `--all` in this
-mode, auditing
-unchanged modules and manifests before module validation. Existing manifests
-must satisfy the proposed encoder's signature and execution-identity contracts;
-an arbitrary encoder upgrade does not guarantee admission of older manifests.
-Staged inactive composer pins remain inactive for older
-encoder callers. These local checks do not establish the external encoder's
-manifest-admission policy.
+protected-base binding when dependency refs are unchanged. Dependency-ref
+updates accompanied by docs, helpers or other files outside the admitted
+configuration paths are rejected even when they supply base inputs. A change
+to an encoder, engine, corpus, composer,
+RuleSpec dependency or shared-validator ref selects `full-toolchain-bump`,
+revalidating every module and companion at the proposed pins before merge.
+A workflow edit that changes no dependency ref keeps changed-file selection.
+Changes to the release or waiver-digest toolchain metadata may still require
+full module validation without enabling the whole-repository manifest audit.
+The whole-repository generated-content audit is a ratchet: run supervised
+`guard-generated --all` against the protected base with its pins and the
+proposed tree with its pins, reject issues present only at the proposed tree,
+and report inherited issues as information. Missing legacy manifests or stale
+waiver digests therefore do not alone block an unchanged-content validator
+adoption PR. This audit does not excuse a newly introduced issue or replace
+module validation. Staged inactive composer pins remain inactive for older
+encoder callers. Local fixtures exercise this comparison; they do not establish
+the external encoder's manifest-admission policy on complete live repositories.
 
-Toolchain installers run outside the candidate checkout with isolated Python
-imports and isolated pip configuration. Authenticated dependency sources are
-checked by full-tree integrity checks after installation and immediately before
-later consumers, including supervisor build and provisioning. A changed HEAD
-is not required to detect source drift. The local regression injects candidate
-`pip.py` that replaces real supervisor and provisioner inputs and verifies that
-it never executes; separate drift probes require rejection before consumption.
+The Python/pip installation steps clear ambient Python import settings and use
+isolated imports and pip configuration. Encoder installation uses authenticated
+source copies outside the candidate checkout. The composer setup disables the
+setup-uv cache and uses the runner's temporary working directory; composer
+packages install without a cache. Integrity checks cover authenticated
+dependency sources, staged encoder packages, and both staged and copied
+composer runtime packages before consuming steps, including supervisor build
+and provisioning. A changed HEAD is not required
+to detect source drift. Local regressions test candidate `pip.py` exclusion,
+source and runtime drift rejection, and cache configuration. These checks do
+not provide filesystem isolation for every installer or later candidate test.
 
 Module selection compares the exact event base with the proposed merge result,
 so candidate edits are checked at their final paths after any base-side rename,
@@ -400,6 +415,35 @@ Complete and retain the evidence for every item **before the ruleset is applied
 to production repositories**. Settings inspection and hosted acceptance are
 adoption work; passing local fixtures does not complete these items.
 
+For an existing repository, open and merge these PRs in order before enabling
+the ruleset:
+
+1. If its protected base lacks a valid canonical caller or trusted pin source,
+   open a configuration-only prerequisite PR to establish or repair
+   `repository-checks.yml` (or `.yaml`) and any existing workflow-toolchain
+   TOML. Preserve the current dependency pins. Repositories with a valid caller
+   and trusted pins skip this PR.
+2. Open a configuration-only validator-adoption PR that changes the canonical
+   shared-validator `uses:` SHA to the reviewed, binding-capable release on
+   first-parent `main`, updating the TOML `shared_workflow_ref` mirror in the
+   same PR when present. Keep the encoder, engine, corpus, composer and RuleSpec
+   dependency pins unchanged. In particular, NZ and UK move from validator
+   `842c69d6` in this PR while retaining their current encoder pins. The
+   whole-repository audit compares base and proposed issues; inherited missing
+   manifests and stale waiver digests are informational. Merge only after the
+   validator and full module/companion checks pass.
+3. If local guard visibility is wanted, open a configuration-only PR adding
+   the optional guard caller pinned to the same reviewed release SHA. It does
+   not replace the organization ruleset. Skip this PR when no local caller is
+   wanted.
+
+After these PRs and the acceptance checks below, enable the pinned ruleset and
+its branch-freshness companion policy. Later dependency upgrades use their own
+configuration-only PRs. Manifest repairs and encoded content changes use
+separate content PRs after the relevant configuration PR has merged; an
+inherited audit issue is not a requirement to combine those repairs with the
+adoption PR.
+
 - [ ] Run a hosted acceptance test on a sandbox rulespec-style repository with
   no caller workflow (caller-free). Pin the intended source workflow SHA and
   confirm the required workflow runs and governs the merge decision. A module
@@ -460,11 +504,17 @@ adoption work; passing local fixtures does not complete these items.
 - [ ] Run an explicit pin-only full-revalidation case: change only a toolchain
   pin while leaving unchanged modules and manifests in place. Exercise both a
   literal caller update and a table-only update with base inputs. Confirm every
-  unchanged module and companion is selected and its manifest is revalidated
-  at the proposed pin before merge. After merge, supply the newly protected
-  inputs and confirm full revalidation at the new pin, including rejection of
-  an unchanged module or manifest that violates its policy. Retain the exact
-  validator SHA, selected target inventories and both hosted runs.
+  unchanged module and companion is selected at the proposed pin, and that
+  the whole-repository audit compares protected-base issues at base pins with
+  proposed-tree issues at proposed pins. Retain inherited missing-manifest and
+  stale-waiver-digest cases that pass, a jurisdiction-root-only manifest case,
+  and a newly introduced unmanifested module that fails. Also retain an
+  unchanged-content NZ/UK validator-adoption case with its encoder unchanged,
+  and a workflow edit with no changed dependency ref that keeps the ordinary
+  changed-file guard. After merge, confirm the full-push run uses the newly
+  protected pins and a later content PR retains protected-base binding.
+  Retain the exact validator SHA, selected target
+  inventories, issue reports and hosted outcomes.
 - [ ] Keep `do_not_enforce_on_create: true` and test repository initialization
   in the sandbox; required workflows cannot run while a repository is being
   initialized. Replace the zero-SHA placeholder only with the reviewed release
