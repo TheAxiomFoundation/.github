@@ -546,8 +546,52 @@ class GuardDecisionTests(unittest.TestCase):
             # A stale event merge still has a regular manifest but wrong base.
             stale = git(fixture.root, "commit-tree", f"{head}^{{tree}}", "-p", fixture.base, "-p", head, "-m", "Stale test merge")
             self.assert_pass(fixture.run(head, merge=stale))
-            self.assert_fail(fixture.run(head, base=advanced, merge=stale))
+            result = fixture.run(head, base=advanced, merge=stale)
+            self.assert_fail(result)
+            self.assertIn("Missing encoder apply manifests: 1", result.stderr)
             self.assert_fail(fixture.run(head, merge="not-a-sha"))
+
+    def test_event_merge_for_an_earlier_head_is_replaced_by_the_current_merge(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: head\n")
+            earlier = fixture.head()
+            earlier_merge = git(
+                fixture.root, "commit-tree", f"{earlier}^{{tree}}",
+                "-p", fixture.base, "-p", earlier, "-m", "Test merge of the earlier head",
+            )
+            self.assert_pass(fixture.run(earlier, merge=earlier_merge))
+            # A later push's event carries the earlier head's test merge. A clean
+            # later head passes on the merge the guard computes for it.
+            git(fixture.root, "checkout", "-q", "--detach", earlier)
+            fixture.write(module, "fixture: later head\n")
+            later = fixture.head()
+            self.assert_pass(fixture.run(later, merge=earlier_merge))
+            # A later head that removes the manifest fails, although the earlier
+            # head's merge still carries it.
+            git(fixture.root, "checkout", "-q", "--detach", earlier)
+            (fixture.root / manifest).unlink()
+            removed = fixture.head()
+            result = fixture.run(removed, merge=earlier_merge)
+            self.assert_fail(result)
+            self.assertIn("Missing encoder apply manifests: 1", result.stderr)
+
+    def test_event_merge_that_is_not_available_is_replaced_by_the_current_merge(self):
+        # A re-run reuses its event; GitHub may no longer serve a superseded merge.
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        missing = "0" * 40
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: head\n")
+            head = fixture.head()
+            self.assert_pass(fixture.run(head, merge=missing))
+            git(fixture.root, "checkout", "-q", "--detach", head)
+            (fixture.root / manifest).unlink()
+            removed = fixture.head()
+            result = fixture.run(removed, merge=missing)
+            self.assert_fail(result)
+            self.assertIn("Missing encoder apply manifests: 1", result.stderr)
 
     def test_jurisdiction_retirement_receipt_uses_relative_module_path(self):
         module = "us/statutes/item.yaml"
@@ -1349,11 +1393,61 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIs(settings["lfs"], False)
         self.assertEqual(steps[0]["name"], REVISION_STEP)
 
+    def test_fetch_step_fails_closed_for_the_head_and_is_best_effort_for_the_merge(self):
+        script = step(document(WORKFLOW), "Fetch candidate and event merge commits as Git objects only")["run"]
+        head, merge = "a" * 40, "b" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            calls = tools / "calls"
+            # Stub git logs every call and fails the one whose arguments contain FAIL_ON.
+            (tools / "git").write_text(
+                '#!/bin/sh\necho "$*" >> "$CALLS"\ncase "$*" in *"$FAIL_ON"*) exit 1 ;; esac\nexit 0\n'
+            )
+            (tools / "base64").write_text("#!/bin/sh\ncat >/dev/null\necho dG9rZW4=\n")
+            for tool in ("git", "base64"):
+                os.chmod(tools / tool, 0o755)
+
+            def run(fail_on: str, merge_sha: str = merge) -> tuple[int, list[str]]:
+                calls.write_text("")
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                    env={
+                        "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+                        "CALLS": str(calls), "FAIL_ON": fail_on,
+                        "HEAD_SHA": head, "MERGE_SHA": merge_sha,
+                        "GH_READ_TOKEN": "token", "GIT_TERMINAL_PROMPT": "0",
+                    },
+                    capture_output=True, text=True, check=False,
+                )
+                return result.returncode, calls.read_text().splitlines()
+
+            # The head is required: a failed fetch or a missing commit stops the step.
+            code, made = run(f"origin {head}")
+            self.assertNotEqual(code, 0)
+            self.assertEqual(len(made), 1)
+            code, made = run(f"{head}^{{commit}}")
+            self.assertNotEqual(code, 0)
+            self.assertEqual(len(made), 2)
+            # The event merge is best effort: either failure only skips it.
+            for fail_on, expected_calls in ((f"origin {merge}", 3), (f"{merge}^{{commit}}", 4)):
+                code, made = run(fail_on)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(made), expected_calls)
+            code, made = run("no-such-argument")
+            self.assertEqual(code, 0)
+            self.assertEqual(len(made), 4)
+            # No event merge: only the head is fetched and checked.
+            self.assertEqual(run("no-such-argument", merge_sha=""), (0, [
+                f"-c core.hooksPath=/dev/null -c core.fsmonitor=false fetch --no-tags --no-recurse-submodules origin {head}",
+                f"cat-file -e {head}^{{commit}}",
+            ]))
+
     def test_head_is_only_fetched_and_guard_uses_isolated_standard_library_python(self):
         workflow = document(WORKFLOW)
         fetch = step(workflow, "Fetch candidate and event merge commits as Git objects only")
-        self.assertIn('for revision in "$HEAD_SHA" "$MERGE_SHA"', fetch["run"])
-        self.assertIn('fetch --no-tags --no-recurse-submodules origin "$revision"', fetch["run"])
+        self.assertIn('fetch_commit "$HEAD_SHA"\n', fetch["run"])
+        self.assertIn('if [ -n "$MERGE_SHA" ] && ! fetch_commit "$MERGE_SHA"; then', fetch["run"])
+        self.assertIn('fetch --no-tags --no-recurse-submodules origin "$1"', fetch["run"])
         self.assertEqual(fetch["env"]["HEAD_SHA"], "${{ steps.revisions.outputs.head-sha }}")
         self.assertEqual(fetch["env"]["MERGE_SHA"], "${{ steps.revisions.outputs.merge-sha }}")
         guard = step(workflow, GUARD_STEP)
