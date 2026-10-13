@@ -280,6 +280,7 @@ def run_workflow_inputs(
     root: Path, base: str, *, pins: dict[str, str] | None = None,
     event: str = "pull_request", head: str | None = None,
     caller_path: str = VALIDATION_CALLER,
+    current_ref: str = "refs/heads/main",
     output: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     actual = {**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "", **(pins or {})}
@@ -290,10 +291,10 @@ def run_workflow_inputs(
         "PR_BASE_SHA": base if event in ("pull_request", "pull_request_target") else "",
         "MERGE_GROUP_BASE_SHA": base if event == "merge_group" else "",
         "CURRENT_SHA": head or git(root, "rev-parse", "HEAD"),
-        "CURRENT_REF": "refs/heads/main",
+        "CURRENT_REF": current_ref,
         "DEFAULT_BRANCH": "main",
         "REPOSITORY": "example/rules",
-        "CALLER_WORKFLOW_REF": f"example/rules/{caller_path}@refs/heads/main",
+        "CALLER_WORKFLOW_REF": f"example/rules/{caller_path}@{current_ref}",
         "GITHUB_SHA": head or git(root, "rev-parse", "HEAD"),
         "RELEASE_BASE_URL": "https://example.invalid",
         "RELEASE_REGISTRY_URL": "",
@@ -653,22 +654,21 @@ def test_protected_workflow_inputs_reject_untrusted_event_sources() -> None:
         for event in ("workflow_run", "repository_dispatch", "pull_request_review"):
             result = run_workflow_inputs(fixture.root, fixture.base, event=event)
             assert result.returncode != 0, event
-        shell = workflow_input_step()["run"]
-        for event in ("push", "workflow_dispatch"):
-            # Mutate only context fixtures, never the protected-input source.
-            environment = {
-                **os.environ,
-                **{WORKFLOW_INPUT_ENV[key]: value for key, value in WORKFLOW_INPUT_PINS.items()},
-                "AXIOM_COMPOSE_REF": "", "EVENT_NAME": event,
-                "PR_BASE_SHA": "", "MERGE_GROUP_BASE_SHA": "",
-                "CURRENT_SHA": fixture.base, "CURRENT_REF": "refs/heads/candidate",
-                "DEFAULT_BRANCH": "main", "RELEASE_BASE_URL": "https://example.invalid",
-                "RELEASE_REGISTRY_URL": "", "RELEASE_REGISTRY_ANON_KEY": "",
-                "PYTHON_VERSION": "3.13",
-                "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
-            }
-            result = subprocess.run(["bash", "-c", shell], cwd=fixture.root, env=environment, capture_output=True, text=True)
-            assert result.returncode != 0, event
+        for event in ("push", "schedule", "workflow_dispatch"):
+            output = fixture.root / f"{event}-output"
+            control = run_workflow_inputs(fixture.root, fixture.base, event=event, output=output)
+            assert control.returncode == 0, (event, control.stdout, control.stderr)
+            assert output.exists(), event
+            assert "Traceback" not in control.stderr, control.stderr
+            result = run_workflow_inputs(
+                fixture.root, fixture.base, event=event,
+                current_ref="refs/heads/candidate", output=output,
+            )
+            assert result.returncode == 1, (event, result.stdout, result.stderr)
+            assert result.stderr == (
+                "ProtectedWorkflowInputError: non-PR validation must run on the protected default branch\n"
+            ), (event, result.stderr)
+            assert "Traceback" not in result.stderr, result.stderr
 
 
 def test_protected_workflow_input_imports_ignore_candidate_python() -> None:

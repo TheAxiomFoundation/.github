@@ -3548,7 +3548,7 @@ jobs:
           fi
 
           # Audit each revision with its own encoder and corpus. Only exact
-          # issue strings newly present at head block adoption or a pin update.
+          # issue identities newly present at head block adoption or a pin update.
           base_status=0
           run_generated_guard /opt/axiom-base-verification "$BASE_RULESPEC_ROOT" "$BASE_DEPENDENCY_ROOT" "$base_ref" --all --json \
             > "$RUNNER_TEMP/generated-guard-base.json" || base_status=$?
@@ -3560,7 +3560,33 @@ jobs:
             "$BASE_RULESPEC_ROOT" "$GITHUB_WORKSPACE" "$BASE_DEPENDENCY_ROOT" "$AXIOM_DEPENDENCY_ROOT" <<'PYRATCHET'
           import json
           from pathlib import Path
+          import re
           import sys
+
+          def issue_key(issue, repo, dependencies):
+              # Preserve diagnostic bytes, including relative filenames and
+              # issue codes. The safe-read diagnostic's final field is a path;
+              # recognize its delimiter without splitting the path itself.
+              # Other diagnostics are one field. Strip only a field's
+              # absolute checkout prefix, never text embedded in a filename.
+              fields = (issue,)
+              safe_read = re.fullmatch(
+                  r"(.* cannot be read safely: (?:encoder apply manifest "
+                  r"(?:is not (?:a file|a regular file)|exceeds (?:byte limit|the [0-9]+-byte safety limit))"
+                  r"|Could not safely open encoder apply manifest): )(.*)", issue, re.DOTALL)
+              if safe_read and issue.count(" cannot be read safely: ") == 1:
+                  fields = safe_read.groups()
+              key = []
+              for field in fields:
+                  for kind, root in (("repository", repo), ("dependencies", dependencies)):
+                      if Path(root).is_absolute() and field.startswith(root + "/"):
+                          key.append((kind, field[len(root) + 1:]))
+                          break
+                  else:
+                      key.append(("literal", field))
+              # Tagged fields keep a literal '<repository>' filename distinct
+              # from a normalized absolute path with the same remaining text.
+              return tuple(key)
 
           def issue_set(path, status, repo, dependencies):
               try:
@@ -3574,11 +3600,7 @@ jobs:
                   or payload["passed"] != (not payload["issues"])
                   or (status == "0") != payload["passed"]):
                   raise SystemExit("ManifestAuditError: guard execution failed or returned an inconsistent issue result")
-              # External encoders include absolute roots in some diagnostics.
-              # Normalize only the two known checkout prefixes, preserving the
-              # issue kind, relative file path and every remaining byte.
-              return {issue.replace(repo + "/", "<repository>/").replace(dependencies + "/", "<dependencies>/")
-                      for issue in payload["issues"]}
+              return {issue_key(issue, repo, dependencies) for issue in payload["issues"]}
 
           before = issue_set(sys.argv[1], sys.argv[2], sys.argv[5], sys.argv[7])
           after = issue_set(sys.argv[3], sys.argv[4], sys.argv[6], sys.argv[8])

@@ -260,6 +260,71 @@ class PinBumpManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Inherited manifest audit issues: 1", result.stdout)
 
+    def test_issue_ratchet_preserves_distinct_relative_paths_and_messages(self):
+        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+        shell = next(step["run"] for step in steps if step.get("name") == "Reject manual RuleSpec changes")
+        source = shell.split("<<'PYRATCHET'\n", 1)[1].split("\nPYRATCHET", 1)[0]
+        code = compile(source, "manifest-ratchet", "exec")
+        repository = "/home/runner/work/rulespec-uk/rulespec-uk"
+        dependencies = "/home/runner/work/_temp/dependencies"
+        read_error = " cannot be read safely: encoder apply manifest exceeds byte limit: "
+        cases = []
+        for root, marker, base_root in ((repository, "<repository>", "/audit/base/rulespec-uk"),
+                                        (dependencies, "<dependencies>", "/audit/base/dependencies")):
+            # One base issue plus two distinct head issues: the root embedded
+            # in a relative filename must not become the literal placeholder.
+            for prefix in ("uk/statutes/x", "uk/statutes/x ", "uk/statutes/x:"):
+                cases.append((prefix + marker + "/foo.yaml: issue",
+                              prefix + root + "/foo.yaml: issue"))
+            cases.append((marker + "/foo.yaml: issue", root + "/foo.yaml: issue"))
+            cases.append(("module.yaml" + read_error + marker + "/foo.yaml",
+                          "module.yaml" + read_error + root + "/foo.yaml"))
+            cases.append(("module.yaml" + read_error + "relative: " + marker + "/foo.yaml",
+                          "module.yaml" + read_error + "relative: " + root + "/foo.yaml"))
+            cases.append(("module.yaml" + read_error + "relative: " + base_root + "/foo.yaml",
+                          "module.yaml" + read_error + "relative: " + root + "/foo.yaml"))
+            cases.append(("module.yaml" + read_error + "relative" + read_error + marker + "/foo.yaml",
+                          "module.yaml" + read_error + "relative" + read_error + root + "/foo.yaml"))
+        cases.extend((
+            ("module.yaml: MissingManifest: issue", "module.yaml: StaleManifest: issue"),
+            ("module.yaml: issue detail one", "module.yaml: issue detail two"),
+        ))
+        with tempfile.TemporaryDirectory(prefix="hub-.github-125-ratchet-", dir=TEMP_PARENT) as directory:
+            before, after = Path(directory) / "base.json", Path(directory) / "head.json"
+            args = ["ratchet", str(before), "1", str(after), "1",
+                    "/audit/base/rulespec-uk", repository, "/audit/base/dependencies", dependencies]
+            for inherited, added in cases:
+                with self.subTest(inherited=inherited, added=added):
+                    before.write_text(json.dumps({"passed": False, "issues": [inherited]}))
+                    after.write_text(json.dumps({"passed": False, "issues": [inherited, added]}))
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as rejection:
+                            exec(code, {"__name__": "__main__"})
+                    self.assertEqual(rejection.exception.code, 1)
+                    self.assertIn("Inherited manifest audit issues: 1", stdout.getvalue())
+                    self.assertIn("New manifest audit issues: 1", stderr.getvalue())
+                    if added.startswith("uk/statutes/"):
+                        self.assertIn(added, stderr.getvalue())
+                    if "relative: " in added:
+                        self.assertIn(added.split(read_error, 1)[1], stderr.getvalue())
+                    self.assertNotIn("Manifest audit ratchet passed", stdout.getvalue())
+            # Checkout relocation changes only actual absolute path fields.
+            for base_root, head_root in ((args[5], repository), (args[7], dependencies)):
+                for prefix in ("", "module.yaml" + read_error,
+                               "module.yaml cannot be read safely: encoder apply manifest is not a regular file: ",
+                               "module.yaml cannot be read safely: encoder apply manifest exceeds the 1048576-byte safety limit: ",
+                               "module.yaml cannot be read safely: Could not safely open encoder apply manifest: "):
+                    with self.subTest(prefix=prefix, root=head_root):
+                        before.write_text(json.dumps({"passed": False, "issues": [prefix + base_root + "/foo: bar.yaml"]}))
+                        after.write_text(json.dumps({"passed": False, "issues": [prefix + head_root + "/foo: bar.yaml"]}))
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            exec(code, {"__name__": "__main__"})
+                        self.assertIn("Inherited manifest audit issues: 1", stdout.getvalue())
+                        self.assertIn("Manifest audit ratchet passed: no new issues.", stdout.getvalue())
+                        self.assertEqual(stderr.getvalue(), "")
+
     def test_audit_integrity_failure_prevents_consumption_inside_status_capture(self):
         result, calls = run_guard(integrity_fail_after=2)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
