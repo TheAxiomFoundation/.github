@@ -546,7 +546,9 @@ class GuardDecisionTests(unittest.TestCase):
             # A stale event merge still has a regular manifest but wrong base.
             stale = git(fixture.root, "commit-tree", f"{head}^{{tree}}", "-p", fixture.base, "-p", head, "-m", "Stale test merge")
             self.assert_pass(fixture.run(head, merge=stale))
-            self.assert_fail(fixture.run(head, base=advanced, merge=stale))
+            result = fixture.run(head, base=advanced, merge=stale)
+            self.assert_fail(result)
+            self.assertIn("Missing encoder apply manifests: 1", result.stderr)
             self.assert_fail(fixture.run(head, merge="not-a-sha"))
 
     def test_event_merge_for_an_earlier_head_is_replaced_by_the_current_merge(self):
@@ -571,7 +573,25 @@ class GuardDecisionTests(unittest.TestCase):
             git(fixture.root, "checkout", "-q", "--detach", earlier)
             (fixture.root / manifest).unlink()
             removed = fixture.head()
-            self.assert_fail(fixture.run(removed, merge=earlier_merge))
+            result = fixture.run(removed, merge=earlier_merge)
+            self.assert_fail(result)
+            self.assertIn("Missing encoder apply manifests: 1", result.stderr)
+
+    def test_event_merge_that_is_not_available_is_replaced_by_the_current_merge(self):
+        # A re-run reuses its event; GitHub may no longer serve a superseded merge.
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        missing = "0" * 40
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: head\n")
+            head = fixture.head()
+            self.assert_pass(fixture.run(head, merge=missing))
+            git(fixture.root, "checkout", "-q", "--detach", head)
+            (fixture.root / manifest).unlink()
+            removed = fixture.head()
+            result = fixture.run(removed, merge=missing)
+            self.assert_fail(result)
+            self.assertIn("Missing encoder apply manifests: 1", result.stderr)
 
     def test_jurisdiction_retirement_receipt_uses_relative_module_path(self):
         module = "us/statutes/item.yaml"
@@ -1376,8 +1396,9 @@ class WorkflowSecurityTests(unittest.TestCase):
     def test_head_is_only_fetched_and_guard_uses_isolated_standard_library_python(self):
         workflow = document(WORKFLOW)
         fetch = step(workflow, "Fetch candidate and event merge commits as Git objects only")
-        self.assertIn('for revision in "$HEAD_SHA" "$MERGE_SHA"', fetch["run"])
-        self.assertIn('fetch --no-tags --no-recurse-submodules origin "$revision"', fetch["run"])
+        self.assertIn('fetch_commit "$HEAD_SHA"\n', fetch["run"])
+        self.assertIn('if [ -n "$MERGE_SHA" ] && ! fetch_commit "$MERGE_SHA"; then', fetch["run"])
+        self.assertIn('fetch --no-tags --no-recurse-submodules origin "$1"', fetch["run"])
         self.assertEqual(fetch["env"]["HEAD_SHA"], "${{ steps.revisions.outputs.head-sha }}")
         self.assertEqual(fetch["env"]["MERGE_SHA"], "${{ steps.revisions.outputs.merge-sha }}")
         guard = step(workflow, GUARD_STEP)
