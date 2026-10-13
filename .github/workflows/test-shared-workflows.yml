@@ -1,35 +1,12 @@
 name: Test shared workflows
 
+# No path filters: this job is meant to be the required check on main, and
+# GitHub leaves a required check pending, blocking the merge, when path
+# filtering skips its workflow. Every pull request and every push to main runs it.
 on:
   pull_request:
-    paths:
-      - ".github/workflows/**"
-      - "scripts/test_legacy_oracle_coverage_workflow.py"
-      - "scripts/test_validate_rulespec_workflow.py"
-      - "scripts/test_composer_verification_workflow.py"
-      - "scripts/test_external_dependency_layout.py"
-      - "scripts/test_dependency_integrity_workflow.py"
-      - "scripts/test_legacy_encoder_waiver_workflow.py"
-      - "scripts/test_pin_bump_manifest_workflow.py"
-      - "tests/test_encoder_guard_workflow.py"
-      - "workflow-templates/encoder-guard-caller.yml"
-      - "rulesets/rulespec-encoder-guard.json"
-      - "README.md"
   push:
     branches: [main]
-    paths:
-      - ".github/workflows/**"
-      - "scripts/test_legacy_oracle_coverage_workflow.py"
-      - "scripts/test_validate_rulespec_workflow.py"
-      - "scripts/test_composer_verification_workflow.py"
-      - "scripts/test_external_dependency_layout.py"
-      - "scripts/test_dependency_integrity_workflow.py"
-      - "scripts/test_legacy_encoder_waiver_workflow.py"
-      - "scripts/test_pin_bump_manifest_workflow.py"
-      - "tests/test_encoder_guard_workflow.py"
-      - "workflow-templates/encoder-guard-caller.yml"
-      - "rulesets/rulespec-encoder-guard.json"
-      - "README.md"
 
 permissions:
   contents: read
@@ -37,6 +14,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung run would otherwise hold a required check pending for six hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
