@@ -251,22 +251,36 @@ compares the pin source, the full table, and the entire `.github/workflows/` Git
 tree, including each entry's mode, type and object ID. Every workflow addition,
 edit, move or deletion is therefore a configuration change, including another
 caller of the shared validator. Malformed or nonregular TOML and invalid literal
-pins fail closed. No candidate YAML, workflow expression or head code is
-evaluated to discover callers.
+pins fail closed. Candidate caller YAML is inspected as restricted data;
+workflow expressions and head code are never executed to discover callers.
 
-Initialization compatibility applies only when neither a canonical caller nor
-workflow-toolchain TOML has ever appeared in the trusted base's complete reachable
-ancestry. The history scan includes merged branches; shallow or unreadable
-history fails closed. Once TOML has appeared, it must remain a regular blob.
-Once a canonical caller has appeared, at least one canonical `.yml` or `.yaml`
-caller, or workflow-toolchain TOML, must remain. A caller-only rename outside
-those paths is rejected even without content changes. An isolated move between
-the canonical extensions or migration to TOML is allowed. Absence in both base
-and merge result cannot restore initialization compatibility after either source
-has established protection.
+Every PR to a targeted repository must retain an operative shared-validator call in the canonical
+`repository-checks.yml` or `.yaml` caller, with all four binding inputs.
+The guard rejects a local stub, caller rename, conditional validation job,
+missing binding input, or disabled generated guard even in a configuration-only
+PR. A table cannot replace this operative call. A changed validator pin must
+advance along this source repository's first-parent `main` history: older
+commits and commits from merged side branches are rejected. The selected
+validator source must contain the isolated effective-input binding check.
+Adoption therefore requires a binding-capable shared validator on the protected
+base; the guard does not supply that check to old shared-validator revisions.
+Canonical caller updates preserve the protected caller's remaining bytes;
+only admitted validator and binding pin scalars may change. This prevents
+unrelated malformed YAML or helper edits from disabling workflow loading.
+Adoption must start from a tested, valid canonical caller. Initial caller
+establishment uses the guard's supported minimal direct-call form.
 
-Restore any missing established source on the protected branch before adoption;
-ordinary PR validation fails while its trusted base lacks that source.
+Native events in `TheAxiomFoundation/.github`, which the ruleset excludes,
+omit only this caller requirement when the complete proposed tree contains no
+validation content or provenance and no canonical caller or workflow-toolchain
+TOML exists now or anywhere in protected history. Manifest checks still run.
+
+The history scan includes merged branches; shallow or unreadable history fails
+closed. Once TOML has appeared, it must remain a regular blob. An isolated move
+between the canonical extensions is supported while retaining the operative
+call. An initial PR must establish that call; repository creation retains the
+ruleset's separate `do_not_enforce_on_create` behavior. Restore missing
+established sources on the protected branch before adoption.
 
 **Pin changes must be their own pull request.** A pin source, pin value, or
 workflow-tree change cannot share a PR with any changed content under
@@ -297,14 +311,29 @@ hosted evidence that this context identifies the intended caller. See
 Callers must pin a shared validator revision containing this check. It adds no
 encoder command requirement for older encoder pins.
 
-Pin-only configuration PRs must continue supplying the protected base's inputs
-until their new configuration is merged. A caller that reads pins from candidate
-TOML must first support reading that exact protected base for PR validation.
-Then callers may supply the newly protected pins after merge. Adopters must
-verify full repository revalidation in both stages at their exact shared
-validator SHA; the guard's presence check does not provide that behavior.
-These local checks do not establish the external encoder's manifest-admission
-policy.
+Content-free updates limited to the workflow-toolchain table and canonical
+caller may supply either the base or proposed inputs. The shared validator
+reads the proposed configuration from the exact event commit's Git objects,
+checks the effective inputs, and passes the resolved proposed refs to dependency
+checkout and every later consumer. Content or helper changes retain exact
+protected-base binding. Both literal-caller and table-only pin updates select
+`full-toolchain-bump`, revalidating every module and companion at the proposed
+pins before merge. The supervised generated guard also receives `--all` in this
+mode, auditing
+unchanged modules and manifests before module validation. Existing manifests
+must satisfy the proposed encoder's signature and execution-identity contracts;
+an arbitrary encoder upgrade does not guarantee admission of older manifests.
+Staged inactive composer pins remain inactive for older
+encoder callers. These local checks do not establish the external encoder's
+manifest-admission policy.
+
+Toolchain installers run outside the candidate checkout with isolated Python
+imports and isolated pip configuration. Authenticated dependency sources are
+checked by full-tree integrity checks after installation and immediately before
+later consumers, including supervisor build and provisioning. A changed HEAD
+is not required to detect source drift. The local regression injects candidate
+`pip.py` that replaces real supervisor and provisioner inputs and verifies that
+it never executes; separate drift probes require rejection before consumption.
 
 Module selection compares the exact event base with the proposed merge result,
 so candidate edits are checked at their final paths after any base-side rename,
@@ -375,8 +404,12 @@ adoption work; passing local fixtures does not complete these items.
   no caller workflow (caller-free). Pin the intended source workflow SHA and
   confirm the required workflow runs and governs the merge decision. A module
   change without a manifest must be blocked; a valid encoded change must pass.
-  Removing the caller and adding a counterfeit named job must not bypass the
-  pinned workflow identity.
+  Removing the optional guard caller and adding a counterfeit named job must
+  not bypass the pinned workflow identity. Separately replace the canonical
+  validator call with a successful named local job and attempt an older or
+  off-main validator pin; each configuration-only PR must be blocked. Repeat
+  a later manifested module/helper edit with each unsafe base in a disposable
+  sandbox and retain the hosted merge decisions.
 - [ ] Exercise the same-head retarget case in that sandbox: open against an
   alternate base, retarget to the default branch, and verify that a prior pass
   cannot authorize the newly guarded change. Confirm the supported head-update
@@ -425,12 +458,13 @@ adoption work; passing local fixtures does not complete these items.
   Retain both the required workflow and shared validator SHAs with the run
   results and merge decisions.
 - [ ] Run an explicit pin-only full-revalidation case: change only a toolchain
-  pin while leaving unchanged modules and manifests in place. Continue supplying
-  the protected base's inputs for that PR. Confirm every unchanged module and its
-  manifest is revalidated. After merge, supply the newly protected inputs and
-  confirm full revalidation at the new pin, including
-  rejection of an unchanged module or manifest that violates its policy. Retain
-  the exact validator SHA, selected target inventories and both hosted runs.
+  pin while leaving unchanged modules and manifests in place. Exercise both a
+  literal caller update and a table-only update with base inputs. Confirm every
+  unchanged module and companion is selected and its manifest is revalidated
+  at the proposed pin before merge. After merge, supply the newly protected
+  inputs and confirm full revalidation at the new pin, including rejection of
+  an unchanged module or manifest that violates its policy. Retain the exact
+  validator SHA, selected target inventories and both hosted runs.
 - [ ] Keep `do_not_enforce_on_create: true` and test repository initialization
   in the sandbox; required workflows cannot run while a repository is being
   initialized. Replace the zero-SHA placeholder only with the reviewed release

@@ -13,7 +13,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/validate-rul
 class ComposerWorkflowTests(unittest.TestCase):
     def test_pin_admission(self):
         text = WORKFLOW.read_text()
-        source = text.split("python - <<'PYCOMPOSE'\n", 1)[1].split('          PYCOMPOSE', 1)[0]
+        source = text.split("python -I - <<'PYCOMPOSE'\n", 1)[1].split('          PYCOMPOSE', 1)[0]
         source = textwrap.dedent(source)
         spec = importlib.util.spec_from_file_location(
             'validator_tests', WORKFLOW.parents[2] / 'scripts/test_validate_rulespec_workflow.py',

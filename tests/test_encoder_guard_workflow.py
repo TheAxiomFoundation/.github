@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import atexit
 import fnmatch
 import json
 import os
@@ -62,9 +63,13 @@ def git(root: Path, *args: str) -> str:
 class Fixture:
     """Only fixture commits change; the shared workspace's Git history stays intact."""
 
+    shared_validator_history = None
+
     def __init__(self, initial: dict[str, str] | None = None):
         self.temporary = temporary_fixture_directory()
         self.root = Path(self.temporary.name)
+        self.validator_temporary = None
+        self.validator_pins = {}
         git(self.root, "init", "-q")
         git(self.root, "config", "user.name", "Encoder guard fixture")
         git(self.root, "config", "user.email", "fixture@example.invalid")
@@ -72,6 +77,20 @@ class Fixture:
         self.write("README.md", "Fixture only.\n")
         self.write(".github/workflows/trusted-guard.yml", WORKFLOW.read_text())
         self.write(".github/workflows/encoder-guard.yml", CALLER.read_text())
+        self.establish_validator_history()
+        if not any(path in (initial or {}) for path in (
+            ".github/workflows/repository-checks.yml", ".github/workflows/repository-checks.yaml",
+        )):
+            self.write(".github/workflows/repository-checks.yml", (
+                "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
+                f"    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@{self.validator_pins['binding']}\n"
+                "    with:\n" + "".join(
+                    f"      {key}: {value * 40}\n" for key, value in (
+                        ("axiom-encode-ref", "8"), ("axiom-rules-engine-ref", "3"),
+                        ("axiom-corpus-ref", "6"), ("rulespec-us-ref", "7"),
+                    )
+                )
+            ))
         for path, content in (initial or {}).items():
             self.write(path, content)
         self.base = self.commit("Base fixture")
@@ -83,7 +102,50 @@ class Fixture:
     def __exit__(self, *_):
         self.temporary.cleanup()
 
+    def establish_validator_history(self) -> None:
+        """Trusted source main includes an old validator and a merged side branch."""
+        if Fixture.shared_validator_history is not None:
+            self.validator_temporary, self.validator_root, self.validator_pins = Fixture.shared_validator_history
+            return
+        self.validator_temporary = temporary_fixture_directory()
+        self.validator_root = Path(self.validator_temporary.name)
+        git(self.validator_root, "init", "-q", "-b", "main")
+        git(self.validator_root, "config", "user.name", "Validator source fixture")
+        git(self.validator_root, "config", "user.email", "fixture@example.invalid")
+        git(self.validator_root, "config", "commit.gpgsign", "false")
+        validator = self.validator_root / ".github/workflows/validate-rulespec.yml"
+        validator.parent.mkdir(parents=True)
+        validator.write_text("name: Legacy syntax check\njobs: {}\n")
+        git(self.validator_root, "add", "-A")
+        git(self.validator_root, "commit", "-qm", "Legacy validator without protected binding")
+        self.validator_pins["legacy"] = git(self.validator_root, "rev-parse", "HEAD")
+        validator.write_text((ROOT / ".github/workflows/validate-rulespec.yml").read_text())
+        git(self.validator_root, "add", "-A")
+        git(self.validator_root, "commit", "-qm", "Validator with protected input binding")
+        self.validator_pins["binding"] = git(self.validator_root, "rev-parse", "HEAD")
+        git(self.validator_root, "checkout", "-qb", "side")
+        (self.validator_root / "side.txt").write_text("Side branch validator revision.\n")
+        git(self.validator_root, "add", "-A")
+        git(self.validator_root, "commit", "-qm", "Side branch revision")
+        self.validator_pins["side"] = git(self.validator_root, "rev-parse", "HEAD")
+        git(self.validator_root, "checkout", "-q", "main")
+        (self.validator_root / "main.txt").write_text("Main validator revision.\n")
+        git(self.validator_root, "add", "-A")
+        git(self.validator_root, "commit", "-qm", "Later main validator revision")
+        self.validator_pins["newer"] = git(self.validator_root, "rev-parse", "HEAD")
+        git(self.validator_root, "merge", "--no-ff", "-qm", "Merge side revision", "side")
+        self.validator_pins["main"] = git(self.validator_root, "rev-parse", "HEAD")
+        Fixture.shared_validator_history = (self.validator_temporary, self.validator_root, self.validator_pins)
+        atexit.register(self.validator_temporary.cleanup)
+
     def write(self, path: str, content: str = "fixture: data\n") -> Path:
+        if self.validator_pins and path in (
+            ".github/workflows/repository-checks.yml", ".github/workflows/repository-checks.yaml",
+        ):
+            content = content.replace(
+                "validate-rulespec.yml@" + "a" * 40,
+                "validate-rulespec.yml@" + self.validator_pins["binding"],
+            )
         destination = self.root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(content)
@@ -103,14 +165,17 @@ class Fixture:
         git(self.root, "checkout", "--detach", "-q", self.base)
         return head
 
-    def run(self, head: str, *, base: str | None = None, merge: str = "", event: str = "pull_request") -> subprocess.CompletedProcess[str]:
+    def run(self, head: str, *, base: str | None = None, merge: str = "", event: str = "pull_request", repository: str = "TheAxiomFoundation/rulespec-fixture") -> subprocess.CompletedProcess[str]:
         global GUARD_EVALUATIONS
         GUARD_EVALUATIONS += 1
         # Extract executable code from BASE, never from the candidate tree.
         trusted = yaml.safe_load(git(self.root, "show", f"{self.base}:.github/workflows/trusted-guard.yml"))
+        source_env = {} if self.validator_temporary is None else {
+            "VALIDATOR_GIT_DIR": str(self.validator_root / ".git"),
+        }
         return subprocess.run(
             [sys.executable, "-I", "-c", source(trusted)], cwd=self.root,
-            env={**os.environ, "BASE_SHA": self.base if base is None else base, "HEAD_SHA": head, "MERGE_SHA": merge, "EVENT_NAME": event},
+            env={**os.environ, **source_env, "BASE_SHA": self.base if base is None else base, "HEAD_SHA": head, "MERGE_SHA": merge, "EVENT_NAME": event, "DEFAULT_BRANCH": "main", "REPOSITORY": repository},
             capture_output=True, text=True,
         )
 
@@ -564,6 +629,9 @@ class ValidationPinTests(unittest.TestCase):
             "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
             f"    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@{validator}\n"
             f"    with:\n      axiom-encode-ref: {encoder}\n"
+            f"      axiom-rules-engine-ref: {'3' * 40}\n"
+            f"      axiom-corpus-ref: {'6' * 40}\n"
+            f"      rulespec-us-ref: {'7' * 40}\n"
         )
 
     def initial(self, *, literal: bool = False) -> dict[str, str]:
@@ -846,16 +914,293 @@ class ValidationPinTests(unittest.TestCase):
                         self.VALIDATION_CALLER.removesuffix(".yml") + ".yaml")
                 else:
                     fixture.write(self.TOOLCHAIN, self.toolchain(self.BASE_PIN))
-                    (fixture.root / self.VALIDATION_CALLER).unlink()
                 self.assert_pass(fixture.run(fixture.head()))
+
+    def test_toml_migration_cannot_delete_the_operative_canonical_validator(self):
+        with Fixture({self.VALIDATION_CALLER: self.caller(self.BASE_PIN)}) as fixture:
+            fixture.write(self.TOOLCHAIN, self.toolchain(self.BASE_PIN))
+            (fixture.root / self.VALIDATION_CALLER).unlink()
+            result = fixture.run(fixture.head())
+            self.assert_fail(result)
+            self.assertIn("operative canonical validator", result.stderr.lower())
 
     def test_never_established_source_preserves_initialization(self):
         with Fixture() as fixture:
+            # Bootstrap is a PR adding an operative caller to a truly empty
+            # protected history. Branch creation itself is exempt in the ruleset.
+            git(fixture.root, "checkout", "--orphan", "initial-empty-base")
+            git(fixture.root, "rm", "-rf", ".")
+            fixture.write("README.md", "Initialization fixture.\n")
+            fixture.write(".github/workflows/trusted-guard.yml", WORKFLOW.read_text())
+            fixture.base = fixture.commit("Base without established validation")
+            fixture.write(self.VALIDATION_CALLER, self.caller(self.BASE_PIN))
+            bootstrap = fixture.head()
+            self.assert_pass(fixture.run(bootstrap))
+            fixture.base = bootstrap
             self.module(fixture)
             self.assert_pass(fixture.run(fixture.head()))
 
+    def test_never_established_source_still_requires_an_operative_caller_on_every_pr(self):
+        with Fixture() as fixture:
+            git(fixture.root, "checkout", "--orphan", "initial-empty-base")
+            git(fixture.root, "rm", "-rf", ".")
+            fixture.write("README.md", "Initialization fixture.\n")
+            fixture.write(".github/workflows/trusted-guard.yml", WORKFLOW.read_text())
+            fixture.base = fixture.commit("Base without established validation")
+            self.module(fixture)
+            result = fixture.run(fixture.head())
+            self.assert_fail(result)
+            self.assertIn("operative canonical validator", result.stderr.lower())
+
+
+class EnforcementContinuityTests(unittest.TestCase):
+    """Round-four two-PR probes, including an unsafe first PR forced into base."""
+
+    TOOLCHAIN = ValidationPinTests.TOOLCHAIN
+    VALIDATION_CALLER = ValidationPinTests.VALIDATION_CALLER
+    BASE_PIN = ValidationPinTests.BASE_PIN
+    LOWER_PIN = ValidationPinTests.LOWER_PIN
+    toolchain = staticmethod(ValidationPinTests.toolchain)
+    assert_pass = ValidationPinTests.assert_pass
+    assert_fail = ValidationPinTests.assert_fail
+
+    def prepare(self, fixture: Fixture) -> None:
+        fixture.establish_validator_history()
+        fixture.write(self.VALIDATION_CALLER, self.complete_caller(fixture.validator_pins["binding"]))
+        fixture.write(self.TOOLCHAIN, self.toolchain(self.BASE_PIN))
+        fixture.write("scripts/read_pin.py", f'print("encoder={self.BASE_PIN}")\n')
+        fixture.write("us/statutes/item.yaml", "fixture: protected module\n")
+        fixture.manifest(".axiom/encoding-manifests/us/statutes/item.json")
+        fixture.base = fixture.commit("Establish canonical protected validator")
+
+    def complete_caller(self, validator: str, **job_fields) -> str:
+        job = {
+            "uses": "TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@" + validator,
+            "with": {
+                "axiom-encode-ref": self.BASE_PIN,
+                "axiom-rules-engine-ref": "3" * 40,
+                "axiom-corpus-ref": "6" * 40,
+                "rulespec-us-ref": "7" * 40,
+                "run-generated-guard": True,
+            },
+            **job_fields,
+        }
+        return yaml.safe_dump({"name": "Repository checks", "on": "pull_request", "jobs": {"validate": job}}, sort_keys=False)
+
+    def test_canonical_stub_two_stage_probe_rejects_both_prs(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            fixture.write(self.VALIDATION_CALLER, yaml.safe_dump({
+                "name": "Repository checks", "on": "pull_request",
+                "jobs": {"validate": {"runs-on": "ubuntu-latest", "steps": [
+                    {"run": "python -I scripts/read_pin.py"},
+                ]}},
+            }, sort_keys=False))
+            pr1 = fixture.commit("Replace canonical validator with always-successful local job")
+            first = fixture.run(pr1)
+            fixture.base = pr1
+            fixture.write("scripts/read_pin.py", f'print("encoder={self.LOWER_PIN}")\n')
+            fixture.write("us/statutes/item.yaml", "fixture: candidate module\n")
+            second = fixture.run(fixture.head())
+            self.assert_fail(first)
+            self.assert_fail(second)
+            self.assertIn("operative canonical validator", first.stderr.lower())
+            self.assertIn("operative canonical validator", second.stderr.lower())
+
+    def test_validator_downgrade_two_stage_probe_rejects_both_prs(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            fixture.write(self.VALIDATION_CALLER, self.complete_caller(fixture.validator_pins["legacy"]))
+            pr1 = fixture.commit("Downgrade shared validator without changing modules")
+            first = fixture.run(pr1)
+            fixture.base = pr1
+            fixture.write("scripts/read_pin.py", f'print("encoder={self.LOWER_PIN}")\n')
+            fixture.write("us/statutes/item.yaml", "fixture: candidate module\n")
+            second = fixture.run(fixture.head())
+            self.assert_fail(first)
+            self.assert_fail(second)
+            self.assertIn("protected-input binding", first.stderr.lower())
+            self.assertIn("protected-input binding", second.stderr.lower())
+
+    def test_validator_pin_changes_follow_first_parent_main_monotonically(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            for name, passes in (("newer", True), ("side", False)):
+                with self.subTest(revision=name):
+                    git(fixture.root, "checkout", "--detach", "-q", fixture.base)
+                    fixture.write(self.VALIDATION_CALLER, self.complete_caller(fixture.validator_pins[name]))
+                    head = fixture.head()
+                    result = fixture.run(head)
+                    (self.assert_pass if passes else self.assert_fail)(result)
+            git(fixture.root, "checkout", "--detach", "-q", fixture.base)
+            fixture.write(self.VALIDATION_CALLER, self.complete_caller(fixture.validator_pins["newer"]))
+            fixture.base = fixture.commit("Advance base validator pin")
+            fixture.write(self.VALIDATION_CALLER, self.complete_caller(fixture.validator_pins["binding"]))
+            result = fixture.run(fixture.head())
+            self.assert_fail(result)
+            self.assertIn("first-parent main", result.stderr.lower())
+
+    def test_conditional_renamed_and_incomplete_validation_calls_are_rejected(self):
+        changes = ("conditional", "renamed", "missing-ref", "disabled-guard", "duplicate-jobs", "escaped-duplicate-jobs", "conditional-needs", "dispatch-only", "filtered-pr", "flow-filtered-pr", "wrong-branch")
+        for change in changes:
+            with self.subTest(change=change), Fixture() as fixture:
+                self.prepare(fixture)
+                document = yaml.safe_load(self.complete_caller(fixture.validator_pins["binding"]))
+                job = document["jobs"]["validate"]
+                if change == "conditional":
+                    job["if"] = "${{ false }}"
+                elif change == "renamed":
+                    document["jobs"]["counterfeit"] = document["jobs"].pop("validate")
+                elif change == "missing-ref":
+                    del job["with"]["axiom-corpus-ref"]
+                elif change == "disabled-guard":
+                    job["with"]["run-generated-guard"] = False
+                elif change == "conditional-needs":
+                    job["needs"] = "pins"
+                    document["jobs"]["pins"] = {"if": "${{ false }}", "runs-on": "ubuntu-latest", "steps": [{"run": "exit 0"}]}
+                elif change == "dispatch-only":
+                    document["on"] = "workflow_dispatch"
+                elif change == "filtered-pr":
+                    document["on"] = {"pull_request": {"paths": ["README.md"]}}
+                elif change == "wrong-branch":
+                    document["on"] = {"pull_request": {"branches": ["different"]}}
+                candidate = yaml.safe_dump(document, sort_keys=False)
+                if change == "duplicate-jobs":
+                    candidate += "jobs:\n  validate:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n"
+                elif change == "escaped-duplicate-jobs":
+                    candidate += '"\\u006aobs":\n  validate:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n'
+                elif change == "flow-filtered-pr":
+                    candidate = candidate.replace("'on': pull_request", "'on':\n  pull_request: {paths: [README.md]}")
+                fixture.write(self.VALIDATION_CALLER, candidate)
+                self.assert_fail(fixture.run(fixture.head()))
+
+    def test_unconditional_dependency_diamond_preserves_validation(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            document = yaml.safe_load(self.complete_caller(fixture.validator_pins["binding"]))
+            document["jobs"]["validate"]["needs"] = ["first", "second"]
+            for key, dependencies in (("first", "common"), ("second", "common"), ("common", None)):
+                document["jobs"][key] = {"runs-on": "ubuntu-latest", "steps": [{"run": "exit 0"}]}
+                if dependencies is not None:
+                    document["jobs"][key]["needs"] = dependencies
+            fixture.write(self.VALIDATION_CALLER, yaml.safe_dump(document, sort_keys=False))
+            fixture.base = fixture.commit("Protected unconditional dependency diamond")
+            fixture.write("us/statutes/item.yaml", "fixture: candidate module\n")
+            self.assert_pass(fixture.run(fixture.head()))
+
+    def test_malformed_unrelated_job_cannot_start_a_two_stage_enforcement_bypass(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            canonical = self.complete_caller(fixture.validator_pins["binding"])
+            protected = canonical + "  quality:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n"
+            fixture.write(self.VALIDATION_CALLER, protected)
+            fixture.base = fixture.commit("Protected caller with independent quality job")
+            malformed = protected.replace("      - run: exit 0", '      - run: "unterminated')
+            fixture.write(self.VALIDATION_CALLER, malformed)
+            pr1 = fixture.head()
+            first = fixture.run(pr1)
+            self.assert_fail(first)
+            self.assertIn("preserve every other protected caller byte", first.stderr.lower())
+            # A rejected first PR cannot become the protected base. A later
+            # content PR still uses the operative protected canonical workflow.
+            fixture.write("scripts/read_pin.py", f'print("encoder={self.LOWER_PIN}")\n')
+            fixture.write("us/statutes/item.yaml", "fixture: candidate module\n")
+            pr2 = fixture.head()
+            self.assert_pass(fixture.run(pr2))
+            self.assertEqual(git(fixture.root, "show", f"{pr2}:{self.VALIDATION_CALLER}"), protected.strip())
+
+    def test_changed_binding_expressions_cannot_disable_workflow_loading(self):
+        for value in ("${{ invalid::: }}", "${{ needs.missing.outputs.encoder }}"):
+            with self.subTest(value=value), Fixture() as fixture:
+                self.prepare(fixture)
+                caller = yaml.safe_load(self.complete_caller(fixture.validator_pins["binding"]))
+                caller["jobs"]["validate"]["with"]["axiom-encode-ref"] = value
+                fixture.write(self.VALIDATION_CALLER, yaml.safe_dump(caller, sort_keys=False))
+                self.assert_fail(fixture.run(fixture.head()))
+
+    def test_unchanged_protected_expression_can_upgrade_to_a_literal_pin(self):
+        with Fixture() as fixture:
+            self.prepare(fixture)
+            caller = self.complete_caller(fixture.validator_pins["binding"])
+            protected = caller.replace(self.BASE_PIN, "${{ needs.toolchain.outputs.axiom_encode_ref }}")
+            fixture.write(self.VALIDATION_CALLER, protected)
+            fixture.base = fixture.commit("Protected caller with established binding expression")
+            fixture.write(self.VALIDATION_CALLER, caller)
+            self.assert_pass(fixture.run(fixture.head()))
+
+    def test_older_encoder_callers_keep_literal_fallback_and_inactive_composer(self):
+        encoders = (
+            ("a9987a4bc6a58e3f0407972f2e5726b7092b9c4b", False),
+            ("c326d1ac0acdb557f047a3054160b19dd72602fa", True),
+        )
+        for encoder, staged_composer in encoders:
+            with self.subTest(encoder=encoder), Fixture() as fixture:
+                self.prepare(fixture)
+                caller = yaml.safe_load(self.complete_caller(fixture.validator_pins["binding"]))
+                caller["on"] = {"push": {"branches": ["main"]}, "pull_request": {"branches": ["main"]}}
+                caller["jobs"]["validate"]["with"]["axiom-encode-ref"] = encoder
+                if staged_composer:
+                    caller["jobs"]["validate"]["needs"] = "workflow-toolchain"
+                    caller["jobs"]["workflow-toolchain"] = {
+                        "runs-on": "ubuntu-latest", "env": {"AXIOM_COMPOSE_REF": "2" * 40},
+                        "steps": [{"run": "python - <<'PY'\nprint('Staged composer remains inactive')\nPY\n"}],
+                    }
+                fixture.write(self.VALIDATION_CALLER, yaml.safe_dump(caller, sort_keys=False))
+                table = self.toolchain(encoder)
+                if not staged_composer:
+                    table = re.sub(r'(?m)^rulespec_us_ref = .*\n', "", table)
+                fixture.write(self.TOOLCHAIN, table)
+                fixture.base = fixture.commit("Older encoder with current binding validator")
+                fixture.write("us/statutes/item.yaml", "fixture: candidate module\n")
+                self.assert_pass(fixture.run(fixture.head()))
+
+    def test_source_repository_native_events_exempt_only_caller_free_content_free_trees(self):
+        with Fixture() as fixture:
+            git(fixture.root, "checkout", "--orphan", "source-empty-base")
+            git(fixture.root, "rm", "-rf", ".")
+            fixture.write("README.md", "Source repository fixture.\n")
+            fixture.write(".github/workflows/trusted-guard.yml", WORKFLOW.read_text())
+            fixture.base = fixture.commit("Source base without validation content or callers")
+            fixture.write("scripts/source_only.py", "print('Source implementation change')\n")
+            source_only = fixture.head()
+            self.assert_pass(fixture.run(source_only, repository="TheAxiomFoundation/.github"))
+            self.assert_fail(fixture.run(source_only))
+            for path in ("us/statutes/item.yaml", ".axiom/receipts/apply.json"):
+                with self.subTest(path=path):
+                    git(fixture.root, "checkout", "--detach", "-q", fixture.base)
+                    fixture.write(path)
+                    if path.endswith(".yaml"):
+                        fixture.manifest(".axiom/encoding-manifests/us/statutes/item.json")
+                    result = fixture.run(fixture.head(), repository="TheAxiomFoundation/.github")
+                    self.assert_fail(result)
+                    self.assertIn("operative canonical validator", result.stderr.lower())
+            git(fixture.root, "checkout", "--detach", "-q", fixture.base)
+            fixture.write("us/statutes/existing.yaml")
+            fixture.manifest(".axiom/encoding-manifests/us/statutes/existing.json")
+            fixture.base = fixture.commit("Source base contains an unchanged manifested module")
+            fixture.write("README.md", "Source docs-only candidate.\n")
+            unchanged_content = fixture.run(fixture.head(), repository="TheAxiomFoundation/.github")
+            self.assert_fail(unchanged_content)
+            self.assertIn("operative canonical validator", unchanged_content.stderr.lower())
+
 
 class WorkflowSecurityTests(unittest.TestCase):
+    def test_validator_source_fetch_is_bare_transient_and_full_history(self):
+        workflow = document(WORKFLOW)
+        name = "Fetch trusted shared-validator main history as Git objects only"
+        self.assertIn(name, [item.get("name") for item in workflow["jobs"]["guard"]["steps"]])
+        fetch = step(workflow, name)
+        self.assertEqual(fetch["env"]["GH_READ_TOKEN"], "${{ github.token }}")
+        self.assertEqual(fetch["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(fetch["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertIn('init --bare --template= "$VALIDATOR_GIT_DIR"', fetch["run"])
+        self.assertIn("https://github.com/TheAxiomFoundation/.github.git", fetch["run"])
+        self.assertIn("+refs/heads/main:refs/heads/main", fetch["run"])
+        self.assertIn("GIT_CONFIG_VALUE_0=", fetch["run"])
+        self.assertIn("timeout 300 git", fetch["run"])
+        self.assertNotIn("--depth", fetch["run"])
+        self.assertNotIn("--global", fetch["run"])
+
     def test_required_workflow_has_supported_events_read_only_permissions_and_no_opt_out(self):
         workflow = document(WORKFLOW)
         self.assertEqual(events(workflow), {
@@ -903,6 +1248,9 @@ class WorkflowSecurityTests(unittest.TestCase):
             "HEAD_SHA": "${{ steps.revisions.outputs.head-sha }}",
             "MERGE_SHA": "${{ steps.revisions.outputs.merge-sha }}",
             "EVENT_NAME": "${{ github.event_name }}",
+            "VALIDATOR_GIT_DIR": "${{ runner.temp }}/encoder-guard-validator.git",
+            "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+            "REPOSITORY": "${{ github.repository }}",
         })
         imports = re.findall(r"^import (\w+)$", source(workflow), re.MULTILINE)
         self.assertEqual(set(imports), {"json", "os", "re", "subprocess", "sys", "tempfile", "tomllib"})

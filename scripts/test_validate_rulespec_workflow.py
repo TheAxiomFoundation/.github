@@ -37,7 +37,7 @@ def test_corpus_placement_runs_before_supervised_gates_with_step_only_credential
     assert names[index + 1] == "Provision protected verification supervisor"
     install = steps[names.index("Install Python dependencies")]
     assert names.index("Install Python dependencies") < index
-    assert 'python -m pip install -e "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"' in install["run"]
+    assert 'python -I -m pip --isolated install "$RUNNER_TEMP/axiom-encode-install"' in install["run"]
 
     step = steps[index]
     assert step["shell"] == "bash"
@@ -45,7 +45,7 @@ def test_corpus_placement_runs_before_supervised_gates_with_step_only_credential
     assert "${{" not in step["run"]
     assert "/opt/axiom-verification" not in step["run"]
     assert "axiom-encode-signing-supervisor" not in step["run"]
-    assert step["working-directory"] == "${{ github.workspace }}"
+    assert step["working-directory"] == "${{ runner.temp }}"
     assert step["env"]["CORPUS_PATH"] == "${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus"
     assert step["env"]["RELEASE_NAME"] == "${{ steps.toolchain.outputs.axiom_corpus_release }}"
     assert step["env"]["RELEASE_CONTENT_SHA256"] == "${{ steps.toolchain.outputs.axiom_corpus_release_content_sha256 }}"
@@ -154,8 +154,15 @@ def run_corpus_placement(
             "R2_ACCESS_KEY_ID": "fixture-read-access-key" if credentials else "",
             "R2_SECRET_ACCESS_KEY": "fixture-read-secret-key" if credentials else "",
         })
+        # Source integrity has its own real-Git regression suite. This fixture
+        # exercises corpus placement after that precondition using a fake CLI.
+        integrity = root / "integrity.py"
+        integrity.write_text("import sys\nassert sys.argv[1] in {'verify', 'refresh-corpus'}\n")
+        shell = corpus_placement_step()["run"].replace(
+            "/opt/axiom-dependency-integrity/check.py", str(integrity),
+        ).replace('sudo "$(command -v python)" -I', '"$(command -v python)" -I')
         result = subprocess.run(
-            ["bash", "-c", corpus_placement_step()["run"]],
+            ["bash", "-c", shell],
             cwd=workspace,
             env=env,
             capture_output=True,
@@ -270,6 +277,7 @@ def run_workflow_inputs(
     root: Path, base: str, *, pins: dict[str, str] | None = None,
     event: str = "pull_request", head: str | None = None,
     caller_path: str = VALIDATION_CALLER,
+    output: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     actual = {**WORKFLOW_INPUT_PINS, "axiom_compose_ref": "", **(pins or {})}
     environment = {
@@ -290,6 +298,7 @@ def run_workflow_inputs(
         "PYTHON_VERSION": "3.13",
         "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
         "PYTHONPATH": str(root),
+        "GITHUB_OUTPUT": str(output) if output else os.devnull,
     }
     return subprocess.run(
         ["bash", "-c", workflow_input_step()["run"]],
@@ -511,8 +520,8 @@ def test_pin_only_candidate_uses_protected_base_and_landed_pin_uses_new_base() -
         for event in ("pull_request", "pull_request_target", "merge_group"):
             protected = run_workflow_inputs(fixture.root, fixture.base, event=event)
             assert protected.returncode == 0, protected.stderr
-            premature = run_workflow_inputs(fixture.root, fixture.base, pins=changed, event=event)
-            assert premature.returncode != 0
+            proposed = run_workflow_inputs(fixture.root, fixture.base, pins=changed, event=event)
+            assert proposed.returncode == 0, proposed.stderr
         landed = run_workflow_inputs(fixture.root, head, pins=changed, event="push", head=head)
         assert landed.returncode == 0, landed.stderr
 
@@ -560,7 +569,8 @@ def test_workflow_input_protection_precedes_dependency_checkout() -> None:
     assert "python -I - <<'PYPINS'" in step["run"]
     assert steps.index(step) == 3
     assert steps[2]["name"] == "Install the ProgramSpec shape-check parser"
-    assert "python -I -m pip install" in steps[2]["run"]
+    assert "python -I -m pip --isolated install" in steps[2]["run"]
+    assert steps[2]["working-directory"] == "${{ runner.temp }}"
     assert workflow["jobs"]["validate"]["needs"] == "shards"
     assert WORKFLOW.read_text().index("      - name: Validate immutable dependency inputs") < WORKFLOW.read_text().index("      - name: Checkout axiom-encode")
 
@@ -625,6 +635,208 @@ def test_protected_workflow_input_imports_ignore_candidate_python() -> None:
         result = run_workflow_inputs(fixture.root, fixture.base)
         assert result.returncode == 0, result.stderr
         assert not (fixture.root / "candidate-executed").exists()
+SELECTOR_TOOLCHAIN = (
+    '[toolchain]\n'
+    'axiom_corpus_release = "before"\n'
+    f'axiom_corpus_release_content_sha256 = "{"a" * 64}"\n'
+    f'validation_waiver_set_sha256 = "{"b" * 64}"\n'
+)
+SELECTOR_WORKFLOW_TOOLCHAIN = (
+    '[workflow_toolchain]\n'
+    f'axiom_encode_ref = "{"a" * 40}"\n'
+    f'axiom_rules_engine_ref = "{"b" * 40}"\n'
+    f'axiom_compose_ref = "{"c" * 40}"\n'
+)
+SELECTOR_MODULES = ["us/regulations/two.yml", "us/statutes/one.yaml"]
+SELECTOR_COMPANIONS = ["us/regulations/two.test.yml", "us/statutes/one.test.yaml"]
+
+
+def run_validation_targets(
+    changes: dict[str, str], *, event: str = "pull_request"
+) -> tuple[str, list[str], list[str]]:
+    """Execute the workflow's real selector against a synthetic Git diff."""
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    step = next(s for s in steps if s.get("id") == "validation_targets")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+
+        def write(path: str, content: str) -> None:
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+
+        files = {
+            ".axiom/toolchain.toml": SELECTOR_TOOLCHAIN,
+            ".axiom/workflow-toolchain.toml": SELECTOR_WORKFLOW_TOOLCHAIN,
+            "README.md": "before\n",
+            **{path: "fixture\n" for path in SELECTOR_MODULES + SELECTOR_COMPANIONS},
+        }
+        for path, content in files.items():
+            write(path, content)
+        base = commit(root, "selector base")
+        for path, content in changes.items():
+            write(path, content)
+        head = commit(root, "selector head")
+        assert git(root, "diff", "--name-only", base, head).splitlines() == sorted(changes)
+
+        runner_temp = root / "runner-temp"
+        runner_temp.mkdir()
+        output = runner_temp / "output"
+        source = (
+            step["run"]
+            .replace("${{ github.event_name }}", event)
+            .replace("${{ github.event.pull_request.base.sha }}", base)
+        )
+        assert "${{" not in source
+        result = subprocess.run(
+            ["bash", "-c", source],
+            cwd=root,
+            env={
+                **os.environ,
+                "GITHUB_SHA": head,
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_ENV": str(runner_temp / "env"),
+                "GITHUB_OUTPUT": str(output),
+                "VALIDATE_ROOTS": "us",
+                "VALIDATE_ROOTS_INPUT": "auto",
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        mode = dict(line.split("=", 1) for line in output.read_text().splitlines())["mode"]
+        return (
+            mode,
+            (runner_temp / "rulespec-files.txt").read_text().splitlines(),
+            (runner_temp / "rulespec-test-files.txt").read_text().splitlines(),
+        )
+
+
+def test_validation_targets_workflow_toolchain_pin_only_requires_full_validation() -> None:
+    for pin in ("a", "b", "c"):
+        changed = SELECTOR_WORKFLOW_TOOLCHAIN.replace(pin * 40, "d" * 40)
+        assert run_validation_targets({".axiom/workflow-toolchain.toml": changed}) == (
+            "full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS
+        ), pin
+
+    # A corpus-only shortcut must not suppress a workflow dependency re-pin.
+    assert run_validation_targets({
+        ".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace('"before"', '"after"'),
+        ".axiom/workflow-toolchain.toml": changed,
+    }) == ("full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS)
+
+
+def test_validation_targets_preserve_other_path_classifications() -> None:
+    full = ("full-toolchain-bump", SELECTOR_MODULES, SELECTOR_COMPANIONS)
+    corpus_only = SELECTOR_TOOLCHAIN.replace('"before"', '"after"')
+    cases = [
+        ({".github/workflows/validate.yml": "changed\n"}, full),
+        ({".github/workflows/validate.yaml": "changed\n"}, full),
+        ({".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace("b" * 64, "c" * 64)}, full),
+        ({".axiom/toolchain.toml": corpus_only}, ("changed-corpus-toolchain-bump", [], [])),
+        ({"README.md": "changed\n"}, ("changed", [], [])),
+        ({".axiom/other.toml": "changed\n"}, ("changed", [], [])),
+        ({"us/statutes/one.yaml": "changed\n"},
+         ("changed", ["us/statutes/one.yaml"], ["us/statutes/one.test.yaml"])),
+        ({"us/statutes/one.test.yaml": "changed\n"},
+         ("changed", ["us/statutes/one.yaml"], ["us/statutes/one.test.yaml"])),
+        ({".axiom/toolchain.toml": corpus_only, "us/statutes/one.yaml": "changed\n"},
+         ("changed-corpus-toolchain-bump", ["us/statutes/one.yaml"], ["us/statutes/one.test.yaml"])),
+    ]
+    for changes, expected in cases:
+        assert run_validation_targets(changes) == expected, changes
+    assert run_validation_targets({"README.md": "changed\n"}, event="push") == (
+        "full-push", SELECTOR_MODULES, SELECTOR_COMPANIONS
+    )
+
+
+def literal_pin_caller(pins: dict[str, str]) -> str:
+    return (
+        "name: Repository checks\non: pull_request\njobs:\n  validate:\n"
+        "    uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@"
+        + "a" * 40 + "\n    with:\n"
+        + "".join(f"      {key.replace('_', '-')}: '{value}'\n" for key, value in pins.items())
+    )
+
+
+def pin_only_binding_and_selection(*, literal: bool) -> None:
+    """Replay the review's caller/input/selection probes in one Git fixture."""
+    import yaml
+
+    with WorkflowInputFixture(
+        table=workflow_toolchain(WORKFLOW_INPUT_PINS),
+        caller=literal_pin_caller(WORKFLOW_INPUT_PINS),
+    ) as fixture, tempfile.TemporaryDirectory(
+        prefix="hub-.github-125-pin-only-",
+        dir="/private/tmp" if Path("/private/tmp").is_dir() else None,
+    ) as directory:
+        runner_temp = Path(directory)
+        for path in SELECTOR_MODULES + SELECTOR_COMPANIONS:
+            fixture.write(path, "fixture: unchanged\n")
+        for path in SELECTOR_MODULES:
+            fixture.write(".axiom/encoding-manifests/" + path.rsplit(".", 1)[0] + ".json", "{}\n")
+        fixture.base = commit(fixture.root, "base with unchanged modules and companions")
+        proposed = {**WORKFLOW_INPUT_PINS, "axiom_encode_ref": "e" * 40}
+        fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain(proposed))
+        if literal:
+            fixture.write(VALIDATION_CALLER, literal_pin_caller(proposed))
+        head = commit(fixture.root, "content-free pin candidate")
+        output = runner_temp / "binding-output"
+        result = run_workflow_inputs(fixture.root, fixture.base, pins=proposed if literal else None,
+                                     head=head, output=output)
+        assert result.returncode == 0, result.stderr
+        assert output.exists(), "proposed dependency refs were not carried to the validator"
+        bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert all(bound[key] == value for key, value in proposed.items()), bound
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+        select = next(step for step in workflow["jobs"]["validate"]["steps"]
+                      if step.get("id") == "validation_targets")
+        source = select["run"].replace("${{ github.event_name }}", "pull_request").replace(
+            "${{ github.event.pull_request.base.sha }}", fixture.base)
+        selected_output = runner_temp / "selection-output"
+        selected = subprocess.run(["bash", "-c", source], cwd=fixture.root, env={
+            **os.environ, "GITHUB_SHA": head, "RUNNER_TEMP": directory,
+            "GITHUB_ENV": str(runner_temp / "env"), "GITHUB_OUTPUT": str(selected_output),
+            "VALIDATE_ROOTS": "us", "VALIDATE_ROOTS_INPUT": "auto",
+        }, capture_output=True, text=True, timeout=30)
+        assert selected.returncode == 0, selected.stdout + selected.stderr
+        assert "mode=full-toolchain-bump" in selected_output.read_text()
+        assert (runner_temp / "rulespec-files.txt").read_text().splitlines() == SELECTOR_MODULES
+        assert (runner_temp / "rulespec-test-files.txt").read_text().splitlines() == SELECTOR_COMPANIONS
+        # Assert that the verified proposed pins actually reach all dependency
+        # checkout and authentication steps, including optional consumers.
+        for key in (*WORKFLOW_INPUT_PINS, "axiom_compose_ref"):
+            assert workflow["jobs"]["shards"]["outputs"][key] == "${{ steps.dependency_inputs.outputs." + key + " }}"
+        for step in workflow["jobs"]["validate"]["steps"]:
+            if step.get("name", "").startswith("Checkout ") and "TheAxiomFoundation/" in step.get("with", {}).get("repository", ""):
+                assert step["with"]["ref"].startswith("${{ needs.shards.outputs."), step
+
+
+def test_literal_pin_only_binds_proposed_pin_and_selects_every_target() -> None:
+    pin_only_binding_and_selection(literal=True)
+
+
+def test_table_pin_only_binds_proposed_pin_and_selects_every_target() -> None:
+    pin_only_binding_and_selection(literal=False)
+
+
+def test_proposed_pin_exception_rejects_content_and_helper_changes() -> None:
+    for path in ("us/statutes/item.yaml", "us/statutes/item.test.yaml", ".axiom/encoding-manifests/us/statutes/item.json",
+                 "programs/us/item.yaml", "scripts/read_pin.py", "README.md"):
+        with WorkflowInputFixture(table=workflow_toolchain(WORKFLOW_INPUT_PINS)) as fixture:
+            proposed = {**WORKFLOW_INPUT_PINS, "axiom_encode_ref": "e" * 40}
+            fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain(proposed))
+            fixture.write(path, "candidate\n")
+            head = commit(fixture.root, "pin and non-configuration candidate")
+            result = run_workflow_inputs(fixture.root, fixture.base, pins=proposed, head=head)
+            assert result.returncode != 0, path
+            assert "axiom_encode_ref" in result.stderr, result.stderr
 
 
 def authorization_source() -> str:
@@ -632,7 +844,10 @@ def authorization_source() -> str:
     start = workflow.index("# reviewed-migration-authorization-start")
     end = workflow.index("# reviewed-migration-authorization-end")
     block = textwrap.dedent(workflow[start:end].split("\n", 1)[1])
-    marker = "python - <<'PY' >> \"$GITHUB_OUTPUT\"\n"
+    marker = next(marker for marker in (
+        "python -I - <<'PY' >> \"$GITHUB_OUTPUT\"\n",
+        "python - <<'PY' >> \"$GITHUB_OUTPUT\"\n",
+    ) if block.startswith(marker))
     assert block.startswith(marker)
     assert block.endswith("          PY\n") or block.endswith("PY\n")
     source = block[len(marker) :]
@@ -964,7 +1179,7 @@ def test_release_pin_companion_accepts_exact_staged_consumption() -> None:
 def guard_base_ref_source() -> str:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Reject manual RuleSpec changes")
-    end = workflow.index("      - name: Select RuleSpec validation targets")
+    end = workflow.index("      - name: Validate RuleSpec YAML", start)
     step = workflow[start:end]
     block_start = step.index("# generated-guard-base-ref-start")
     block_end = step.index("# generated-guard-base-ref-end")
@@ -981,7 +1196,7 @@ def test_generated_guard_resolves_scheduled_base_to_exact_commit() -> None:
 
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Reject manual RuleSpec changes")
-    end = workflow.index("      - name: Select RuleSpec validation targets")
+    end = workflow.index("      - name: Validate RuleSpec YAML", start)
     step = workflow[start:end]
     assert 'base_ref="HEAD~1"' not in step
     assert '--base-ref "$base_ref"' in step
@@ -1632,6 +1847,9 @@ def test_conflicted_merge_is_rejected() -> None:
 
 
 def main() -> None:
+    test_literal_pin_only_binds_proposed_pin_and_selects_every_target()
+    test_table_pin_only_binds_proposed_pin_and_selects_every_target()
+    test_proposed_pin_exception_rejects_content_and_helper_changes()
     test_indirect_script_encoder_pin_cannot_validate_changed_module()
     test_reusable_workflow_input_default_cannot_validate_changed_module()
     test_reusable_workflow_env_pin_cannot_validate_changed_module()
@@ -1644,6 +1862,9 @@ def main() -> None:
     test_protected_workflow_inputs_reject_untrusted_event_sources()
     test_protected_workflow_input_imports_ignore_candidate_python()
     print("protected effective workflow inputs: 11 regression checks passed")
+    test_validation_targets_workflow_toolchain_pin_only_requires_full_validation()
+    test_validation_targets_preserve_other_path_classifications()
+    print("validation target selection: 14 regression cases passed")
     test_corpus_placement_runs_before_supervised_gates_with_step_only_credentials()
     test_pre_switch_corpus_skips_placement_without_invoking_old_encoder()
     test_post_switch_corpus_rejects_encoder_without_corpus_fetch()

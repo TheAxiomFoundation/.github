@@ -122,8 +122,8 @@ on:
           shape. When true, it additionally requires a tracked encoding
           manifest for each file (no signature is verified), and
           `programs` is guarded as a RuleSpec root rather than merely
-          tolerated as an allowed extra directory. No current encoder tool
-          can produce a ProgramSpec manifest.
+          tolerated as an allowed extra directory. This repository supplies
+          no ProgramSpec manifest producer.
         required: false
         type: boolean
         default: false
@@ -153,6 +153,11 @@ jobs:
       first: ${{ steps.compute.outputs.first }}
       roots: ${{ steps.compute.outputs.roots }}
       allowed-extra: ${{ steps.compute.outputs.allowed-extra }}
+      axiom_encode_ref: ${{ steps.dependency_inputs.outputs.axiom_encode_ref }}
+      axiom_rules_engine_ref: ${{ steps.dependency_inputs.outputs.axiom_rules_engine_ref }}
+      axiom_corpus_ref: ${{ steps.dependency_inputs.outputs.axiom_corpus_ref }}
+      rulespec_us_ref: ${{ steps.dependency_inputs.outputs.rulespec_us_ref }}
+      axiom_compose_ref: ${{ steps.dependency_inputs.outputs.axiom_compose_ref }}
     steps:
       - name: Checkout rules repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -167,9 +172,14 @@ jobs:
           python-version: ${{ inputs.python-version }}
 
       - name: Install the ProgramSpec shape-check parser
-        run: python -I -m pip install --disable-pip-version-check pyyaml==6.0.3
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME
+          python -I -m pip --isolated install --disable-pip-version-check pyyaml==6.0.3
 
       - name: Validate immutable dependency inputs
+        id: dependency_inputs
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -276,8 +286,8 @@ jobs:
           if git("rev-parse", "--is-shallow-repository").strip() != b"false":
               fail("complete protected history is required")
 
-          def protected_blob(path):
-              entries = git("ls-tree", "-z", base, "--", path).split(b"\0")
+          def protected_blob(path, revision):
+              entries = git("ls-tree", "-z", revision, "--", path).split(b"\0")
               entries = [entry for entry in entries if entry]
               if not entries:
                   return None
@@ -289,88 +299,113 @@ jobs:
                   fail(f"protected configuration must be a regular Git blob: {path}")
               return git("cat-file", "blob", oid.decode("ascii"))
 
-          raw = protected_blob(TABLE_PATH)
-          if raw is None and git("log", "--full-history", "--format=%H", base, "--", TABLE_PATH).strip():
-              # Establishment is permanent across the protected ancestry. A
-              # deletion or rename cannot recover initialization compatibility.
-              fail("workflow-toolchain.toml cannot disappear after establishment")
-          pins = {}
-          if raw is not None:
-              try:
-                  payload = tomllib.loads(raw.decode("utf-8"))
-              except (UnicodeError, tomllib.TOMLDecodeError):
-                  fail("protected workflow-toolchain.toml must be valid UTF-8 TOML")
-              pins = payload.get("workflow_toolchain")
-              if set(payload) != {"workflow_toolchain"} or not isinstance(pins, dict) or "axiom_encode_ref" not in pins:
-                  fail("protected configuration requires [workflow_toolchain] with axiom_encode_ref")
-              for key, value in pins.items():
-                  if not isinstance(value, str) or (key.endswith("_ref") and SHA.fullmatch(value) is None):
-                      fail(f"invalid protected workflow toolchain pin: {key}")
+          def configuration_pins(revision):
+              raw = protected_blob(TABLE_PATH, revision)
+              if raw is None and git("log", "--full-history", "--format=%H", revision, "--", TABLE_PATH).strip():
+                  # Establishment is permanent across the protected ancestry. A
+                  # deletion or rename cannot recover initialization compatibility.
+                  fail("workflow-toolchain.toml cannot disappear after establishment")
+              pins = {}
+              if raw is not None:
+                  try:
+                      payload = tomllib.loads(raw.decode("utf-8"))
+                  except (UnicodeError, tomllib.TOMLDecodeError):
+                      fail("protected workflow-toolchain.toml must be valid UTF-8 TOML")
+                  pins = payload.get("workflow_toolchain")
+                  if set(payload) != {"workflow_toolchain"} or not isinstance(pins, dict) or "axiom_encode_ref" not in pins:
+                      fail("protected configuration requires [workflow_toolchain] with axiom_encode_ref")
+                  for key, value in pins.items():
+                      if not isinstance(value, str) or (key.endswith("_ref") and SHA.fullmatch(value) is None):
+                          fail(f"invalid protected workflow toolchain pin: {key}")
 
-          VALIDATOR = re.compile(r"TheAxiomFoundation/\.github/\.github/workflows/validate-rulespec\.ya?ml@[0-9a-f]{40}")
+              VALIDATOR = re.compile(r"TheAxiomFoundation/\.github/\.github/workflows/validate-rulespec\.ya?ml@[0-9a-f]{40}")
 
-          class ProtectedLoader(yaml.SafeLoader):
-              def construct_mapping(self, node, deep=False):
-                  keys = set()
-                  for key_node, _ in node.value:
-                      if key_node.tag == "tag:yaml.org,2002:merge":
-                          fail("protected workflows cannot use ambiguous YAML merge keys")
-                      key = self.construct_object(key_node, deep=True)
-                      try:
-                          if key in keys:
-                              fail("protected workflows cannot contain duplicate YAML keys")
-                          keys.add(key)
-                      except TypeError:
-                          fail("protected workflow mapping keys must be scalar values")
-                  return super().construct_mapping(node, deep=deep)
+              class ProtectedLoader(yaml.SafeLoader):
+                  def construct_mapping(self, node, deep=False):
+                      keys = set()
+                      for key_node, _ in node.value:
+                          if key_node.tag == "tag:yaml.org,2002:merge":
+                              fail("protected workflows cannot use ambiguous YAML merge keys")
+                          key = self.construct_object(key_node, deep=True)
+                          try:
+                              if key in keys:
+                                  fail("protected workflows cannot contain duplicate YAML keys")
+                              keys.add(key)
+                          except TypeError:
+                              fail("protected workflow mapping keys must be scalar values")
+                      return super().construct_mapping(node, deep=deep)
 
-          def workflow_jobs(raw, path):
-              try:
-                  payload = yaml.load(raw.decode("utf-8"), Loader=ProtectedLoader)
-              except (UnicodeError, yaml.YAMLError):
-                  fail(f"protected workflow must be valid UTF-8 YAML: {path}")
-              if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), dict):
-                  fail(f"protected workflow must contain a jobs mapping: {path}")
-              jobs = list(payload["jobs"].values())
-              if any(not isinstance(job, dict) for job in jobs):
-                  fail(f"protected workflow jobs must be mappings: {path}")
-              return jobs
+              def workflow_jobs(raw, path):
+                  try:
+                      payload = yaml.load(raw.decode("utf-8"), Loader=ProtectedLoader)
+                  except (UnicodeError, yaml.YAMLError):
+                      fail(f"protected workflow must be valid UTF-8 YAML: {path}")
+                  if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), dict):
+                      fail(f"protected workflow must contain a jobs mapping: {path}")
+                  jobs = list(payload["jobs"].values())
+                  if any(not isinstance(job, dict) for job in jobs):
+                      fail(f"protected workflow jobs must be mappings: {path}")
+                  return jobs
 
-          caller_values = {}
-          direct_caller = False
-          opaque_caller = False
-          for path in CALLER_PATHS:
-              caller = protected_blob(path)
-              if caller is None:
-                  continue
-              for job in workflow_jobs(caller, path):
-                  uses = job.get("uses", "")
-                  if not isinstance(uses, str):
-                      fail(f"protected caller uses must be a string: {path}")
-                  if not VALIDATOR.fullmatch(uses):
-                      opaque_caller |= bool(uses)
+              caller_values = {}
+              direct_caller = False
+              opaque_caller = False
+              for path in CALLER_PATHS:
+                  caller = protected_blob(path, revision)
+                  if caller is None:
                       continue
-                  direct_caller = True
-                  supplied = job.get("with", {})
-                  if not isinstance(supplied, dict):
-                      fail(f"protected validator inputs must be a mapping: {path}")
-                  for key, value in supplied.items():
-                      if isinstance(key, str):
-                          caller_values.setdefault(key.replace("-", "_"), []).append(str(value) if value is not None else "")
+                  for job in workflow_jobs(caller, path):
+                      uses = job.get("uses", "")
+                      if not isinstance(uses, str):
+                          fail(f"protected caller uses must be a string: {path}")
+                      if not VALIDATOR.fullmatch(uses):
+                          opaque_caller |= bool(uses)
+                          continue
+                      direct_caller = True
+                      supplied = job.get("with", {})
+                      if not isinstance(supplied, dict):
+                          fail(f"protected validator inputs must be a mapping: {path}")
+                      for key, value in supplied.items():
+                          if isinstance(key, str):
+                              caller_values.setdefault(key.replace("-", "_"), []).append(str(value) if value is not None else "")
 
-          def protected_pin(key):
-              if key in pins:
-                  return pins[key]
-              # Older callers may precede the table or omit a newer table key.
-              # Only an unambiguous trusted canonical literal is compatible.
-              values = caller_values.get(key, [])
-              if len(values) != 1 or SHA.fullmatch(values[0]) is None:
-                  fail(f"{key} requires a protected table pin or canonical literal input")
-              return values[0]
+              def protected_pin(key):
+                  if key in pins:
+                      return pins[key]
+                  # Older callers may precede the table or omit a newer table key.
+                  # Only an unambiguous trusted canonical literal is compatible.
+                  values = caller_values.get(key, [])
+                  if len(values) != 1 or SHA.fullmatch(values[0]) is None:
+                      fail(f"{key} requires a protected table pin or canonical literal input")
+                  return values[0]
 
+              return protected_pin, pins, caller_values, direct_caller, opaque_caller
+
+          protected_pin, pins, caller_values, direct_caller, opaque_caller = configuration_pins(base)
+          base_inputs = {key: protected_pin(key) for key in INPUTS}
+          base_compose = pins.get("axiom_compose_ref", "")
+          configuration = base
+          # Only a content-free update of the canonical configuration can test
+          # proposed pins. Every other path keeps exact protected-base binding.
+          # Git objects describe the checked-out event merge, never working files.
+          if event in ("pull_request", "pull_request_target", "merge_group"):
+              candidate = os.environ["CURRENT_SHA"]
+              if SHA.fullmatch(candidate) is None or git("cat-file", "-t", candidate).strip() != b"commit":
+                  fail("the event must identify an available exact validation commit")
+              changed = {os.fsdecode(path) for path in git(
+                  "diff", "--name-only", "-z", "--no-renames", base, candidate,
+              ).split(b"\0") if path}
+              if changed and changed <= {TABLE_PATH, *CALLER_PATHS}:
+                  git("merge-base", "--is-ancestor", base, candidate)
+                  configuration = candidate
+                  protected_pin, pins, caller_values, direct_caller, opaque_caller = configuration_pins(configuration)
+          resolved = {}
           for key, environment in INPUTS.items():
-              if os.environ[environment] != protected_pin(key):
+              proposed = protected_pin(key)
+              allowed = {base_inputs[key], proposed} if configuration != base else {proposed}
+              if os.environ[environment] not in allowed:
                   fail(f"effective {key} must match the protected configuration")
+              resolved[key] = proposed
           compose = os.environ["AXIOM_COMPOSE_REF"]
           compose_enabled = any(caller_values.get("axiom_compose_ref", []))
           if not compose and "axiom_compose_ref" in pins:
@@ -390,8 +425,15 @@ jobs:
               fail("effective axiom_compose_ref cannot disable the protected composer input")
           if compose and "axiom_compose_ref" not in pins:
               fail("effective axiom_compose_ref requires an explicit protected workflow-toolchain.toml pin")
-          if compose and (SHA.fullmatch(compose) is None or compose != protected_pin("axiom_compose_ref")):
+          if compose and (SHA.fullmatch(compose) is None or compose not in (
+              {base_compose, protected_pin("axiom_compose_ref")} if configuration != base
+              else {protected_pin("axiom_compose_ref")}
+          )):
               fail("effective axiom_compose_ref must match the protected configuration")
+          resolved["axiom_compose_ref"] = protected_pin("axiom_compose_ref") if compose else ""
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in resolved.items():
+                  output.write(f"{key}={value}\n")
           print("Effective dependency inputs match the protected workflow configuration.")
           PYPINS
 
@@ -413,7 +455,7 @@ jobs:
             if [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
               git diff --name-only -z --no-renames --diff-filter=ACMRTD "$BASE_SHA" "$GITHUB_SHA"
             fi
-          } | python3 -c '
+          } | python3 -I -c '
           import os
           import sys
 
@@ -478,7 +520,7 @@ jobs:
           # below). A caller that sets `guard-programs-root: true` also gets
           # the legacy manifest check on `programs/`. That check verifies no
           # signature (a tracked manifest at the mirrored path suffices), and
-          # no current encoder tool can produce a ProgramSpec manifest.
+          # this repository supplies no ProgramSpec manifest producer.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -499,7 +541,7 @@ jobs:
             SCAN_MODE="none"
           fi
           export BASE_SHA SCAN_MODE
-          python3 <<'PY'
+          python3 -I <<'PY'
           import hashlib
           import json
           import os
@@ -1209,7 +1251,7 @@ jobs:
               EVENT_NAME="$EVENT_NAME" \
               PR_BASE_SHA="$PR_BASE_SHA" \
               HEAD_SHA="$HEAD_SHA" \
-              python3 <<'PY'
+              python3 -I <<'PY'
           import os
           import subprocess
           import sys
@@ -1289,7 +1331,7 @@ jobs:
             fi
             allowed_extra="sources"
           fi
-          matrix=$(printf '%s\n' "${shards[@]}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          matrix=$(printf '%s\n' "${shards[@]}" | python3 -I -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
           {
             echo "matrix=$matrix"
             echo "first=${shards[0]}"
@@ -1304,6 +1346,9 @@ jobs:
     # leg with behavior identical to the pre-shard workflow.
     name: validate
     needs: shards
+    env:
+      # Read-only Git consumers must not refresh dependency index metadata.
+      GIT_OPTIONAL_LOCKS: "0"
     runs-on: ubuntu-latest
     # Hosted runners default to 360 minutes. From 2026-09-12 to 09-29,
     # 1,298 green rulespec-us legs took p50 23, p99 131, max 153 minutes.
@@ -1355,7 +1400,7 @@ jobs:
         run: |
           set -euo pipefail
           # reviewed-migration-authorization-start
-          python - <<'PY' >> "$GITHUB_OUTPUT"
+          python -I - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
           import re
@@ -1519,7 +1564,7 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python -I - <<'PY'
           import os
           import re
           import subprocess
@@ -1629,7 +1674,7 @@ jobs:
           stage="$(mktemp -d "$GITHUB_WORKSPACE/.axiom-dependency-stage.XXXXXXXX")"
           tools="$(mktemp -d "$RUNNER_TEMP/axiom-dependencies.XXXXXXXX")"
           export stage tools
-          python - <<'PYLAYOUT'
+          python -I - <<'PYLAYOUT'
           import os
           from pathlib import Path
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
@@ -1645,7 +1690,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-encode
-          ref: ${{ inputs.axiom-encode-ref }}
+          ref: ${{ needs.shards.outputs.axiom_encode_ref }}
           path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-encode
           persist-credentials: false
 
@@ -1665,7 +1710,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-rules-engine
-          ref: ${{ inputs.axiom-rules-engine-ref }}
+          ref: ${{ needs.shards.outputs.axiom_rules_engine_ref }}
           path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-rules-engine
           persist-credentials: false
 
@@ -1685,7 +1730,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-corpus
-          ref: ${{ inputs.axiom-corpus-ref }}
+          ref: ${{ needs.shards.outputs.axiom_corpus_ref }}
           path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-corpus
           persist-credentials: false
 
@@ -1705,7 +1750,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/rulespec-us
-          ref: ${{ inputs.rulespec-us-ref }}
+          ref: ${{ needs.shards.outputs.rulespec_us_ref }}
           path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/rulespec-us
           persist-credentials: false
 
@@ -1724,10 +1769,10 @@ jobs:
       - name: Authenticate dependency commits
         shell: bash
         env:
-          AXIOM_ENCODE_SHA: ${{ inputs.axiom-encode-ref }}
-          AXIOM_RULES_ENGINE_SHA: ${{ inputs.axiom-rules-engine-ref }}
-          AXIOM_CORPUS_SHA: ${{ inputs.axiom-corpus-ref }}
-          RULESPEC_US_SHA: ${{ inputs.rulespec-us-ref }}
+          AXIOM_ENCODE_SHA: ${{ needs.shards.outputs.axiom_encode_ref }}
+          AXIOM_RULES_ENGINE_SHA: ${{ needs.shards.outputs.axiom_rules_engine_ref }}
+          AXIOM_CORPUS_SHA: ${{ needs.shards.outputs.axiom_corpus_ref }}
+          RULESPEC_US_SHA: ${{ needs.shards.outputs.rulespec_us_ref }}
         run: |
           set -euo pipefail
           verify_ancestor() {
@@ -1748,13 +1793,13 @@ jobs:
           verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/rulespec-us" "$RULESPEC_US_SHA"
 
       - name: Validate composer pin
-        if: ${{ inputs.axiom-compose-ref != '' }}
+        if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
         env:
-          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
         run: |
           set -euo pipefail
           # composer-pin-validation-start
-          python - <<'PYCOMPOSE'
+          python -I - <<'PYCOMPOSE'
           import os
           import re
 
@@ -1767,17 +1812,17 @@ jobs:
           # composer-pin-validation-end
 
       - name: Checkout axiom-compose
-        if: ${{ inputs.axiom-compose-ref != '' }}
+        if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-compose
-          ref: ${{ inputs.axiom-compose-ref }}
+          ref: ${{ needs.shards.outputs.axiom_compose_ref }}
           path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-compose
           persist-credentials: false
           fetch-depth: 0
 
       - name: Relocate dependency axiom-compose
-        if: ${{ inputs.axiom-compose-ref != '' }}
+        if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1790,9 +1835,9 @@ jobs:
           mv "$source" "$destination"
 
       - name: Authenticate composer commit
-        if: ${{ inputs.axiom-compose-ref != '' }}
+        if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
         env:
-          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
         run: |
           set -euo pipefail
           repo="${AXIOM_DEPENDENCY_ROOT}/axiom-compose"
@@ -1802,8 +1847,149 @@ jobs:
           git -C "$repo" fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
           git -C "$repo" merge-base --is-ancestor "$AXIOM_COMPOSE_REF" refs/remotes/origin/main
 
+      - name: Snapshot authenticated dependency sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          cat > "$RUNNER_TEMP/axiom-dependency-integrity.py" <<'PYINTEGRITY'
+          # dependency-integrity-python-start
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import subprocess
+          import sys
+
+          manifest = Path(__file__).with_name("sources.json")
+
+          def fail(message):
+              raise SystemExit(f"DependencyIntegrityError: {message}")
+
+          def git(root, *args):
+              return subprocess.check_output(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-C", str(root), *args],
+                  env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_OPTIONAL_LOCKS": "0"},
+              ).decode().strip()
+
+          def fingerprint(root, *, repository=True):
+              root = Path(root)
+              if root.is_symlink() or not root.is_dir():
+                  fail(f"source root is not a regular directory: {root.name}")
+              digest = hashlib.sha256()
+              immutable = hashlib.sha256()
+              writable_artifacts = {
+                  "axiom-rules-engine": ("target",),
+                  "axiom-corpus": ("releases", "data/corpus"),
+              }.get(root.name, ()) if repository else ()
+
+              def authorized_artifact(relative):
+                  if relative == ".git" or relative.startswith(".git/"):
+                      # Fetch may add objects/ref metadata, but cannot alter
+                      # checkout identity or executable Git configuration.
+                      if relative in {".git/objects/info/alternates", ".git/objects/info/http-alternates"}:
+                          return False
+                      metadata = (".git/objects", ".git/refs/remotes", ".git/logs/refs/remotes")
+                      return relative in {".git/FETCH_HEAD", ".git/shallow", ".git/index", ".git/packed-refs"} or any(
+                          relative == prefix or relative.startswith(prefix + "/")
+                          or prefix.startswith(relative + "/") for prefix in metadata
+                      )
+                  return any(relative == prefix or relative.startswith(prefix + "/")
+                             or prefix.startswith(relative + "/") for prefix in writable_artifacts)
+
+              for directory, directories, files in os.walk(root, followlinks=False):
+                  directory = Path(directory)
+                  # Include Git configuration, refs and objects as well as every
+                  # ignored/untracked source entry. HEAD equality alone cannot
+                  # detect mutable metadata or working-tree replacements.
+                  for name in sorted(directories + files):
+                      path = directory / name
+                      metadata = path.lstat()
+                      relative = path.relative_to(root).as_posix()
+                      record = json.dumps([relative, stat.S_IFMT(metadata.st_mode),
+                                           stat.S_IMODE(metadata.st_mode)]).encode() + b"\0"
+                      if path.is_symlink():
+                          target = path.resolve()
+                          if not target.is_relative_to(root.resolve()):
+                              fail(f"source symlink escapes checkout: {root.name}/{relative}")
+                          record += json.dumps(os.readlink(path)).encode() + b"\0"
+                      elif path.is_file():
+                          file_digest = hashlib.sha256()
+                          with path.open("rb") as source:
+                              while chunk := source.read(1024 * 1024):
+                                  file_digest.update(chunk)
+                          record += file_digest.digest()
+                      elif not path.is_dir():
+                          fail(f"unsupported source entry: {root.name}/{relative}")
+                      digest.update(record)
+                      if not authorized_artifact(relative):
+                          immutable.update(record)
+                  directories.sort()
+              result = {"path": str(root), "sha256": digest.hexdigest(), "immutable_sha256": immutable.hexdigest(), "repository": repository}
+              if repository:
+                  result.update(head=git(root, "rev-parse", "HEAD"), tree=git(root, "rev-parse", "HEAD^{tree}"))
+              return result
+
+          def verify(sources, *, skip=()):
+              for name, expected in sources.items():
+                  if name not in skip and fingerprint(expected["path"], repository=expected["repository"]) != expected:
+                      fail(f"authenticated source tree drifted: {name}")
+
+          def save(sources):
+              manifest.write_text(json.dumps(sources, sort_keys=True) + "\n")
+              manifest.chmod(0o644)
+
+          action = sys.argv[1]
+          if action == "snapshot":
+              root = Path(sys.argv[2])
+              names = ["axiom-encode", "axiom-rules-engine", "axiom-corpus", "rulespec-us"]
+              if (root / "axiom-compose").exists():
+                  names.append("axiom-compose")
+              sources = {}
+              for name in names:
+                  checkout = root / name
+                  if git(checkout, "status", "--porcelain", "--untracked-files=all", "--ignored"):
+                      fail(f"authenticated checkout is not clean: {name}")
+                  sources[name] = fingerprint(checkout)
+              save(sources)
+          else:
+              sources = json.loads(manifest.read_text())
+              if action == "verify":
+                  verify(sources)
+              elif action in {"refresh-corpus", "refresh-engine"}:
+                  # Checkpoint only declared data/build artifacts after trusted
+                  # steps. Authenticated source bytes and Git identity persist.
+                  name = "axiom-corpus" if action == "refresh-corpus" else "axiom-rules-engine"
+                  verify(sources, skip=(name,))
+                  current = fingerprint(sources[name]["path"])
+                  if any(current[key] != sources[name][key] for key in ("head", "tree", "immutable_sha256")):
+                      fail(f"authenticated source changed during artifact creation: {name}")
+                  sources[name] = current
+                  save(sources)
+              elif action == "add":
+                  verify(sources)
+                  name, root, kind = sys.argv[2:]
+                  if name in sources:
+                      fail(f"source was already recorded: {name}")
+                  sources[name] = fingerprint(root, repository=kind == "repository")
+                  save(sources)
+              else:
+                  fail("unsupported source-integrity action")
+          # dependency-integrity-python-end
+          PYINTEGRITY
+          # Root-owned files also need root-owned ancestors: a writable parent
+          # would let candidate code replace the helper or its sealed baseline.
+          sudo chown root:root /opt
+          sudo chmod go-w /opt
+          sudo rm -rf /opt/axiom-dependency-integrity
+          sudo install -d -m 755 /opt/axiom-dependency-integrity
+          sudo install -m 644 "$RUNNER_TEMP/axiom-dependency-integrity.py" /opt/axiom-dependency-integrity/check.py
+          sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py snapshot "$AXIOM_DEPENDENCY_ROOT"
+
       - name: Install uv for composer runtime
-        if: ${{ inputs.axiom-compose-ref != '' }}
+        if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: "0.11.7"
@@ -1818,14 +2004,27 @@ jobs:
           cache: false
 
       - name: Install Python dependencies
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest pyyaml
-          python -m pip install -e "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
+          python -I -m pip --isolated install --upgrade pip
+          python -I -m pip --isolated install pytest pyyaml
+          # Build backends may create metadata in their project directory.
+          # Install from an external copy, keeping every authenticated source
+          # byte unchanged and avoiding editable import paths into checkouts.
+          rm -rf "$RUNNER_TEMP/axiom-encode-install"
+          cp -a "${AXIOM_DEPENDENCY_ROOT}/axiom-encode" "$RUNNER_TEMP/axiom-encode-install"
+          python -I -m pip --isolated install "$RUNNER_TEMP/axiom-encode-install"
           rm -rf "$RUNNER_TEMP/axiom-verification-site-packages"
-          python -m pip install \
+          python -I -m pip --isolated install \
             --target "$RUNNER_TEMP/axiom-verification-site-packages" \
-            "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
+            "$RUNNER_TEMP/axiom-encode-install"
+          python -I /opt/axiom-dependency-integrity/check.py verify
+          sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add \
+            verification-site-packages "$RUNNER_TEMP/axiom-verification-site-packages" runtime
 
       - name: Verify immutable retired-schema freeze
         shell: bash
@@ -1843,7 +2042,7 @@ jobs:
           MIGRATION_AUTHORIZED: ${{ steps.migration_authorization.outputs.authorized }}
         run: |
           set -euo pipefail
-          python - "$RUNNER_TEMP/retired-schema-skip.txt" <<'PY'
+          python -I - "$RUNNER_TEMP/retired-schema-skip.txt" <<'PY'
           import hashlib
           import json
           import os
@@ -2052,6 +2251,9 @@ jobs:
           RELEASE_CONTENT_SHA256: ${{ steps.toolchain.outputs.axiom_corpus_release_content_sha256 }}
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
           destination="${AXIOM_DEPENDENCY_ROOT}/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
           mkdir -p "$(dirname "$destination")"
           if [ -n "$RELEASE_REGISTRY_URL" ]; then
@@ -2068,7 +2270,7 @@ jobs:
             curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
               --output "$destination.tmp" "$url"
           fi
-          python - "$destination.tmp" "$RELEASE_NAME" "$RELEASE_CONTENT_SHA256" "$acquisition" <<'PY'
+          python -I - "$destination.tmp" "$RELEASE_NAME" "$RELEASE_CONTENT_SHA256" "$acquisition" <<'PY'
           import hashlib
           import json
           import sys
@@ -2112,16 +2314,21 @@ jobs:
           path.replace(path.with_suffix(""))
           PY
 
+          sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py refresh-corpus
+
       - name: Authenticate signed corpus provenance commit
         shell: bash
         env:
           RELEASE_NAME: ${{ steps.toolchain.outputs.axiom_corpus_release }}
           RELEASE_CONTENT_SHA256: ${{ steps.toolchain.outputs.axiom_corpus_release_content_sha256 }}
-          AXIOM_CORPUS_SHA: ${{ inputs.axiom-corpus-ref }}
+          AXIOM_CORPUS_SHA: ${{ needs.shards.outputs.axiom_corpus_ref }}
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
           object="${AXIOM_DEPENDENCY_ROOT}/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
-          release_commit="$(python - "$object" <<'PY'
+          release_commit="$(python -I - "$object" <<'PY'
           import json
           import sys
           print(json.load(open(sys.argv[1]))["content"]["git"]["commit"])
@@ -2144,10 +2351,11 @@ jobs:
               echo "Corpus checkout $AXIOM_CORPUS_SHA predates signed release provenance $release_commit" >&2
               exit 1
             }
+          sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py refresh-corpus
 
       - name: Place the pinned corpus release's provisions
         shell: bash
-        working-directory: ${{ github.workspace }}
+        working-directory: ${{ runner.temp }}
         env:
           CORPUS_PATH: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus
           RELEASE_NAME: ${{ steps.toolchain.outputs.axiom_corpus_release }}
@@ -2156,6 +2364,8 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_CORPUS_READ_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
           if [ ! -d "$CORPUS_PATH/.axiom/corpus-locks" ]; then
             echo "No .axiom/corpus-locks directory in the corpus checkout; skipping provisions placement for this pre-switch corpus pin."
             exit 0
@@ -2183,6 +2393,8 @@ jobs:
             exit "$status"
           fi
 
+          sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py refresh-corpus
+
       - name: Provision protected verification supervisor
         working-directory: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-encode
         env:
@@ -2192,6 +2404,8 @@ jobs:
           TRUST_RETIRED_CORPUS_RELEASE_ROOT: ${{ vars.AXIOM_CORPUS_RELEASE_RETIRED_PUBLIC_KEY }}
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
           test -n "$TRUST_APPLY_ROOT" && test -n "$TRUST_EVAL_ROOT" && test -n "$TRUST_CORPUS_RELEASE_ROOT"
           CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-buildid=' \
             -o "$RUNNER_TEMP/axiom-encode-signing-supervisor" \
@@ -2202,7 +2416,8 @@ jobs:
           # invoking interpreter's sys.base_prefix, i.e. it would copytree
           # /usr until the runner disk dies. Resolve the setup-python
           # interpreter in this shell and pass its absolute path through.
-          sudo "$(command -v python)" scripts/provision_verification_supervisor.py \
+          python -I /opt/axiom-dependency-integrity/check.py verify
+          sudo "$(command -v python)" -I scripts/provision_verification_supervisor.py \
             --destination /opt/axiom-verification \
             --supervisor "$RUNNER_TEMP/axiom-encode-signing-supervisor" \
             --site-packages "$RUNNER_TEMP/axiom-verification-site-packages" \
@@ -2220,11 +2435,15 @@ jobs:
           sudo chmod go-w /opt
 
       - name: Build protected axiom-compose runtime
-        if: ${{ inputs.axiom-compose-ref != '' }}
+        if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
         env:
-          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          export UV_NO_CONFIG=1
+          python -I /opt/axiom-dependency-integrity/check.py verify
           uv python install 3.14
           uv venv --python 3.14 "$RUNNER_TEMP/axiom-compose-build"
           uv export \
@@ -2238,8 +2457,12 @@ jobs:
             --python "$RUNNER_TEMP/axiom-compose-build/bin/python" \
             --target "$RUNNER_TEMP/axiom-compose-site-packages" \
             --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"
+          python -I /opt/axiom-dependency-integrity/check.py verify
           sudo rm -rf /opt/axiom-compose-verification
-          sudo "$RUNNER_TEMP/axiom-compose-build/bin/python" \
+          # This provisioner imports its authenticated sibling helper. Isolated
+          # mode omits script directories, so add only that verified directory.
+          sudo "$RUNNER_TEMP/axiom-compose-build/bin/python" -I -c \
+            'import pathlib, runpy, sys; script = pathlib.Path(sys.argv.pop(1)); sys.path.insert(0, str(script.parent)); sys.argv[0] = str(script); runpy.run_path(str(script), run_name="__main__")' \
             "${AXIOM_DEPENDENCY_ROOT}/axiom-encode/scripts/provision_axiom_compose_runtime.py" \
             --destination /opt/axiom-compose-verification \
             --site-packages "$RUNNER_TEMP/axiom-compose-site-packages" \
@@ -2251,15 +2474,26 @@ jobs:
 
       - name: Build axiom-rules-engine
         working-directory: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-rules-engine
-        run: cargo build --verbose
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
+          cargo build --verbose --locked -j 4
+          sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py refresh-engine
 
       - name: Expose axiom-rules-engine on PATH
-        run: echo "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine/target/debug" >> "$GITHUB_PATH"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I /opt/axiom-dependency-integrity/check.py verify
+          echo "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine/target/debug" >> "$GITHUB_PATH"
 
       - name: Link axiom-rules-engine as sibling checkout
         shell: bash
         run: |
           set -euo pipefail
+          python -I /opt/axiom-dependency-integrity/check.py verify
           ln -sfn "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine" "$GITHUB_WORKSPACE/../axiom-rules-engine"
           ln -sfn "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" "$GITHUB_WORKSPACE/../axiom-corpus"
           if [ "$(basename "$GITHUB_WORKSPACE")" != "rulespec-us" ]; then
@@ -2288,7 +2522,7 @@ jobs:
           set -euo pipefail
 
           if [ -f .axiom/repository-structure.yaml ]; then
-          python - <<'PY'
+          python -I - <<'PY'
           import fnmatch
           import sys
           from pathlib import Path, PurePosixPath
@@ -2454,7 +2688,7 @@ jobs:
         # minutes. Fail here, naming the step, before the job limit.
         timeout-minutes: 150
         env:
-          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
           # The matrix already partitions the audit across 52 runners, so
           # keep each leg serial except us-wa. Its two adjacent expensive
           # tariff chapters exceeded the unchanged 150-minute step limit in
@@ -2471,6 +2705,8 @@ jobs:
           MIGRATION_CANDIDATE: ${{ steps.migration_authorization.outputs.candidate }}
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base_ref="${{ github.event.pull_request.base.sha }}"
           elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
@@ -2521,7 +2757,7 @@ jobs:
             }
           fi
           # waiver-ratchet-python-start
-          python - "$protected_base" known-validation-gaps.yaml \
+          python -I - "$protected_base" known-validation-gaps.yaml \
             "$protected_base_toolchain" .axiom/toolchain.toml "$changed_paths" \
             "$audit_changed_paths" <<'PY'
           import hashlib
@@ -2733,56 +2969,59 @@ jobs:
             test -x /opt/axiom-compose-verification/axiom-compose
             composer_args=(--axiom-compose-path /opt/axiom-compose-verification/axiom-compose)
           fi
-          /opt/axiom-verification/axiom-encode-signing-supervisor \
-            --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
-            --trusted-python-runtime-root /opt/axiom-verification/python \
-            --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
-            --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
-            -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" "${dependency_args[@]}" \
+          workers="${AXIOM_ENCODE_WAIVER_AUDIT_WORKERS:-1}"
+          if [[ ! "$workers" =~ ^[1-4]$ ]]; then
+            echo "::error::Validation waiver audit workers must be between 1 and 4." >&2
+            exit 1
+          fi
+          export AXIOM_ENCODE_WAIVER_AUDIT_WORKERS="$workers"
+          # Probe the protected CLI through the same supervisor as the audit.
+          # A failed or empty probe cannot authorize a compatibility fallback.
+          run_waiver_audit() {
+            /opt/axiom-verification/axiom-encode-signing-supervisor \
+              --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
+              --trusted-python-runtime-root /opt/axiom-verification/python \
+              --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
+              --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
+              -- /opt/axiom-verification/axiom-encode validation-waivers audit "${composer_args[@]}" "${dependency_args[@]}" "$@"
+          }
+          audit_help="$RUNNER_TEMP/validation-waivers-audit-help.txt"
+          if run_waiver_audit --help > "$audit_help"; then
+            :
+          else
+            status=$?
+            echo "::error::Validation waiver audit capability probe failed (exit $status)." >&2
+            exit "$status"
+          fi
+          if [ ! -s "$audit_help" ]; then
+            echo "::error::Validation waiver audit capability probe returned no help." >&2
+            exit 1
+          fi
+          partition_args=()
+          if grep -qE -- '(^|[[:space:],])--partition-key([[:space:]=,]|$)' "$audit_help" \
+            && grep -qE -- '(^|[[:space:],])--partition-keys-json([[:space:]=,]|$)' "$audit_help"; then
+            partition_args=(
+              --partition-key "${{ matrix.shard }}"
+              --partition-keys-json '${{ needs.shards.outputs.matrix }}'
+            )
+          else
+            # A pre-partition encoder audits the complete root once, even when
+            # the matrix selected only one jurisdiction for changed content.
+            if [ "${{ matrix.shard }}" != "${{ needs.shards.outputs.first }}" ]; then
+              echo "Pinned encoder lacks audit partition flags; the complete audit runs on the first shard."
+              exit 0
+            fi
+            export AXIOM_ENCODE_WAIVER_AUDIT_WORKERS=1
+            echo "Pinned encoder lacks audit partition flags; running the complete unpartitioned waiver audit."
+          fi
+          run_waiver_audit \
             --json \
             --root "$GITHUB_WORKSPACE" \
             --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
             --protected-base "$protected_base" \
             --changed-paths "$audit_changed_paths" \
-            --partition-key "${{ matrix.shard }}" \
-            --partition-keys-json '${{ needs.shards.outputs.matrix }}' \
+            "${partition_args[@]}" \
             --axiom-rules-engine-path "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine"
-
-      - name: Reject manual RuleSpec changes
-        if: ${{ inputs.run-generated-guard && matrix.shard == needs.shards.outputs.first }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # generated-guard-base-ref-start
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base_ref="${{ github.event.pull_request.base.sha }}"
-          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            base_ref="${{ github.event.before }}"
-          else
-            # schedule and workflow_dispatch carry no base SHA. The supervised
-            # guard's trusted git wrapper accepts only HEAD, main, origin/main,
-            # or a full 40-hex commit (never HEAD~1), so resolve the parent to
-            # its exact commit here. Checkout uses fetch-depth: 0.
-            base_ref="$(git rev-parse --verify 'HEAD~1^{commit}')"
-          fi
-          if [[ ! "$base_ref" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "GeneratedGuardBaseRef: base ref must be an exact 40-hex commit, got '$base_ref'" >&2
-            exit 1
-          fi
-          # generated-guard-base-ref-end
-
-          /opt/axiom-verification/axiom-encode-signing-supervisor \
-            --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
-            --trusted-python-runtime-root /opt/axiom-verification/python \
-            --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
-            --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
-            -- /opt/axiom-verification/axiom-encode guard-generated \
-            --repo "$GITHUB_WORKSPACE" \
-            --base-ref "$base_ref" \
-            --head-ref "$GITHUB_SHA" \
-            --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
-            --expected-encoder-checkout "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
 
       - name: Select RuleSpec validation targets
         id: validation_targets
@@ -2877,7 +3116,7 @@ jobs:
           }
 
           classify_toolchain_change() {
-            python - "$base_ref" <<'PY'
+            python -I - "$base_ref" <<'PY'
           import subprocess
           import sys
           import tomllib
@@ -2927,7 +3166,7 @@ jobs:
             mode="changed"
             for path in "${all_changed_paths[@]}"; do
               case "$path" in
-                .github/workflows/*.yml|.github/workflows/*.yaml)
+                .github/workflows/*.yml|.github/workflows/*.yaml|.axiom/workflow-toolchain.toml)
                   mode="full-toolchain-bump"
                   break
                   ;;
@@ -2975,12 +3214,57 @@ jobs:
           echo "RuleSpec companion tests selected:"
           sed 's/^/- /' "$test_file_list" || true
 
+      - name: Reject manual RuleSpec changes
+        if: ${{ inputs.run-generated-guard && matrix.shard == needs.shards.outputs.first }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
+
+          # generated-guard-base-ref-start
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            base_ref="${{ github.event.before }}"
+          else
+            # schedule and workflow_dispatch carry no base SHA. The supervised
+            # guard's trusted git wrapper accepts only HEAD, main, origin/main,
+            # or a full 40-hex commit (never HEAD~1), so resolve the parent to
+            # its exact commit here. Checkout uses fetch-depth: 0.
+            base_ref="$(git rev-parse --verify 'HEAD~1^{commit}')"
+          fi
+          if [[ ! "$base_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GeneratedGuardBaseRef: base ref must be an exact 40-hex commit, got '$base_ref'" >&2
+            exit 1
+          fi
+          # generated-guard-base-ref-end
+
+          # A content-free pin update must authenticate unchanged manifests
+          # with the proposed encoder, as well as validate every module.
+          guard_args=()
+          if [ "$RULESPEC_VALIDATION_MODE" = "full-toolchain-bump" ]; then
+            guard_args=(--all)
+          fi
+          /opt/axiom-verification/axiom-encode-signing-supervisor \
+            --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
+            --trusted-python-runtime-root /opt/axiom-verification/python \
+            --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
+            --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
+            -- /opt/axiom-verification/axiom-encode guard-generated \
+            --repo "$GITHUB_WORKSPACE" \
+            --base-ref "$base_ref" \
+            --head-ref "$GITHUB_SHA" \
+            "${guard_args[@]}" \
+            --corpus-path "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" \
+            --expected-encoder-checkout "${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
+
       - name: Validate RuleSpec YAML
         shell: bash
         # Green rulespec-us legs, September 2026: at most 85 minutes.
         timeout-minutes: 120
         env:
-          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           VALIDATION_WORKERS: ${{ inputs.validation-workers }}
           AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ env.AXIOM_DEPENDENCY_ROOT }}/rulespec-us
@@ -2988,6 +3272,8 @@ jobs:
           AXIOM_CORPUS_REPO: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
 
           mapfile -t rulespec_files < "$RULESPEC_FILE_LIST"
 
@@ -3005,7 +3291,7 @@ jobs:
           skip_list="$RUNNER_TEMP/validate-skip.txt"
           : > "$skip_list"
           if [ -f known-validation-gaps.yaml ]; then
-            python - <<'SKIP' > "$skip_list"
+            python -I - <<'SKIP' > "$skip_list"
           import yaml
           payload = yaml.safe_load(open("known-validation-gaps.yaml")) or {}
           failures = payload.get("validate_failures") or {}
@@ -3111,11 +3397,13 @@ jobs:
         # Green rulespec-us legs, September 2026: at most 33 minutes.
         timeout-minutes: 60
         env:
-          AXIOM_COMPOSE_REF: ${{ inputs.axiom-compose-ref }}
+          AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
           VALIDATE_ROOTS: ${{ steps.resolve_roots.outputs.roots }}
           AXIOM_RULESPEC_REPO_ROOTS: ${{ github.workspace }}:${{ env.AXIOM_DEPENDENCY_ROOT }}/rulespec-us
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
 
           mapfile -t test_files < "$RULESPEC_TEST_FILE_LIST"
 
@@ -3180,6 +3468,8 @@ jobs:
           AXIOM_CORPUS_REPO: ${{ env.AXIOM_DEPENDENCY_ROOT }}/axiom-corpus
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
 
           mapfile -t rulespec_files < "$RULESPEC_FILE_LIST"
 
@@ -3202,7 +3492,7 @@ jobs:
           skip_list="$RUNNER_TEMP/proof-validate-skip.txt"
           : > "$skip_list"
           if [ -f known-validation-gaps.yaml ]; then
-            python - <<'SKIP' > "$skip_list"
+            python -I - <<'SKIP' > "$skip_list"
           import yaml
           payload = yaml.safe_load(open("known-validation-gaps.yaml")) or {}
           failures = payload.get("validate_failures") or {}
@@ -3251,6 +3541,8 @@ jobs:
           VALIDATE_ROOTS_INPUT: ${{ inputs.validate-roots }}
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
 
           atomic_roots=()
           if [ "$VALIDATE_ROOTS_INPUT" = "auto" ]; then
@@ -3313,6 +3605,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
           axiom-encode oracle-coverage \
             --root "$GITHUB_WORKSPACE" \
             --fail-on-unmapped \
@@ -3324,7 +3618,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: TheAxiomFoundation/axiom-encode
-          ref: ${{ inputs.axiom-encode-ref }}
+          ref: ${{ needs.shards.outputs.axiom_encode_ref }}
           path: ${{ env.AXIOM_DEPENDENCY_STAGE }}/axiom-encode-oracle-coverage
           persist-credentials: false
 
@@ -3346,7 +3640,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -e "${AXIOM_DEPENDENCY_ROOT}/axiom-encode-oracle-coverage"
+          cd "$RUNNER_TEMP"
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
+          classifier="${AXIOM_DEPENDENCY_ROOT}/axiom-encode-oracle-coverage"
+          test "$(git -C "$classifier" rev-parse HEAD)" = \
+            "$(git -C "${AXIOM_DEPENDENCY_ROOT}/axiom-encode" rev-parse HEAD)"
+          test -z "$(git -C "$classifier" status --porcelain --untracked-files=all --ignored)"
+          sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add \
+            oracle-coverage "$classifier" repository
+          rm -rf "$RUNNER_TEMP/axiom-encode-oracle-coverage-install"
+          cp -a "$classifier" "$RUNNER_TEMP/axiom-encode-oracle-coverage-install"
+          python -I -m pip --isolated install "$RUNNER_TEMP/axiom-encode-oracle-coverage-install"
           # The changed-file classifier checkout may pin an axiom-oracles commit
           # step installed. axiom-oracles is a git dependency whose version string
           # does not change per commit, so pip treats the pinned SHA as "already
@@ -3355,7 +3660,7 @@ jobs:
           # axiom-oracles pin declared by this checkout so the classifier reads its
           # bridge mappings, not the toolchain-pinned ones.
           oracles_spec="$(
-            python - <<'PY'
+            python -I - <<'PY'
           import pathlib
           import re
           import os
@@ -3368,9 +3673,9 @@ jobs:
           PY
           )"
           if [ -n "$oracles_spec" ]; then
-            python -m pip install --force-reinstall --no-deps "$oracles_spec"
+            python -I -m pip --isolated install --force-reinstall --no-deps "$oracles_spec"
           fi
-          python - <<'PY'
+          python -I - <<'PY'
           import importlib.metadata
 
           print(
@@ -3378,12 +3683,15 @@ jobs:
               f"{importlib.metadata.version('axiom-encode')}."
           )
           PY
+          python -I /opt/axiom-dependency-integrity/check.py verify
 
       - name: Validate changed PolicyEngine oracle coverage classification
         if: ${{ github.event_name == 'pull_request' && steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}
         shell: bash
         run: |
           set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I /opt/axiom-dependency-integrity/check.py verify
 
           if [ ! -s "$RULESPEC_FILE_LIST" ]; then
             echo "No changed RuleSpec YAML files selected for oracle coverage."
@@ -3395,7 +3703,7 @@ jobs:
             --root "$GITHUB_WORKSPACE" \
             --json > "$coverage_json"
 
-          python - "$coverage_json" "$RULESPEC_FILE_LIST" <<'PY'
+          python -I - "$coverage_json" "$RULESPEC_FILE_LIST" <<'PY'
           import json
           import os
           import sys
