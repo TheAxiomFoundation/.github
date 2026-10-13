@@ -114,7 +114,7 @@ class DependencyIntegrityTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_candidate_pip_cannot_replace_real_build_or_provision_inputs(self):
-        with tempfile.TemporaryDirectory(prefix="hub-.github-125-integrity-", dir=TEMP_PARENT) as directory:
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-integrity-", dir=TEMP_PARENT) as directory:
             candidate, env = self.fixture(Path(directory))
             dependencies = Path(env["AXIOM_DEPENDENCY_ROOT"])
             before = {path: path.read_bytes() for path in dependencies.rglob("*") if path.is_file()}
@@ -129,7 +129,7 @@ class DependencyIntegrityTests(unittest.TestCase):
         for relative in ("cmd/axiom-encode-signing-supervisor/main.go",
                          "scripts/provision_verification_supervisor.py"):
             with self.subTest(source=relative), tempfile.TemporaryDirectory(
-                prefix="hub-.github-125-integrity-", dir=TEMP_PARENT
+                prefix="encoder-guard-integrity-", dir=TEMP_PARENT
             ) as directory:
                 candidate, env = self.fixture(Path(directory))
                 self.snapshot(candidate, env)
@@ -147,7 +147,7 @@ class DependencyIntegrityTests(unittest.TestCase):
     def test_untracked_and_symlink_drift_fail_closed(self):
         for mutate in ("untracked", "symlink"):
             with self.subTest(mutation=mutate), tempfile.TemporaryDirectory(
-                prefix="hub-.github-125-integrity-", dir=TEMP_PARENT
+                prefix="encoder-guard-integrity-", dir=TEMP_PARENT
             ) as directory:
                 candidate, env = self.fixture(Path(directory))
                 self.snapshot(candidate, env)
@@ -176,7 +176,7 @@ class DependencyIntegrityTests(unittest.TestCase):
         )
         for name, relative, allowed in cases:
             with self.subTest(repository=name, path=relative), tempfile.TemporaryDirectory(
-                prefix="hub-.github-125-integrity-", dir=TEMP_PARENT
+                prefix="encoder-guard-integrity-", dir=TEMP_PARENT
             ) as directory:
                 candidate, env = self.fixture(Path(directory))
                 self.snapshot(candidate, env)
@@ -210,7 +210,7 @@ class DependencyIntegrityTests(unittest.TestCase):
             (".git/hooks/pre-commit", False),
         ):
             with self.subTest(path=relative), tempfile.TemporaryDirectory(
-                prefix="hub-.github-125-integrity-", dir=TEMP_PARENT
+                prefix="encoder-guard-integrity-", dir=TEMP_PARENT
             ) as directory:
                 candidate, env = self.fixture(Path(directory))
                 self.snapshot(candidate, env)
@@ -283,7 +283,7 @@ class DependencyIntegrityTests(unittest.TestCase):
                         self.assertIn("python -I -m pip --isolated ", line, item.get("name"))
         loader = re.search(r"-I -B -c \\\n\s*'([^']+)'", step("Build protected axiom-compose runtime")["run"])
         self.assertIsNotNone(loader, "isolated provisioning must preserve the trusted sibling import")
-        with tempfile.TemporaryDirectory(prefix="hub-.github-125-integrity-", dir=TEMP_PARENT) as directory:
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-integrity-", dir=TEMP_PARENT) as directory:
             root = Path(directory)
             candidate = root / "candidate"
             candidate.mkdir()
@@ -340,7 +340,7 @@ class DependencyIntegrityTests(unittest.TestCase):
         for name, relative in (("composer-site-packages", "dependency.py"),
                                ("composer-runtime", "site-packages/dependency.py")):
             with self.subTest(runtime=name), tempfile.TemporaryDirectory(
-                prefix="hub-.github-125-integrity-", dir=TEMP_PARENT
+                prefix="encoder-guard-integrity-", dir=TEMP_PARENT
             ) as directory:
                 candidate, env = self.fixture(Path(directory))
                 self.snapshot(candidate, env)

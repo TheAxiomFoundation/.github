@@ -35,7 +35,7 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
               integrity_fail_after=0, event="pull_request"):
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     shell = next(step["run"] for step in steps if step.get("name") == "Reject manual RuleSpec changes")
-    with tempfile.TemporaryDirectory(prefix="hub-.github-125-pin-manifest-", dir=TEMP_PARENT) as directory:
+    with tempfile.TemporaryDirectory(prefix="encoder-guard-pin-manifest-", dir=TEMP_PARENT) as directory:
         root = Path(directory)
         workspace = root / "rulespec-uk"
         workspace.mkdir()
@@ -289,7 +289,7 @@ class PinBumpManifestTests(unittest.TestCase):
             ("module.yaml: MissingManifest: issue", "module.yaml: StaleManifest: issue"),
             ("module.yaml: issue detail one", "module.yaml: issue detail two"),
         ))
-        with tempfile.TemporaryDirectory(prefix="hub-.github-125-ratchet-", dir=TEMP_PARENT) as directory:
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-ratchet-", dir=TEMP_PARENT) as directory:
             before, after = Path(directory) / "base.json", Path(directory) / "head.json"
             args = ["ratchet", str(before), "1", str(after), "1",
                     "/audit/base/rulespec-uk", repository, "/audit/base/dependencies", dependencies]
@@ -334,7 +334,7 @@ class PinBumpManifestTests(unittest.TestCase):
         steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
         preparation = next(step for step in steps if step.get("name") == "Prepare protected-base manifest audit")
         source = preparation["run"].split("base_corpus_fetch() {\n", 1)[1].split("\n}", 1)[0]
-        with tempfile.TemporaryDirectory(prefix="hub-.github-125-base-fetch-", dir=TEMP_PARENT) as directory:
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-base-fetch-", dir=TEMP_PARENT) as directory:
             root = Path(directory)
             integrity = root / "integrity"
             integrity.mkdir()
@@ -414,7 +414,7 @@ class PinBumpManifestTests(unittest.TestCase):
         self.assertIn("<<'PYRATCHET'", shell)
         source = shell.split("<<'PYRATCHET'\n", 1)[1].split("\nPYRATCHET", 1)[0]
         code = compile(source, "manifest-ratchet", "exec")
-        with tempfile.TemporaryDirectory(prefix="hub-.github-125-ratchet-", dir=TEMP_PARENT) as directory:
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-ratchet-", dir=TEMP_PARENT) as directory:
             before, after = Path(directory) / "base.json", Path(directory) / "head.json"
             def check(base, head, base_status=None, head_status=None):
                 before.write_text(json.dumps(base))

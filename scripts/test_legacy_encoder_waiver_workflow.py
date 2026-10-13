@@ -28,7 +28,7 @@ def run_audit(*, capability="old", shard="uk", first="uk", probe_status=0,
     step = next(item for item in yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
                 if item.get("name") == "Enforce validation waiver ratchet")
     shell = step["run"].split("# waiver-ratchet-python-end\n", 1)[1]
-    with tempfile.TemporaryDirectory(prefix="hub-.github-125-legacy-waiver-", dir=TEMP_PARENT) as directory:
+    with tempfile.TemporaryDirectory(prefix="encoder-guard-legacy-waiver-", dir=TEMP_PARENT) as directory:
         root = Path(directory)
         protected = root / "protected"
         protected.mkdir()
@@ -141,7 +141,25 @@ def run_audit(*, capability="old", shard="uk", first="uk", probe_status=0,
 
 
 class LegacyEncoderWaiverTests(unittest.TestCase):
-    def test_prepartition_nz_and_uk_encoders_audit_all_roots_on_first_shard(self):
+    def test_nonfirst_shard_audit_failure_preserves_protected_gate(self):
+        step = next(item for item in yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+                    if item.get("name") == "Enforce validation waiver ratchet")
+        self.assertEqual(step["env"]["AXIOM_COMPOSE_REF"],
+                         "${{ needs.shards.outputs.axiom_compose_ref }}")
+        self.assertLess(step["run"].index("python -I /opt/axiom-dependency-integrity/check.py verify"),
+                        step["run"].index("run_waiver_audit --help"))
+        for capability in ("old", "key-only", "keys-only"):
+            with self.subTest(capability=capability):
+                result, calls = run_audit(capability=capability, shard="uk-region", audit_status=41)
+                self.assertEqual(result.returncode, 41, result.stderr)
+                self.assertEqual(len(calls), 4)
+                probe = calls[0]["supervisor"]
+                audit = calls[2]["supervisor"]
+                self.assertEqual(probe[:probe.index("--")], audit[:audit.index("--")])
+                self.assertFalse(any(arg.startswith("--partition-") for arg in calls[-1]["cli"]))
+                self.assertEqual(json.loads(result.stdout.splitlines()[-1])["checked_modules"], sorted(MODULES))
+
+    def test_prepartition_nz_and_uk_encoders_audit_all_roots_on_every_shard(self):
         for encoder in ("rulespec-nz/a9987a4b", "rulespec-uk/c326d1ac"):
             with self.subTest(encoder=encoder):
                 result, calls = run_audit(encoder=encoder, workers="2")
@@ -153,8 +171,12 @@ class LegacyEncoderWaiverTests(unittest.TestCase):
                 self.assertFalse(any(arg.startswith("--partition-") for arg in calls[-1]["cli"]))
                 result, calls = run_audit(encoder=encoder, shard="uk-region")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(len(calls), 2)
-                self.assertIn("complete audit runs on the first shard", result.stdout)
+                self.assertEqual(len(calls), 4)
+                report = json.loads(result.stdout.splitlines()[-1])
+                self.assertEqual(report["checked_modules"], sorted(MODULES))
+                self.assertEqual(report["workers"], 1)
+                self.assertFalse(any(arg.startswith("--partition-") for arg in calls[-1]["cli"]))
+                self.assertIn("complete unpartitioned waiver audit on this shard", result.stdout)
                 result, calls = run_audit(encoder=encoder, shard="uk-region", first="uk-region", matrix=["uk-region"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(calls), 4)

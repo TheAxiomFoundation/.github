@@ -3138,14 +3138,10 @@ jobs:
               --partition-keys-json '${{ needs.shards.outputs.matrix }}'
             )
           else
-            # A pre-partition encoder audits the complete root once, even when
-            # the matrix selected only one jurisdiction for changed content.
-            if [ "${{ matrix.shard }}" != "${{ needs.shards.outputs.first }}" ]; then
-              echo "Pinned encoder lacks audit partition flags; the complete audit runs on the first shard."
-              exit 0
-            fi
+            # Pre-partition encoders must audit EVERY waiver on EVERY shard.
+            # Duplicate runtime fingerprint checks preserve complete coverage.
             export AXIOM_ENCODE_WAIVER_AUDIT_WORKERS=1
-            echo "Pinned encoder lacks audit partition flags; running the complete unpartitioned waiver audit."
+            echo "Pinned encoder lacks audit partition flags; running the complete unpartitioned waiver audit on this shard."
           fi
           run_waiver_audit \
             --json \

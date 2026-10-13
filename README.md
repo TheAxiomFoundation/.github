@@ -537,6 +537,20 @@ A leg that reaches a limit is stopped, and the aggregate `validate` check
 fails. Treat that as a hang to fix, not a limit to raise. A caller gets these
 bounds only when it moves its pin to a workflow commit that has them.
 
+## Encoding lane registry
+
+The [live board](https://github.com/TheAxiomFoundation/.github/blob/lanes-registry/LANES.md)
+is generated every six hours on the `lanes-registry` branch. Edit the curated
+section of `LANES.md` on `main` by pull request. The registry workflow always
+reads its generator and curated content from `main`; a manual `workflow_dispatch`
+run creates the board branch if absent or updates it only when content changes.
+
+`python3 scripts/generate_lanes.py --check` validates the curated source and its
+preservation during rendering without fetching live data. To render a board
+locally, use `--output <board-path>`; add `--pending` for an offline seed board.
+Run `python3 scripts/test_generate_lanes.py` for the generator and publication
+tests (requires PyYAML, also run by the shared-workflow CI test script).
+
 ## Links
 
 - https://axiom.org

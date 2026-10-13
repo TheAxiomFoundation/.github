@@ -30,7 +30,7 @@ def temporary_fixture_directory():
     # Keep Git fixtures outside the checkout; /private/tmp is the local fleet's
     # scratch directory, while hosted Linux runners use their system temp dir.
     parent = "/private/tmp" if Path("/private/tmp").is_dir() else None
-    return tempfile.TemporaryDirectory(prefix="hub-.github-125-fixture-", dir=parent)
+    return tempfile.TemporaryDirectory(prefix="encoder-guard-fixture-", dir=parent)
 
 
 def document(path: Path) -> dict:
