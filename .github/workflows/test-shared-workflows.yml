@@ -1,8 +1,8 @@
 name: Test shared workflows
 
-# No path filters: this job is the check that protects main, and GitHub leaves
-# a required check pending, blocking the merge, when path filtering skips its
-# workflow. Every pull request and every push to main runs it.
+# No path filters: this job is meant to be the required check on main, and
+# GitHub leaves a required check pending, blocking the merge, when path
+# filtering skips its workflow. Every pull request and every push to main runs it.
 on:
   pull_request:
   push:
@@ -14,6 +14,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung run would otherwise hold a required check pending for six hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
