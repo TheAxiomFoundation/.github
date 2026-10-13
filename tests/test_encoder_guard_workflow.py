@@ -549,6 +549,30 @@ class GuardDecisionTests(unittest.TestCase):
             self.assert_fail(fixture.run(head, base=advanced, merge=stale))
             self.assert_fail(fixture.run(head, merge="not-a-sha"))
 
+    def test_event_merge_for_an_earlier_head_is_replaced_by_the_current_merge(self):
+        module = "us/statutes/item.yaml"
+        manifest = ".axiom/encoding-manifests/us/statutes/item.json"
+        with Fixture({module: "fixture: base\n", manifest: "{}\n"}) as fixture:
+            fixture.write(module, "fixture: head\n")
+            earlier = fixture.head()
+            earlier_merge = git(
+                fixture.root, "commit-tree", f"{earlier}^{{tree}}",
+                "-p", fixture.base, "-p", earlier, "-m", "Test merge of the earlier head",
+            )
+            self.assert_pass(fixture.run(earlier, merge=earlier_merge))
+            # A later push's event carries the earlier head's test merge. A clean
+            # later head passes on the merge the guard computes for it.
+            git(fixture.root, "checkout", "-q", "--detach", earlier)
+            fixture.write(module, "fixture: later head\n")
+            later = fixture.head()
+            self.assert_pass(fixture.run(later, merge=earlier_merge))
+            # A later head that removes the manifest fails, although the earlier
+            # head's merge still carries it.
+            git(fixture.root, "checkout", "-q", "--detach", earlier)
+            (fixture.root / manifest).unlink()
+            removed = fixture.head()
+            self.assert_fail(fixture.run(removed, merge=earlier_merge))
+
     def test_jurisdiction_retirement_receipt_uses_relative_module_path(self):
         module = "us/statutes/item.yaml"
         manifest = "us/.axiom/encoding-manifests/statutes/item.json"

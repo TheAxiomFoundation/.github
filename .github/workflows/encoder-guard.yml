@@ -635,13 +635,14 @@ jobs:
                   # tree, and fail closed if that group is not based on its event base.
                   git("merge-base", "--is-ancestor", base, head)
                   tree = head
-              elif merge:
-                  # Never accept a cached test merge computed from a different base/head.
-                  parents = git("rev-list", "--parents", "-n", "1", merge).split()
-                  if parents != [merge.encode(), base.encode(), head.encode()]:
-                      raise SystemExit("Event merge commit does not match exact base and head")
+              elif merge and git("rev-list", "--parents", "-n", "1", merge).split() == [
+                  merge.encode(), base.encode(), head.encode(),
+              ]:
                   tree = merge
               else:
+                  # No event merge, or one computed from a different base or head: an
+                  # event for a new push can carry the previous head's test merge. Never
+                  # use such a merge; compute this exact base and head's merge instead.
                   # A bare scratch repository isolates merge config/drivers from the
                   # checkout and global config. Its alternates only read existing Git
                   # objects; synthesized trees/blobs and the index stay in scratch.
