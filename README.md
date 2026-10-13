@@ -395,8 +395,9 @@ explicitly selects the target event's `github.repository` and validated base
 SHA, rather than this shared repository or a PR merge ref. The event's built-in
 `github.token` is limited to read-only repository contents; unspecified token
 permissions are disabled. A SHA-pinned checkout action checks out only the base
-commit and does not persist credentials. A transient authenticated fetch obtains head
-and event merge Git objects. Actions reports the job conclusion without
+commit and does not persist credentials. A transient authenticated fetch obtains the head Git
+objects, failing the guard if they are unavailable, and the event's merge commit
+best effort: an unavailable merge is treated as absent and the merge is computed. Actions reports the job conclusion without
 granting the job `checks: write`. Isolated Python and hardened Git object queries execute no
 head code or configuration and install no packages. See
 [checkout's repository/token defaults](https://github.com/actions/checkout#usage),

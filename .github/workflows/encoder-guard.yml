@@ -82,15 +82,21 @@ jobs:
           # The read-only built-in token is scoped to this fetch, including for
           # private repos; it is never persisted or given to the check below.
           auth="$(printf 'x-access-token:%s' "$GH_READ_TOKEN" | base64 -w 0)"
-          for revision in "$HEAD_SHA" "$MERGE_SHA"; do
-            if [ -z "$revision" ]; then continue; fi
+          fetch_commit() {
             GIT_CONFIG_COUNT=1 \
             GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
             GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
               git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-                fetch --no-tags --no-recurse-submodules origin "$revision"
-            git cat-file -e "$revision^{commit}"
-          done
+                fetch --no-tags --no-recurse-submodules origin "$1" &&
+              git cat-file -e "$1^{commit}"
+          }
+          fetch_commit "$HEAD_SHA"
+          # The event's test merge is only an optimization, and a re-run reuses the
+          # event, so a superseded merge that is no longer served must not fail the
+          # guard: the check below then computes the merge itself.
+          if [ -n "$MERGE_SHA" ] && ! fetch_commit "$MERGE_SHA"; then
+            echo "::notice::Event merge commit $MERGE_SHA is not available; the guard computes the merge"
+          fi
 
       - name: Fetch trusted shared-validator main history as Git objects only
         shell: bash
@@ -164,6 +170,22 @@ jobs:
               if result.returncode:
                   raise SystemExit("Git object read failed: " + result.stderr.decode("utf-8", "replace"))
               return result.stdout
+
+
+          def event_merge_is_exact(merge, base, head):
+              # The event's test merge is used only when it is present and its parents
+              # are exactly the event's base and head.
+              if not merge:
+                  return False
+              present = subprocess.run(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                   "cat-file", "-e", merge + "^{commit}"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+              )
+              if present.returncode:
+                  return False
+              parents = git("rev-list", "--parents", "-n", "1", merge).split()
+              return parents == [merge.encode(), base.encode(), head.encode()]
 
 
           def guarded(path):
@@ -635,13 +657,13 @@ jobs:
                   # tree, and fail closed if that group is not based on its event base.
                   git("merge-base", "--is-ancestor", base, head)
                   tree = head
-              elif merge:
-                  # Never accept a cached test merge computed from a different base/head.
-                  parents = git("rev-list", "--parents", "-n", "1", merge).split()
-                  if parents != [merge.encode(), base.encode(), head.encode()]:
-                      raise SystemExit("Event merge commit does not match exact base and head")
+              elif event_merge_is_exact(merge, base, head):
                   tree = merge
               else:
+                  # No event merge, one that is not available, or one computed from a
+                  # different base or head: an event for a new push can carry the
+                  # previous head's test merge. Never use such a merge; compute this
+                  # exact base and head's merge instead.
                   # A bare scratch repository isolates merge config/drivers from the
                   # checkout and global config. Its alternates only read existing Git
                   # objects; synthesized trees/blobs and the index stay in scratch.
