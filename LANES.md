@@ -4,9 +4,9 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-13 — Merge pull request #127 from TheAxiomFoundation/nzhub/waivers-pending-repin-630aa739 | 1 | nz-rulespec-2026-07-25 | a9987a4bc6a58e3f0407972f2e5726b7092b9c4b | in_progress |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-12 — Merge pull request #461 from TheAxiomFoundation/hub/rulespec-uk-signed-encoder | 37 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | failure |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-12 — Merge pull request #1485 from TheAxiomFoundation/chore/model-pins-2026-10-03 | 103 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
+| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-13 — Merge pull request #124 from TheAxiomFoundation/nzhub/repin-axiom-encode-main | 1 | nz-rulespec-2026-07-25 | 630aa73931e5aa87c51d25fe448e38dbcfaed50f | in_progress |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-13 — Merge pull request #464 from TheAxiomFoundation/hub/adopt-waiver-audit-compat | 36 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-12 — Merge pull request #1485 from TheAxiomFoundation/chore/model-pins-2026-10-03 | 103 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | queued |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-11 — Merge pull request #25 from TheAxiomFoundation/hub/encoder-guard-on | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-11 — Merge pull request #22 from TheAxiomFoundation/hub/encoder-guard-on | 0 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-11 — Merge pull request #20 from TheAxiomFoundation/hub/encoder-guard-on | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
