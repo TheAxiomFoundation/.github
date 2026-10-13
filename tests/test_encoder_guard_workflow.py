@@ -1393,6 +1393,55 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIs(settings["lfs"], False)
         self.assertEqual(steps[0]["name"], REVISION_STEP)
 
+    def test_fetch_step_fails_closed_for_the_head_and_is_best_effort_for_the_merge(self):
+        script = step(document(WORKFLOW), "Fetch candidate and event merge commits as Git objects only")["run"]
+        head, merge = "a" * 40, "b" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            calls = tools / "calls"
+            # Stub git logs every call and fails the one whose arguments contain FAIL_ON.
+            (tools / "git").write_text(
+                '#!/bin/sh\necho "$*" >> "$CALLS"\ncase "$*" in *"$FAIL_ON"*) exit 1 ;; esac\nexit 0\n'
+            )
+            (tools / "base64").write_text("#!/bin/sh\ncat >/dev/null\necho dG9rZW4=\n")
+            for tool in ("git", "base64"):
+                os.chmod(tools / tool, 0o755)
+
+            def run(fail_on: str, merge_sha: str = merge) -> tuple[int, list[str]]:
+                calls.write_text("")
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                    env={
+                        "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+                        "CALLS": str(calls), "FAIL_ON": fail_on,
+                        "HEAD_SHA": head, "MERGE_SHA": merge_sha,
+                        "GH_READ_TOKEN": "token", "GIT_TERMINAL_PROMPT": "0",
+                    },
+                    capture_output=True, text=True, check=False,
+                )
+                return result.returncode, calls.read_text().splitlines()
+
+            # The head is required: a failed fetch or a missing commit stops the step.
+            code, made = run(f"origin {head}")
+            self.assertNotEqual(code, 0)
+            self.assertEqual(len(made), 1)
+            code, made = run(f"{head}^{{commit}}")
+            self.assertNotEqual(code, 0)
+            self.assertEqual(len(made), 2)
+            # The event merge is best effort: either failure only skips it.
+            for fail_on, expected_calls in ((f"origin {merge}", 3), (f"{merge}^{{commit}}", 4)):
+                code, made = run(fail_on)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(made), expected_calls)
+            code, made = run("no-such-argument")
+            self.assertEqual(code, 0)
+            self.assertEqual(len(made), 4)
+            # No event merge: only the head is fetched and checked.
+            self.assertEqual(run("no-such-argument", merge_sha=""), (0, [
+                f"-c core.hooksPath=/dev/null -c core.fsmonitor=false fetch --no-tags --no-recurse-submodules origin {head}",
+                f"cat-file -e {head}^{{commit}}",
+            ]))
+
     def test_head_is_only_fetched_and_guard_uses_isolated_standard_library_python(self):
         workflow = document(WORKFLOW)
         fetch = step(workflow, "Fetch candidate and event merge commits as Git objects only")

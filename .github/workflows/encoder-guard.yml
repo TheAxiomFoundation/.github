@@ -95,7 +95,7 @@ jobs:
           # event, so a superseded merge that is no longer served must not fail the
           # guard: the check below then computes the merge itself.
           if [ -n "$MERGE_SHA" ] && ! fetch_commit "$MERGE_SHA"; then
-            echo "Event merge commit $MERGE_SHA is not available; the guard computes the merge"
+            echo "::notice::Event merge commit $MERGE_SHA is not available; the guard computes the merge"
           fi
 
       - name: Fetch trusted shared-validator main history as Git objects only
