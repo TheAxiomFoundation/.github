@@ -1,0 +1,728 @@
+name: Encoder guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+    types: [checks_requested]
+  # Optional caller support provides local visibility, not enforcement.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve immutable event revisions
+        id: revisions
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json
+          import os
+          import re
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+          # The organization ruleset pins this workflow's source independently
+          # of the target repository. Never select revisions from mutable refs,
+          # GITHUB_SHA (event-dependent), or edited.changes (the previous base).
+          event_name = os.environ["EVENT_NAME"]
+          if event_name in ("pull_request", "pull_request_target"):
+              revisions = {side: event["pull_request"][side]["sha"] for side in ("base", "head")}
+              merge = event["pull_request"].get("merge_commit_sha")
+              revisions["merge"] = "" if merge is None else merge
+          elif event_name == "merge_group":
+              revisions = {side: event["merge_group"][f"{side}_sha"] for side in ("base", "head")}
+              revisions["merge"] = ""
+          else:
+              raise SystemExit("Encoder guard requires a pull request or merge group event")
+          for side, sha in revisions.items():
+              if side == "merge" and sha == "":
+                  continue
+              if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+                  raise SystemExit(f"Invalid {side} commit SHA")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for side, sha in revisions.items():
+                  output.write(f"{side}-sha={sha}\n")
+          PY
+
+      - name: Check out the base commit only
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Ruleset source selection does not select the checkout repository.
+          repository: ${{ github.repository }}
+          ref: ${{ steps.revisions.outputs.base-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Fetch candidate and event merge commits as Git objects only
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.revisions.outputs.head-sha }}
+          MERGE_SHA: ${{ steps.revisions.outputs.merge-sha }}
+          GH_READ_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          # GitHub serves a fork PR's head object through the base repository.
+          # The read-only built-in token is scoped to this fetch, including for
+          # private repos; it is never persisted or given to the check below.
+          auth="$(printf 'x-access-token:%s' "$GH_READ_TOKEN" | base64 -w 0)"
+          for revision in "$HEAD_SHA" "$MERGE_SHA"; do
+            if [ -z "$revision" ]; then continue; fi
+            GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+                fetch --no-tags --no-recurse-submodules origin "$revision"
+            git cat-file -e "$revision^{commit}"
+          done
+
+      - name: Fetch trusted shared-validator main history as Git objects only
+        shell: bash
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+          VALIDATOR_GIT_DIR: ${{ runner.temp }}/encoder-guard-validator.git
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_NO_REPLACE_OBJECTS: "1"
+        run: |
+          set -euo pipefail
+          # The required guard owns this source identity. Fetch main into an
+          # empty bare repository outside both base and candidate checkouts.
+          # Nothing from either target tree configures or executes this fetch.
+          git -c core.hooksPath=/dev/null init --bare --template= "$VALIDATOR_GIT_DIR"
+          auth="$(printf 'x-access-token:%s' "$GH_READ_TOKEN" | base64 -w 0)"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            timeout 300 git --git-dir="$VALIDATOR_GIT_DIR" \
+              -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+              fetch --no-tags --no-recurse-submodules \
+              https://github.com/TheAxiomFoundation/.github.git \
+              +refs/heads/main:refs/heads/main
+
+      - name: Reject RuleSpec modules without encoder manifests
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.revisions.outputs.base-sha }}
+          HEAD_SHA: ${{ steps.revisions.outputs.head-sha }}
+          MERGE_SHA: ${{ steps.revisions.outputs.merge-sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          VALIDATOR_GIT_DIR: ${{ runner.temp }}/encoder-guard-validator.git
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # This script belongs to the ruleset's SHA-pinned workflow, never to
+          # the target's head. -I prevents imports from the checkout or ambient
+          # PYTHONPATH. Git reads commit objects; no head checkout is created.
+          python3 -I - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import tomllib
+
+          ROOTS = {"statutes", "regulations", "policies", "legislation"}
+          JURISDICTION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*")
+          MANIFEST_DIR = ".axiom/encoding-manifests"
+          WORKFLOW_TOOLCHAIN = ".axiom/workflow-toolchain.toml"
+          VALIDATION_CALLERS = (
+              ".github/workflows/repository-checks.yml",
+              ".github/workflows/repository-checks.yaml",
+          )
+          WORKFLOWS = ".github/workflows"
+          BLOBS = {}
+          VALIDATOR_PATH = ".github/workflows/validate-rulespec.yml"
+          VALIDATOR_CALL = re.compile(r"TheAxiomFoundation/\.github/\.github/workflows/validate-rulespec\.yml@([0-9a-f]{40})")
+          BINDING_INPUTS = ("axiom-encode-ref", "axiom-rules-engine-ref", "axiom-corpus-ref", "rulespec-us-ref")
+
+
+          def git(*args, env=None):
+              result = subprocess.run(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=env,
+              )
+              if result.returncode:
+                  raise SystemExit("Git object read failed: " + result.stderr.decode("utf-8", "replace"))
+              return result.stdout
+
+
+          def guarded(path):
+              # ProgramSpecs are assembled content: the existing validator separately
+              # shape-checks programs/, including companions, before its manifest gate.
+              if not path.endswith((".yaml", ".yml")):
+                  return False
+              if path.endswith((".test.yaml", ".test.yml")) or "/composed/" in path:
+                  return False
+              parts = path.split("/")
+              return (len(parts) >= 2 and parts[0] in ROOTS) or (
+                  len(parts) >= 3 and parts[1] in ROOTS
+                  and JURISDICTION.fullmatch(parts[0]) is not None
+              )
+
+
+          def manifest_candidates(path):
+              stem = path.rsplit(".", 1)[0]
+              candidates = [f"{MANIFEST_DIR}/{stem}.json"]
+              parts = path.split("/")
+              if len(parts) >= 3 and parts[1] in ROOTS and JURISDICTION.fullmatch(parts[0]) is not None:
+                  inner = stem.split("/", 1)[1]
+                  candidates.extend([
+                      f"{MANIFEST_DIR}/{inner}.json",
+                      f"{parts[0]}/{MANIFEST_DIR}/{inner}.json",
+                  ])
+              return candidates
+
+
+          def manifest_prefix(path):
+              parts = path.split("/")
+              if path.endswith(".json"):
+                  if parts[:2] == MANIFEST_DIR.split("/"):
+                      return ""
+                  if len(parts) > 3 and parts[1:3] == MANIFEST_DIR.split("/") and JURISDICTION.fullmatch(parts[0]):
+                      return parts[0] + "/"
+              return None
+
+
+          def inventory(tree, env=None):
+              entries, regular = {}, {}
+              for entry in git("ls-tree", "-r", "-t", "-z", "--full-tree", tree, env=env).split(b"\0"):
+                  if not entry:
+                      continue
+                  metadata, path = entry.split(b"\t", 1)
+                  mode, kind, oid = metadata.split(b" ")
+                  path = os.fsdecode(path)
+                  entries[path] = (mode, kind, oid)
+                  if mode in (b"100644", b"100755") and kind == b"blob":
+                      regular[path] = oid.decode("ascii")
+              return entries, regular
+
+
+          def validation_configuration(tree, entries, regular, env=None):
+              def blob(path):
+                  if path not in entries:
+                      return None
+                  if path not in regular:
+                      raise SystemExit(f"Validation pin source must be a regular Git blob: {path!r}")
+                  oid = regular[path]
+                  if oid not in BLOBS:
+                      BLOBS[oid] = git("show", f"{tree}:{path}", env=env)
+                  return BLOBS[oid]
+
+              # All workflow entries are configuration, including helper and
+              # additional callers. Compare modes/types/OIDs without parsing or
+              # executing candidate YAML, expressions, or indirect pin readers.
+              workflows = {
+                  path: entry for path, entry in entries.items()
+                  if path == WORKFLOWS or path.startswith(WORKFLOWS + "/")
+              }
+              callers = tuple(blob(path) for path in VALIDATION_CALLERS)
+              raw = blob(WORKFLOW_TOOLCHAIN)
+              if raw is not None:
+                  try:
+                      payload = tomllib.loads(raw.decode("utf-8"))
+                  except (UnicodeError, tomllib.TOMLDecodeError):
+                      raise SystemExit("Validation pins require valid UTF-8 TOML in workflow-toolchain.toml")
+                  pins = payload.get("workflow_toolchain")
+                  if set(payload) != {"workflow_toolchain"} or not isinstance(pins, dict) or "axiom_encode_ref" not in pins:
+                      raise SystemExit("Validation pins require a [workflow_toolchain] table with axiom_encode_ref")
+                  for key, value in pins.items():
+                      if not isinstance(value, str) or (key.endswith("_ref") and re.fullmatch(r"[0-9a-f]{40}", value) is None):
+                          raise SystemExit(f"Invalid workflow toolchain pin: {key!r}")
+                  return WORKFLOW_TOOLCHAIN, pins, callers, workflows
+
+              fallback = []
+              for path, raw in zip(VALIDATION_CALLERS, callers):
+                  if raw is None:
+                      continue
+                  try:
+                      text = raw.decode("utf-8")
+                  except UnicodeError:
+                      raise SystemExit(f"Validation caller must be UTF-8: {path!r}")
+                  pins = {}
+                  for match in re.finditer(r"(?m)^[ \t]+(axiom-[a-z0-9-]+-ref|rulespec-us-ref)[ \t]*:[ \t]*(.*)$", text):
+                      key, value = match.groups()
+                      value = value.split("#", 1)[0].strip()
+                      if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+                          value = value[1:-1]
+                      if key in pins or (re.fullmatch(r"[0-9a-f]{40}", value) is None and not (key == "axiom-compose-ref" and value == "")):
+                          raise SystemExit(f"Validation caller requires unambiguous literal commit pins: {key!r}")
+                      pins[key] = value
+                  if "axiom-encode-ref" not in pins:
+                      raise SystemExit(f"Validation caller requires a literal axiom-encode-ref: {path!r}")
+                  fallback.append((path, pins))
+              return None, fallback, callers, workflows
+
+
+          # strict-caller-loader-start
+          def caller_mapping(lines):
+              # Parse only the block-mapping structure needed by the admission
+              # policy. Unsupported YAML is rejected; no candidate parser,
+              # expression, alias, tag, helper, or reusable workflow executes.
+              lines = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+              if not lines:
+                  return {}
+              indentation = len(lines[0]) - len(lines[0].lstrip(" "))
+              mapping = {}
+              index = 0
+              while index < len(lines):
+                  line = lines[index]
+                  if "\t" in line[:len(line) - len(line.lstrip())] or len(line) - len(line.lstrip(" ")) != indentation:
+                      raise SystemExit("Operative canonical validator requires unambiguous block YAML")
+                  match = re.fullmatch(r" *(\"[^\"]*\"|'[^']*'|[A-Za-z0-9_.-]+):(?:[ \t]+(.*))?", line)
+                  if match is None:
+                      raise SystemExit("Operative canonical validator requires unambiguous mapping keys")
+                  key = caller_scalar((match[1], []))
+                  if re.fullmatch(r"[A-Za-z0-9_.-]+", key) is None:
+                      raise SystemExit("Operative canonical validator requires literal mapping keys")
+                  if key in mapping:
+                      raise SystemExit("Operative canonical validator rejects duplicate YAML keys")
+                  value = (match[2] or "").strip()
+                  stop = index + 1
+                  while stop < len(lines):
+                      child_indent = len(lines[stop]) - len(lines[stop].lstrip(" "))
+                      if child_indent > indentation or (not value and child_indent == indentation and lines[stop].lstrip().startswith("- ")):
+                          stop += 1
+                      else:
+                          break
+                  mapping[key] = (value, lines[index + 1:stop])
+                  index = stop
+              return mapping
+
+
+          def caller_scalar(field):
+              if field is None or field[1]:
+                  raise SystemExit("Operative canonical validator requires scalar call fields")
+              value = field[0]
+              if value.startswith('"'):
+                  try:
+                      value, end = json.JSONDecoder().raw_decode(value)
+                  except ValueError:
+                      raise SystemExit("Operative canonical validator requires plain literal scalars")
+                  if not isinstance(value, str) or field[0][end:].strip().split("#", 1)[0]:
+                      raise SystemExit("Operative canonical validator requires plain literal scalars")
+              elif value.startswith("'"):
+                  match = re.fullmatch(r"'((?:[^']|'')*)'(?:[ \t]+#.*)?", value)
+                  if match is None:
+                      raise SystemExit("Operative canonical validator requires plain literal scalars")
+                  value = match[1].replace("''", "'")
+              else:
+                  value = re.split(r"[ \t]+#", value, maxsplit=1)[0].strip()
+                  if not value or value[0] in "&*!>|" or ": " in value:
+                      raise SystemExit("Operative canonical validator rejects YAML aliases, tags and multiline fields")
+              return value
+
+
+          def caller_block(field):
+              if field is None or (field[0] and not field[0].startswith("#")):
+                  raise SystemExit("Operative canonical validator requires explicit block mappings")
+              return caller_mapping(field[1])
+
+
+          def caller_list(field):
+              if field is not None and not field[0] and field[1]:
+                  values = []
+                  for line in field[1]:
+                      if not line.lstrip().startswith("- "):
+                          raise SystemExit("Operative canonical validator requires scalar YAML lists")
+                      values.append(caller_scalar((line.lstrip()[2:], [])))
+                  return values
+              value = caller_scalar(field)
+              if value.startswith("[") and value.endswith("]"):
+                  return [caller_scalar((item.strip(), [])) for item in value[1:-1].split(",")]
+              return [value]
+
+
+          def caller_lines(raw):
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeError:
+                  raise SystemExit("Operative canonical validator requires UTF-8 YAML")
+              # LF is the only line separator. Other separators must remain in
+              # the scalar so admission cannot mask them as a normal newline.
+              fragments = text.split("\n")
+              lines = [line + "\n" for line in fragments[:-1]]
+              if fragments[-1]:
+                  lines.append(fragments[-1])
+              for line in lines:
+                  match = re.match(r"[ \t]*(\"[^\"]*\"|'[^']*'|[A-Za-z0-9_.-]+):", line)
+                  if match is None:
+                      continue
+                  name = caller_scalar((match[1], []))
+                  if name in ("uses", "axiom-encode-ref", "axiom-rules-engine-ref", "axiom-corpus-ref", "rulespec-us-ref", "axiom-compose-ref"):
+                      if not line.endswith("\n") or any(not 32 <= ord(character) <= 126 for character in line[:-1]):
+                          raise SystemExit("Operative canonical validator pin lines require printable ASCII and LF endings")
+              return lines
+
+
+          def caller_document(raw):
+              return caller_mapping([line.removesuffix("\n") for line in caller_lines(raw)])
+          # strict-caller-loader-end
+
+
+          def canonical_validator(configuration, *, required):
+              found = []
+              for raw in configuration[2]:
+                  if raw is None:
+                      continue
+                  workflow = caller_document(raw)
+                  trigger = workflow.get("on")
+                  if trigger is None:
+                      raise SystemExit("Operative canonical validator must run on every pull request")
+                  if trigger[1]:
+                      event_map = caller_block(trigger)
+                      if "pull_request" not in event_map:
+                          raise SystemExit("Operative canonical validator must run on every pull request")
+                      pr = event_map["pull_request"]
+                      if not pr[1] and pr[0] not in ("", "{}", "null", "~"):
+                          raise SystemExit("Operative canonical validator requires an unfiltered pull-request event mapping")
+                      filters = caller_block(pr) if pr[1] else {}
+                      if any(key != "branches" for key in filters):
+                          raise SystemExit("Operative canonical validator cannot filter pull-request validation")
+                      if "branches" in filters:
+                          branches = caller_list(filters["branches"])
+                          default = os.environ.get("DEFAULT_BRANCH", "")
+                          if not default or branches != [default]:
+                              raise SystemExit("Operative canonical validator must include every protected-default-branch pull request")
+                  elif caller_scalar(trigger) != "pull_request":
+                      raise SystemExit("Operative canonical validator must run on every pull request")
+                  jobs = caller_block(workflow.get("jobs"))
+                  if "validate" not in jobs:
+                      raise SystemExit("Operative canonical validator must retain the canonical validate job")
+                  parsed = {key: caller_block(value) for key, value in jobs.items()}
+                  validation = parsed["validate"]
+                  uses = caller_scalar(validation.get("uses")) if "uses" in validation else ""
+                  call = VALIDATOR_CALL.fullmatch(uses)
+                  if call is None or any(key in validation for key in ("if", "steps", "runs-on", "continue-on-error", "strategy")):
+                      raise SystemExit("Operative canonical validator requires an unconditional direct shared validation call")
+                  supplied = caller_block(validation.get("with"))
+                  for key in BINDING_INPUTS:
+                      value = caller_scalar(supplied.get(key))
+                      if re.fullmatch(r"[0-9a-f]{40}", value) is None and not (configuration[0] and re.fullmatch(r"\$\{\{ *needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_-]+ *\}\}", value)):
+                          raise SystemExit("Operative canonical validator must supply all protected binding inputs")
+                  if "axiom-compose-ref" in supplied:
+                      compose = caller_scalar(supplied["axiom-compose-ref"])
+                      if compose and re.fullmatch(r"[0-9a-f]{40}", compose) is None and not (configuration[0] and re.fullmatch(r"\$\{\{ *needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_-]+ *\}\}", compose)):
+                          raise SystemExit("Operative canonical validator requires a scalar protected composer pin")
+                  if "run-generated-guard" in supplied and caller_scalar(supplied["run-generated-guard"]) != "true":
+                      raise SystemExit("Operative canonical validator cannot disable the generated guard")
+                  pending, visited = [("validate", ())], set()
+                  while pending:
+                      key, ancestors = pending.pop()
+                      if key in ancestors:
+                          raise SystemExit("Operative canonical validator dependencies must be acyclic")
+                      if key in visited:
+                          continue
+                      visited.add(key)
+                      if key not in parsed or "if" in parsed[key] or "continue-on-error" in parsed[key]:
+                          raise SystemExit("Operative canonical validator dependencies must remain unconditional")
+                      dependency = parsed[key].get("needs")
+                      if dependency is not None:
+                          for name in caller_list(dependency):
+                              if re.fullmatch(r"[A-Za-z0-9_-]+", name) is None:
+                                  raise SystemExit("Operative canonical validator requires literal job dependencies")
+                              pending.append((name, (*ancestors, key)))
+                  found.append(call[1])
+              if not found and required:
+                  raise SystemExit("Operative canonical validator must remain at its canonical workflow path")
+              if len(set(found)) > 1:
+                  raise SystemExit("Operative canonical validator pins must agree")
+              return found[0] if found else None
+
+
+          def caller_identity(raw):
+              # Existing caller jobs and scripts are trusted only as protected
+              # bytes. Pin-only updates may alter the admitted validation
+              # scalars; every other byte stays identical, including unrelated
+              # job bodies that could otherwise invalidate the whole workflow.
+              lines = caller_lines(raw)
+              def indentation(line):
+                  return len(line) - len(line.lstrip(" "))
+              def key(line):
+                  match = re.match(r" *(\"[A-Za-z0-9_.-]+\"|'[A-Za-z0-9_.-]+'|[A-Za-z0-9_.-]+):", line)
+                  return match[1].strip("\"'") if match else None
+              meaningful = [index for index, line in enumerate(lines) if line.strip() and not line.lstrip().startswith("#")]
+              root_indent = indentation(lines[meaningful[0]])
+              jobs = next(index for index in meaningful if indentation(lines[index]) == root_indent and key(lines[index]) == "jobs")
+              jobs_end = next((index for index in meaningful if index > jobs and indentation(lines[index]) <= root_indent), len(lines))
+              job_indent = min(indentation(lines[index]) for index in meaningful if jobs < index < jobs_end)
+              validation = next(index for index in meaningful if jobs < index < jobs_end and indentation(lines[index]) == job_indent and key(lines[index]) == "validate")
+              validation_end = next((index for index in meaningful if index > validation and indentation(lines[index]) <= job_indent), jobs_end)
+              field_indent = min(indentation(lines[index]) for index in meaningful if validation < index < validation_end)
+              inputs = next(index for index in meaningful if validation < index < validation_end and indentation(lines[index]) == field_indent and key(lines[index]) == "with")
+              inputs_end = next((index for index in meaningful if index > inputs and indentation(lines[index]) <= field_indent), validation_end)
+              input_indent = min(indentation(lines[index]) for index in meaningful if inputs < index < inputs_end)
+              for index in meaningful:
+                  name = key(lines[index])
+                  admitted = validation < index < validation_end and indentation(lines[index]) == field_indent and name == "uses"
+                  admitted |= inputs < index < inputs_end and indentation(lines[index]) == input_indent and name in (*BINDING_INPUTS, "axiom-compose-ref")
+                  if admitted:
+                      if name == "axiom-compose-ref":
+                          lines[index] = ""
+                          continue
+                      lines[index] = " " * indentation(lines[index]) + name + ": <admitted-pin>\n"
+              return "".join(lines)
+
+
+          def require_caller_identity(base_configuration, proposed_configuration):
+              previous = [raw for raw in base_configuration[2] if raw is not None]
+              proposed = [raw for raw in proposed_configuration[2] if raw is not None]
+              if previous:
+                  if {caller_identity(raw) for raw in previous} != {caller_identity(raw) for raw in proposed}:
+                      raise SystemExit("Operative canonical validator updates may change only admitted validation pins; preserve every other protected caller byte")
+                  def binding_values(raw):
+                      workflow = caller_document(raw)
+                      validation = caller_block(caller_block(workflow["jobs"])["validate"])
+                      supplied = caller_block(validation["with"])
+                      return {name: caller_scalar(supplied[name]) for name in (*BINDING_INPUTS, "axiom-compose-ref") if name in supplied}
+                  protected_values = [binding_values(raw) for raw in previous]
+                  for raw in proposed:
+                      for name, value in binding_values(raw).items():
+                          if re.fullmatch(r"[0-9a-f]{40}", value) or (name == "axiom-compose-ref" and not value):
+                              continue
+                          if not any(values.get(name) == value for values in protected_values):
+                              raise SystemExit("Operative canonical validator changed binding inputs must be literal dependency pins; only unchanged protected expressions are admitted")
+                  return
+              # Bootstrap PRs have no existing caller to authenticate unrelated
+              # scripts against. Admit the minimal direct caller shape only.
+              for raw in proposed:
+                  workflow = caller_document(raw)
+                  if set(workflow) - {"name", "on", "permissions", "jobs"}:
+                      raise SystemExit("Operative canonical validator bootstrap requires a minimal direct caller")
+                  if "name" in workflow:
+                      caller_scalar(workflow["name"])
+                  if caller_scalar(workflow["on"]) != "pull_request":
+                      raise SystemExit("Operative canonical validator bootstrap requires the unfiltered pull_request event")
+                  if "permissions" in workflow:
+                      permissions = caller_block(workflow["permissions"])
+                      if set(permissions) != {"contents"} or caller_scalar(permissions["contents"]) != "read":
+                          raise SystemExit("Operative canonical validator bootstrap requires contents: read permissions")
+                  jobs = caller_block(workflow["jobs"])
+                  validation = caller_block(jobs["validate"])
+                  if set(jobs) != {"validate"} or set(validation) - {"uses", "with", "secrets"}:
+                      raise SystemExit("Operative canonical validator bootstrap cannot introduce unrelated jobs or helpers")
+                  if "secrets" in validation and caller_scalar(validation["secrets"]) != "inherit":
+                      raise SystemExit("Operative canonical validator bootstrap requires a scalar secrets field")
+                  supplied = caller_block(validation["with"])
+                  if set(supplied) - {*BINDING_INPUTS, "axiom-compose-ref", "run-generated-guard"}:
+                      raise SystemExit("Operative canonical validator bootstrap requires only the binding inputs")
+                  for name, field in supplied.items():
+                      value = caller_scalar(field)
+                      if name != "run-generated-guard" and value and re.fullmatch(r"[0-9a-f]{40}", value) is None:
+                          raise SystemExit("Operative canonical validator bootstrap requires literal dependency pins")
+
+
+          def require_validator_continuity(base_configuration, proposed_configuration, proposed_entries):
+              # The required ruleset targets rulespec-* repositories. Its own
+              # source repository also receives native workflow events, but
+              # carries neither RuleSpec content nor a validation caller.
+              if (
+                  os.environ.get("REPOSITORY") == "TheAxiomFoundation/.github"
+                  and not established_caller and not established_toolchain
+                  and not any(base_configuration[2]) and base_configuration[0] is None
+                  and not any(proposed_configuration[2]) and proposed_configuration[0] is None
+                  and not any(validation_content(path) for path in proposed_entries)
+              ):
+                  return
+              proposed = canonical_validator(proposed_configuration, required=True)
+              require_caller_identity(base_configuration, proposed_configuration)
+              source_dir = os.environ.get("VALIDATOR_GIT_DIR", "")
+              if not source_dir or not os.path.isdir(source_dir):
+                  raise SystemExit("Trusted shared-validator first-parent main history is required")
+              source_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+              source_env.update({"GIT_DIR": source_dir, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1"})
+              if git("rev-parse", "--is-shallow-repository", env=source_env).strip() != b"false":
+                  raise SystemExit("Complete shared-validator first-parent main history is required")
+              main = git("rev-list", "--first-parent", "refs/heads/main", env=source_env).decode("ascii").splitlines()
+              positions = {revision: index for index, revision in enumerate(main)}
+              proposed_position = positions.get(proposed)
+              if proposed_position is None:
+                  raise SystemExit("Shared validator pin must belong to source first-parent main")
+              trusted = git("show", f"{proposed}:{VALIDATOR_PATH}", env=source_env).decode("utf-8")
+              # Source main is trusted code. Require the isolated input-binding
+              # capability at every selected pin, including unchanged pins; an
+              # old syntax-only validator cannot become a permanent downgrade.
+              binding = re.search(r"(?ms)^      - name: Validate immutable dependency inputs\n(.*?)(?=^      - |\Z)", trusted)
+              required_fragments = (
+                  "python -I - <<'PYPINS'", "ProtectedWorkflowInputError", WORKFLOW_TOOLCHAIN,
+                  "protected_pin", "for key, environment in INPUTS.items():", "os.environ[environment]",
+                  "AXIOM_ENCODE_SHA", "AXIOM_RULES_ENGINE_SHA", "AXIOM_CORPUS_SHA", "RULESPEC_US_SHA",
+              )
+              if binding is None or any(fragment not in binding[1] for fragment in required_fragments) or re.search(r"(?m)^        if:", binding[1]):
+                  raise SystemExit("Shared validator pin must retain isolated protected-input binding")
+              previous = canonical_validator(base_configuration, required=False)
+              if previous is not None and previous != proposed:
+                  previous_position = positions.get(previous)
+                  if previous_position is None or proposed_position is None or proposed_position > previous_position:
+                      raise SystemExit("Shared validator pin must advance monotonically on source first-parent main")
+
+
+          def require_established_sources(entries):
+              # Establishment is permanent across all reachable protected-base
+              # ancestry, including merged branches. Candidate history never
+              # decides whether initialization compatibility is available.
+              if established_toolchain and WORKFLOW_TOOLCHAIN not in entries:
+                  raise SystemExit("Established workflow-toolchain.toml must remain at its protected path")
+              if established_caller and not any(path in entries for path in VALIDATION_CALLERS) and WORKFLOW_TOOLCHAIN not in entries:
+                  raise SystemExit("Established validation configuration requires a canonical caller or workflow-toolchain.toml")
+
+
+          def validation_content(path):
+              parts = path.split("/")
+              if len(parts) > 1 and JURISDICTION.fullmatch(parts[0]):
+                  parts = parts[1:]
+              if parts[0] in ROOTS | {"programs"}:
+                  return True
+              if parts[0] == ".axiom":
+                  # Include all provenance metadata, whatever its receipt name or
+                  # extension. The two toolchain files are configuration instead.
+                  return parts != [".axiom", "workflow-toolchain.toml"] and parts != [".axiom", "toolchain.toml"]
+              return parts == ["known-validation-gaps.yaml"]
+
+
+          base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+          merge = os.environ.get("MERGE_SHA", "")
+          if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in (base, head)):
+              raise SystemExit("Base and head must be exact 40-hex commit SHAs")
+          if merge and re.fullmatch(r"[0-9a-f]{40}", merge) is None:
+              raise SystemExit("Merge must be an exact 40-hex commit SHA")
+          if git("rev-parse", "--is-shallow-repository").strip() != b"false":
+              raise SystemExit("Complete protected base history is required for validation pin protection")
+          established_toolchain = bool(git("log", "--full-history", "--format=%H", "-1", base, "--", WORKFLOW_TOOLCHAIN).strip())
+          established_caller = bool(git("log", "--full-history", "--format=%H", "-1", base, "--", *VALIDATION_CALLERS).strip())
+          # Three-dot selects only the candidate change set. Deletions/type changes
+          # also matter: removing a manifest cannot silently remove provenance.
+          # No attributes, diff drivers, textconv filters, or hooks execute here.
+          fields = git(
+              "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff",
+              "--no-textconv", "--diff-filter=ACMRTD", f"{base}...{head}", "--",
+          ).split(b"\0")
+          if fields[-1] != b"" or len(fields) % 2 != 1:
+              raise SystemExit("Invalid Git name-status output")
+          changes = {}
+          for index in range(0, len(fields) - 1, 2):
+              if fields[index] not in (b"A", b"C", b"M", b"R", b"T", b"D"):
+                  raise SystemExit("Unexpected Git change status")
+              changes[os.fsdecode(fields[index + 1])] = fields[index]
+          ancestor = git("merge-base", base, head).strip().decode("ascii")
+          original, original_regular = inventory(ancestor)
+          base_entries, base_regular = (original, original_regular) if base == ancestor else inventory(base)
+          base_configuration = validation_configuration(base, base_entries, base_regular)
+
+          with tempfile.TemporaryDirectory(prefix="encoder-guard-") as scratch:
+              merge_env = None
+              if os.environ.get("EVENT_NAME") == "merge_group":
+                  # The queue supplies the result already. Do not synthesize a different
+                  # tree, and fail closed if that group is not based on its event base.
+                  git("merge-base", "--is-ancestor", base, head)
+                  tree = head
+              elif merge:
+                  # Never accept a cached test merge computed from a different base/head.
+                  parents = git("rev-list", "--parents", "-n", "1", merge).split()
+                  if parents != [merge.encode(), base.encode(), head.encode()]:
+                      raise SystemExit("Event merge commit does not match exact base and head")
+                  tree = merge
+              else:
+                  # A bare scratch repository isolates merge config/drivers from the
+                  # checkout and global config. Its alternates only read existing Git
+                  # objects; synthesized trees/blobs and the index stay in scratch.
+                  objects = os.path.abspath(os.fsdecode(git("rev-parse", "--git-path", "objects").strip()))
+                  merge_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+                  merge_env.update({
+                      "GIT_DIR": os.path.join(scratch, "repo.git"),
+                      "GIT_INDEX_FILE": os.path.join(scratch, "index"),
+                      "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects,
+                      "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                  })
+                  git("init", "--bare", "--template=", merge_env["GIT_DIR"], env=merge_env)
+                  tree = git("merge-tree", "--write-tree", base, head, env=merge_env).splitlines()[0].decode("ascii")
+                  git("read-tree", tree, env=merge_env)
+                  tree = git("write-tree", env=merge_env).strip().decode("ascii")
+              merged, regular = inventory(tree, merge_env)
+              # Select modules at their final paths, so a base-side rename cannot hide
+              # a candidate edit by moving it away from the head's original filename.
+              merged_fields = git(
+                  "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff",
+                  "--no-textconv", "--diff-filter=ACMRTD", base, tree, "--", env=merge_env,
+              ).split(b"\0")
+              if merged_fields[-1] != b"" or len(merged_fields) % 2 != 1:
+                  raise SystemExit("Invalid merged Git name-status output")
+              changed = []
+              content_changes = []
+              for index in range(0, len(merged_fields) - 1, 2):
+                  if merged_fields[index] not in (b"A", b"C", b"M", b"R", b"T", b"D"):
+                      raise SystemExit("Unexpected merged Git change status")
+                  path = os.fsdecode(merged_fields[index + 1])
+                  if validation_content(path):
+                      content_changes.append(path)
+                  if merged_fields[index] != b"D" and guarded(path):
+                      changed.append(path)
+              merged_configuration = validation_configuration(tree, merged, regular, merge_env)
+              missing = [path for path in changed if not any(candidate in regular for candidate in manifest_candidates(path))]
+              if missing:
+                  print(f"Missing encoder apply manifests: {len(missing)} of {len(changed)} changed modules", file=sys.stderr)
+                  for path in missing:
+                      # repr keeps newlines and control characters inert in logs.
+                      print(f"  {path!r}: expected {manifest_candidates(path)!r}", file=sys.stderr)
+                  raise SystemExit("RuleSpec must come from the supervised encoder: axiom-encode encode <corpus citation> --backend codex --apply")
+              if base_configuration != merged_configuration and content_changes:
+                  print("Validation pins or the validation workflow caller changed alongside modules or provenance receipts:", file=sys.stderr)
+                  for path in content_changes:
+                      print(f"  {path!r}", file=sys.stderr)
+                  raise SystemExit("Pin changes must be their own pull request; keep validation pins and caller edits separate from RuleSpec content and provenance receipts.")
+              require_established_sources(base_entries)
+              require_established_sources(merged)
+              require_validator_continuity(base_configuration, merged_configuration, merged)
+
+              # Match the validator's applied_files deletion marker, not a new receipt
+              # format. Only a regular receipt changed in this PR may retire a module.
+              # Its signature/content authenticity remains the supervised guard's job.
+              retired = set()
+              for path, status in changes.items():
+                  prefix = manifest_prefix(path)
+                  if status == b"D" or prefix is None or path not in regular:
+                      continue
+                  try:
+                      receipt = json.loads(git("cat-file", "blob", regular[path], env=merge_env))
+                  except (ValueError, UnicodeDecodeError):
+                      continue
+                  if not isinstance(receipt, dict) or not isinstance(receipt.get("applied_files"), list):
+                      continue
+                  for entry in receipt["applied_files"]:
+                      if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry.get("sha256") == "deleted":
+                          retired.add(prefix + entry["path"])
+              removed = {
+                  path for path, status in changes.items()
+                  if status in (b"D", b"T") and path in original_regular and path not in regular
+              }
+              orphaned = [
+                  path for path in original if guarded(path)
+                  and any(candidate in removed for candidate in manifest_candidates(path))
+                  and (path in merged or changes.get(path) != b"D" or path not in retired)
+              ]
+              if orphaned:
+                  print("Removed encoder manifests without module retirement receipts:", file=sys.stderr)
+                  for path in orphaned:
+                      print(f"  {path!r}: retain its manifest or delete the module with a changed encoder retirement receipt", file=sys.stderr)
+                  raise SystemExit(1)
+          print(f"Encoder manifest provenance passed for {len(changed)} changed module(s).")
+          PY
