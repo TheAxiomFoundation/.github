@@ -122,6 +122,17 @@ class GeneratorTests(unittest.TestCase):
                     self.invoke(source, *args)
                 self.assertEqual(error.exception.code, 2)
 
+    def test_hard_linked_output_cannot_overwrite_the_source(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source, alias = Path(directory) / "LANES.md", Path(directory) / "alias.md"
+            source.write_text(generator.render_source(CURATED))
+            original = source.read_bytes()
+            os.link(source, alias)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                self.invoke(source, "--pending", "--output", str(alias))
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual(source.read_bytes(), original)
+
 
 class PublicationTests(unittest.TestCase):
     def setUp(self):

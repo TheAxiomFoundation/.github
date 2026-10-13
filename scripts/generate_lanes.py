@@ -8,6 +8,7 @@ import base64
 import datetime as dt
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -191,7 +192,11 @@ def main() -> int:
         parser.error("--check cannot be combined with --output")
     if not args.check and args.output is None:
         parser.error("--output is required to publish the full board separately from main's LANES.md")
-    if args.output is not None and args.output.resolve() == SOURCE.resolve():
+    if args.output is not None and (
+        args.output.resolve() == SOURCE.resolve()
+        or (args.output.exists() and SOURCE.exists() and os.path.samefile(args.output, SOURCE))
+    ):
+        # samefile also catches hard links and other aliases that resolve() cannot see.
         parser.error("--output must not overwrite main's curated LANES.md")
 
     existing = SOURCE.read_text(encoding="utf-8")
