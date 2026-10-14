@@ -4,9 +4,9 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-14 — Stage pending waiver fingerprints for signed SNAP corpus release | 94 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | queued |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-13 — Merge pull request #130 from TheAxiomFoundation/nzhub/lf-guard | 2 | nz-rulespec-2026-07-25 | 630aa73931e5aa87c51d25fe448e38dbcfaed50f | success |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-13 — Merge pull request #464 from TheAxiomFoundation/hub/adopt-waiver-audit-compat | 36 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-12 — Merge pull request #1485 from TheAxiomFoundation/chore/model-pins-2026-10-03 | 93 | us-rulespec-2026-08-08-obbb-alien-snap | ${{ | success |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-13 — Merge pull request #464 from TheAxiomFoundation/hub/adopt-waiver-audit-compat | 37 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-11 — Merge pull request #25 from TheAxiomFoundation/hub/encoder-guard-on | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-11 — Merge pull request #22 from TheAxiomFoundation/hub/encoder-guard-on | 0 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-11 — Merge pull request #20 from TheAxiomFoundation/hub/encoder-guard-on | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
