@@ -2181,18 +2181,22 @@ jobs:
           uv pip install --python "$python_bin" --require-hashes --no-deps -r "$locked"
           uv pip install --python "$python_bin" --no-deps "$oracles"
           uv pip install --python "$python_bin" --no-deps "$encoder"
-          # Differential check: the staged tree and the interpreter (beyond its
-          # bundled pip) must equal the locked environment.
+          # Differential check: the staged tree and the interpreter must equal
+          # the locked environment. pip is left out of the interpreter's side
+          # of the check on both ends: the toolcache bundles one, and the lock
+          # pins its own (sqlite-utils depends on pip) that replaces it.
           uv pip freeze --python "$reference/bin/python" --exclude-editable \
             > "$RUNNER_TEMP/axiom-verification-locked.freeze"
           uv pip freeze --python "$python_bin" --target "$site_packages" \
             --exclude axiom-encode > "$RUNNER_TEMP/axiom-verification-staged.freeze"
+          uv pip freeze --python "$reference/bin/python" --exclude-editable \
+            --exclude pip > "$RUNNER_TEMP/axiom-interpreter-locked.freeze"
           uv pip freeze --python "$python_bin" --exclude pip \
             --exclude axiom-encode > "$RUNNER_TEMP/axiom-interpreter.freeze"
           test -s "$RUNNER_TEMP/axiom-verification-locked.freeze"
           diff -u "$RUNNER_TEMP/axiom-verification-locked.freeze" \
             "$RUNNER_TEMP/axiom-verification-staged.freeze"
-          diff -u "$RUNNER_TEMP/axiom-verification-locked.freeze" \
+          diff -u "$RUNNER_TEMP/axiom-interpreter-locked.freeze" \
             "$RUNNER_TEMP/axiom-interpreter.freeze"
           # pytest for the repository tests: the version the lock's dev extra
           # pins, its closure held to that extra's hashes.

@@ -138,6 +138,7 @@ HEAD_FIRST = 'uv_cache="$(mktemp -d "$RUNNER_TEMP/axiom-uv-cache.XXXXXXXX")"'
 HEAD_LAST = 'rm -rf "$reference" "$uv_cache"'
 HEAD_LOCKED_FREEZE = "$RUNNER_TEMP/axiom-verification-locked.freeze"
 HEAD_STAGED_FREEZE = "$RUNNER_TEMP/axiom-verification-staged.freeze"
+HEAD_INTERPRETER_LOCKED_FREEZE = "$RUNNER_TEMP/axiom-interpreter-locked.freeze"
 HEAD_INTERPRETER_FREEZE = "$RUNNER_TEMP/axiom-interpreter.freeze"
 HEAD_CANONICAL = [
     HEAD_FIRST,
@@ -152,11 +153,13 @@ HEAD_CANONICAL = [
     'uv pip install --python "$python_bin" --no-deps "$oracles"',
     'uv pip install --python "$python_bin" --no-deps "$encoder"',
     *staged_freeze(HEAD_LOCKED_FREEZE, HEAD_STAGED_FREEZE),
+    'uv pip freeze --python "$reference/bin/python" --exclude-editable --exclude pip'
+    f' > "{HEAD_INTERPRETER_LOCKED_FREEZE}"',
     'uv pip freeze --python "$python_bin" --exclude pip --exclude axiom-encode'
     f' > "{HEAD_INTERPRETER_FREEZE}"',
     f'test -s "{HEAD_LOCKED_FREEZE}"',
     f'diff -u "{HEAD_LOCKED_FREEZE}" "{HEAD_STAGED_FREEZE}"',
-    f'diff -u "{HEAD_LOCKED_FREEZE}" "{HEAD_INTERPRETER_FREEZE}"',
+    f'diff -u "{HEAD_INTERPRETER_LOCKED_FREEZE}" "{HEAD_INTERPRETER_FREEZE}"',
     'tests_locked="$RUNNER_TEMP/axiom-repository-tests-locked-requirements.txt"',
     'uv export --project "$encoder" --locked --no-dev --extra dev --no-emit-project'
     " --no-emit-package axiom-oracles --format requirements-txt"
@@ -270,13 +273,19 @@ elif argv[:2] == ["pip", "freeze"]:
         key = "FAKE_LOCKED_FREEZE"
     else:
         key = "FAKE_INTERPRETER_FREEZE"
-    sys.stdout.write(os.environ[key])
+    excluded = {argv[i + 1] for i, arg in enumerate(argv) if arg == "--exclude"}
+    for line in os.environ[key].splitlines(keepends=True):
+        if line.split("==")[0].split(" @ ")[0] not in excluded:
+            sys.stdout.write(line)
 else:
     sys.exit(f"unexpected uv invocation: {argv}")
 '''
 
 HASH = "--hash=sha256:" + "0" * 64
-LOCKED_FREEZE = f"claude-agent-sdk==0.1.47\n{LOCKED_GIT_LINE}\nrequests==2.32.5\n"
+# The real locks pin pip (sqlite-utils depends on it); the toolcache
+# interpreter keeps its own bundled pip unless that pin replaces it.
+LOCKED_FREEZE = f"claude-agent-sdk==0.1.47\n{LOCKED_GIT_LINE}\npip==25.3\nrequests==2.32.5\n"
+TOOLCACHE_FREEZE = LOCKED_FREEZE.replace("pip==25.3", "pip==26.2.1")
 UNHASHED_EXPORT = f"claude-agent-sdk==0.1.47\n{LOCKED_GIT_LINE}\nrequests==2.32.5\n"
 
 
@@ -294,7 +303,7 @@ class Run:
 
 
 def execute(name: str, *, unhashed_export: str = UNHASHED_EXPORT,
-            staged_freeze: str = LOCKED_FREEZE, interpreter_freeze: str = LOCKED_FREEZE,
+            staged_freeze: str = LOCKED_FREEZE, interpreter_freeze: str = TOOLCACHE_FREEZE,
             locked_freeze: str = LOCKED_FREEZE,
             dev_export: str = f"pytest==9.0.2 \\\n    {HASH}\n",
             export_fails: bool = False, sync_fails: bool = False) -> Run:
@@ -486,6 +495,8 @@ class LockedSitePackagesTests(unittest.TestCase):
             [*system, "--no-deps", encoder],
             ["pip", "freeze", "--python", reference + "/bin/python", "--exclude-editable"],
             ["pip", "freeze", "--python", python, "--target", site_packages, "--exclude", "axiom-encode"],
+            ["pip", "freeze", "--python", reference + "/bin/python", "--exclude-editable",
+             "--exclude", "pip"],
             ["pip", "freeze", "--python", python, "--exclude", "pip", "--exclude", "axiom-encode"],
             ["export", "--project", encoder, "--locked", "--no-dev", "--extra", "dev",
              "--no-emit-project", "--no-emit-package", "axiom-oracles", "--format",
@@ -586,6 +597,11 @@ class LockedSitePackagesTests(unittest.TestCase):
                 run = execute(name, staged_freeze=drifted)
                 self.assertNotEqual(run.result.returncode, 0)
                 self.assertIn("+claude-agent-sdk==0.2.159", run.result.stdout)
+        for name in (HEAD, BASE):
+            with self.subTest(step=name, missing="pip"):
+                run = execute(name, staged_freeze=LOCKED_FREEZE.replace("pip==25.3\n", ""))
+                self.assertNotEqual(run.result.returncode, 0)
+                self.assertIn("-pip==25.3", run.result.stdout)
         for name in (HEAD, BASE, COMPOSE):
             with self.subTest(step=name, extra="unlocked distribution"):
                 run = execute(name, staged_freeze=LOCKED_FREEZE + "sitecustomize-hook==1.0\n")
@@ -594,8 +610,9 @@ class LockedSitePackagesTests(unittest.TestCase):
 
     def test_head_staging_fails_when_the_interpreter_drifts_from_the_lock(self):
         for label, freeze in (
-            ("floated", LOCKED_FREEZE.replace("0.1.47", "0.2.159")),
-            ("preinstalled", LOCKED_FREEZE + "setuptools==80.9.0\n"),
+            ("floated", TOOLCACHE_FREEZE.replace("0.1.47", "0.2.159")),
+            ("preinstalled", TOOLCACHE_FREEZE + "setuptools==80.9.0\n"),
+            ("missing", TOOLCACHE_FREEZE.replace("requests==2.32.5\n", "")),
         ):
             with self.subTest(interpreter=label):
                 run = execute(HEAD, interpreter_freeze=freeze)
