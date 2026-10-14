@@ -198,12 +198,12 @@ COMPOSE_CANONICAL = [
     f'rm -rf "$compose_reference" "{COMPOSE_SITE_PACKAGES}"',
     'UV_PROJECT_ENVIRONMENT="$compose_reference" uv sync'
     ' --project "${AXIOM_DEPENDENCY_ROOT}/axiom-compose" --locked --no-dev'
-    f' --no-install-project --python "{COMPOSE_PYTHON}"',
+    f' --no-install-project --no-build --python "{COMPOSE_PYTHON}"',
     'uv export --project "${AXIOM_DEPENDENCY_ROOT}/axiom-compose" --locked --no-dev'
     " --no-emit-project --format requirements.txt"
     ' --output-file "$RUNNER_TEMP/axiom-compose-requirements.txt"',
     f'uv pip install --python "{COMPOSE_PYTHON}" --target "{COMPOSE_SITE_PACKAGES}"'
-    " --require-hashes --no-deps"
+    " --require-hashes --no-deps --no-build"
     ' --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"',
     'uv pip freeze --python "$compose_reference/bin/python"'
     ' > "$RUNNER_TEMP/axiom-compose-locked.freeze"',
@@ -227,7 +227,7 @@ LOCKED_REQUIREMENTS = {
     '--require-hashes --no-deps -r "$locked"',
     '--no-deps "$oracles"',
     '--no-deps "$encoder"',
-    '--require-hashes --no-deps --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"',
+    '--require-hashes --no-deps --no-build --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"',
     '--require-hashes --constraints "$tests_locked" "$pytest_pin"',
 }
 
@@ -553,11 +553,11 @@ class LockedSitePackagesTests(unittest.TestCase):
         site_packages = str(temp / "axiom-compose-site-packages")
         self.assertEqual(run.argv, [
             ["sync", "--project", project, "--locked", "--no-dev", "--no-install-project",
-             "--python", python],
+             "--no-build", "--python", python],
             ["export", "--project", project, "--locked", "--no-dev", "--no-emit-project",
              "--format", "requirements.txt", "--output-file", requirements],
             ["pip", "install", "--python", python, "--target", site_packages,
-             "--require-hashes", "--no-deps", "--requirement", requirements],
+             "--require-hashes", "--no-deps", "--no-build", "--requirement", requirements],
             ["pip", "freeze", "--python", reference + "/bin/python"],
             ["pip", "freeze", "--python", python, "--target", site_packages],
         ])

@@ -2635,6 +2635,9 @@ jobs:
           uv venv --python 3.14 "$RUNNER_TEMP/axiom-compose-build"
           # The composer runtime is likewise exactly its uv.lock set: hashed and
           # unresolved, then checked against a `uv sync --locked` environment.
+          # Its export is wheels only (axiom-encode sits in an optional extra),
+          # so --no-build fails closed rather than build a source distribution
+          # with unpinned build backends.
           compose_reference="$RUNNER_TEMP/axiom-compose-locked-environment"
           rm -rf "$compose_reference" "$RUNNER_TEMP/axiom-compose-site-packages"
           UV_PROJECT_ENVIRONMENT="$compose_reference" uv sync \
@@ -2642,6 +2645,7 @@ jobs:
             --locked \
             --no-dev \
             --no-install-project \
+            --no-build \
             --python "$RUNNER_TEMP/axiom-compose-build/bin/python"
           uv export \
             --project "${AXIOM_DEPENDENCY_ROOT}/axiom-compose" \
@@ -2655,6 +2659,7 @@ jobs:
             --target "$RUNNER_TEMP/axiom-compose-site-packages" \
             --require-hashes \
             --no-deps \
+            --no-build \
             --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"
           uv pip freeze --python "$compose_reference/bin/python" \
             > "$RUNNER_TEMP/axiom-compose-locked.freeze"
