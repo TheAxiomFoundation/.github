@@ -3384,12 +3384,15 @@ jobs:
           python -I /opt/axiom-dependency-integrity/check.py verify
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-verification-runtime /opt/axiom-base-verification runtime
           # Acquisition needs cloud read credentials, which the supervisor
-          # discards. Invoke only the sealed base runtime's known CLI entry point.
+          # discards. Invoke only the sealed base runtime's known CLI entry point:
+          # the axiom-encode console script's target, which dispatches
+          # corpus-fetch before delegating to axiom_encode.cli (whose parser has
+          # no corpus-fetch). SystemExit carries the command's exit status.
           base_corpus_fetch() {
             # Conditional probes suppress errexit inside this function.
             python -I /opt/axiom-dependency-integrity/check.py verify || return "$?"
             /opt/axiom-base-verification/python/bin/python${{ inputs.python-version }} -I -B -c \
-              'from axiom_encode.cli import main; main()' "$@"
+              'from axiom_encode.entrypoint import main; raise SystemExit(main())' "$@"
           }
           if [ -d "$base_dependencies/axiom-corpus/.axiom/corpus-locks" ]; then
             if ! base_corpus_fetch corpus-fetch --help >/dev/null 2>&1; then
