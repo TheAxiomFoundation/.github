@@ -361,6 +361,84 @@ class PinBumpManifestTests(unittest.TestCase):
                     self.assertIn("DependencyIntegrityError", result.stderr)
                     self.assertFalse(marker.exists(), "integrity failure was masked by conditional corpus-fetch")
 
+    def test_base_corpus_fetch_runs_the_console_entry_point_and_keeps_its_status(self):
+        """corpus-fetch lives in axiom_encode.entrypoint, not axiom_encode.cli.
+
+        Encoders since axiom-encode#1742 dispatch corpus-fetch in the console
+        script's target and delegate everything else to axiom_encode.cli,
+        whose parser rejects corpus-fetch. Run the real function against a
+        stand-in runtime whose modules mirror that split.
+        """
+        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+        preparation = next(step for step in steps if step.get("name") == "Prepare protected-base manifest audit")
+        source = preparation["run"].split("base_corpus_fetch() {\n", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("axiom_encode.cli", source)
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-base-fetch-", dir=TEMP_PARENT) as directory:
+            root = Path(directory)
+            integrity = root / "integrity"
+            integrity.mkdir()
+            (integrity / "check.py").write_text("")
+            package = root / "stub/axiom_encode"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("")
+            (package / "cli.py").write_text(
+                "import sys\n"
+                "def main():\n"
+                "    if sys.argv[1:2] == ['corpus-fetch']:\n"
+                "        raise SystemExit(\"invalid choice: 'corpus-fetch'\")\n"
+                "    return 0\n"
+            )
+            (package / "entrypoint.py").write_text(
+                "import sys\n"
+                "def main():\n"
+                "    argv = sys.argv[1:]\n"
+                "    if argv[:1] == ['corpus-fetch']:\n"
+                "        if '--help' in argv:\n"
+                "            print('usage: axiom-encode corpus-fetch')\n"
+                "            return 0\n"
+                "        return int(argv[argv.index('--fixture-status') + 1])\n"
+                "    from axiom_encode.cli import main as cli_main\n"
+                "    return cli_main()\n"
+            )
+            runtime = root / "runtime/python/bin"
+            runtime.mkdir(parents=True)
+            # The sealed runtime's interpreter, run exactly as the step does.
+            executable = runtime / "python3.13"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "assert args[:3] == ['-I', '-B', '-c'], args\n"
+                "code = args[3]\n"
+                "sys.argv = ['-c', *args[4:]]\n"
+                f"sys.path.insert(0, {str(root / 'stub')!r})\n"
+                "exec(compile(code, '<string>', 'exec'), {'__name__': '__main__'})\n"
+            )
+            executable.chmod(0o755)
+            tools = root / "tools"
+            tools.mkdir()
+            (tools / "python").symlink_to(sys.executable)
+            source = source.replace("/opt/axiom-dependency-integrity", str(integrity))
+            source = source.replace("/opt/axiom-base-verification", str(root / "runtime"))
+            source = source.replace("${{ inputs.python-version }}", "3.13")
+            for invocation, status in (
+                ("base_corpus_fetch corpus-fetch --help", 0),
+                ("base_corpus_fetch corpus-fetch --corpus-path corpus --fixture-status 0", 0),
+                ("base_corpus_fetch corpus-fetch --corpus-path corpus --fixture-status 3", 3),
+                ("if base_corpus_fetch corpus-fetch --fixture-status 5; then exit 0; else exit $?; fi", 5),
+            ):
+                with self.subTest(invocation=invocation):
+                    result = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n" + invocation],
+                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+            # The protected-base step's capability probe passes for such an encoder.
+            probe = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n"
+                                    "if ! base_corpus_fetch corpus-fetch --help >/dev/null 2>&1; then exit 1; fi"],
+                                   env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                   capture_output=True, text=True, timeout=10)
+            self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+
     def test_merge_group_audit_uses_protected_base_instead_of_first_parent(self):
         result, calls = run_guard(event="merge_group", scenario="legacy")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
