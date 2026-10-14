@@ -21,6 +21,7 @@ import json
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -75,14 +76,79 @@ def workflow_steps():
                 yield path.name, job_name, index, step
 
 
-def pip_installs(*, target: bool):
-    for workflow, job, index, step in workflow_steps():
-        for line in logical_lines(step.get("run", "")):
-            if not re.search(r"\bpip\b.*\binstall\b", line):
-                continue
-            has_target = re.search(r"(^|\s)(--target|-t)(\s|=)", line) is not None
-            if has_target == target:
-                yield workflow, job, index, step, line
+# Any command that can put a distribution on disk or into an interpreter.
+# Matched over the raw logical line, so an installer hidden inside a quoted
+# command substitution is still counted.
+INSTALLER = re.compile(
+    r"(?<![\w./-])(?:uv\s+pip\s+(?:install|sync)|uv\s+(?:sync|add|run|tool)\b"
+    r"|uv\s+python\s+install|uvx|pip3?(?:\.\d+)?\s+install|-m\s+(?:pip|ensurepip)\b"
+    r"|easy_install)(?![\w-])"
+)
+SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "{", "}"}
+DIRECTORY_OPTIONS = ("--target", "-t", "--prefix", "--root", "--user")
+
+
+def simple_commands(line: str) -> list[list[str]] | None:
+    """Top-level simple commands of one logical line; None if unparseable."""
+    try:
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>(){}")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    commands, current, skip = [], [], False
+    for token in tokens:
+        if skip:
+            skip = False
+            continue
+        if token in SEPARATORS:
+            if current:
+                commands.append(current)
+            current = []
+        elif set(token) <= set("<>"):
+            skip = True  # the redirection target is not an argument
+        else:
+            current.append(token)
+    if current:
+        commands.append(current)
+    return commands
+
+
+def is_installer(argv: list[str]) -> bool:
+    for index, token in enumerate(argv):
+        name = token.rsplit("/", 1)[-1]
+        rest = argv[index + 1:]
+        if name == "uv" and (rest[:2] in (["pip", "install"], ["pip", "sync"], ["python", "install"])
+                             or rest[:1] in (["sync"], ["add"], ["run"], ["tool"])):
+            return True
+        if name == "uvx" or name == "easy_install":
+            return True
+        if re.fullmatch(r"pip3?(\.\d+)?", name) and "install" in rest:
+            return True
+        if token == "-m" and rest[:1] in (["pip"], ["ensurepip"]):
+            return True
+    return False
+
+
+def installers(run: str) -> tuple[list[tuple[str, ...]], list[str]]:
+    """Every installer command in a run block, and any that hide from parsing."""
+    found, hidden = [], []
+    for line in logical_lines(run):
+        hits = len(INSTALLER.findall(line))
+        commands = simple_commands(line)
+        parsed = [tuple(argv) for argv in commands or [] if is_installer(argv)]
+        if commands is None or hits != len(parsed):
+            if hits:
+                hidden.append(line)
+            continue
+        found.extend(parsed)
+    return found, hidden
+
+
+def installs_into_a_directory(argv: tuple[str, ...]) -> bool:
+    return any(token == option or token.startswith(option + "=")
+               or (option == "-t" and token.startswith("-t") and len(token) > 2)
+               for token in argv for option in DIRECTORY_OPTIONS)
 
 
 VALIDATE_STEPS = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)[
@@ -215,21 +281,83 @@ COMPOSE_CANONICAL = [
     COMPOSE_LAST,
 ]
 
-# Every --target install in this repository's workflows, by staging step.
-TARGET_INSTALLS = {
-    HEAD: 3,
-    BASE: 3,
-    COMPOSE: 1,
+def _uv_install(*args: str) -> tuple[str, ...]:
+    return ("uv", "pip", "install", *args)
+
+
+_TARGET = ("--python", "$python_bin", "--target", "$site_packages")
+_ENCODER_SYNC = ("UV_PROJECT_ENVIRONMENT=$reference", "uv", "sync", "--project", "$encoder",
+                 "--locked", "--no-dev", "--python", "$python_bin")
+_ENCODER_TREE = [
+    _uv_install(*_TARGET, "--require-hashes", "--no-deps", "-r", "$locked"),
+    _uv_install(*_TARGET, "--no-deps", "$oracles"),
+    _uv_install(*_TARGET, "--no-deps", "$encoder"),
+]
+
+# Every installer command in validate-rulespec.yml, by job and step, exactly.
+# Shell quoting is removed, so `"--target=$x"` and `--target "$x"` both appear
+# here as parsed arguments; any other installer anywhere fails the test.
+INSTALLERS = {
+    ("shards", "Install the ProgramSpec shape-check parser"): [
+        ("python", "-I", "-m", "pip", "--isolated", "install",
+         "--disable-pip-version-check", "pyyaml==6.0.3"),
+    ],
+    ("validate", HEAD): [
+        _ENCODER_SYNC,
+        *_ENCODER_TREE,
+        _uv_install("--python", "$python_bin", "--require-hashes", "--no-deps", "-r", "$locked"),
+        _uv_install("--python", "$python_bin", "--no-deps", "$oracles"),
+        _uv_install("--python", "$python_bin", "--no-deps", "$encoder"),
+        _uv_install("--python", "$python_bin", "--require-hashes",
+                    "--constraints", "$tests_locked", "$pytest_pin"),
+    ],
+    ("validate", BASE): [_ENCODER_SYNC, *_ENCODER_TREE],
+    ("validate", COMPOSE): [
+        ("uv", "python", "install", "3.14"),
+        ("UV_PROJECT_ENVIRONMENT=$compose_reference", "uv", "sync",
+         "--project", "${AXIOM_DEPENDENCY_ROOT}/axiom-compose", "--locked", "--no-dev",
+         "--no-install-project", "--no-build", "--python", COMPOSE_PYTHON),
+        _uv_install("--python", COMPOSE_PYTHON, "--target", COMPOSE_SITE_PACKAGES,
+                    "--require-hashes", "--no-deps", "--no-build",
+                    "--requirement", "$RUNNER_TEMP/axiom-compose-requirements.txt"),
+    ],
+    # After the last protected-runtime consumer, the classifier reinstalls the
+    # same authenticated encoder commit, whose dependencies the locked set
+    # already satisfies.
+    ("validate", CLASSIFIER): [
+        ("python", "-I", "-m", "pip", "--isolated", "install",
+         "$RUNNER_TEMP/axiom-encode-oracle-coverage-install"),
+        ("python", "-I", "-m", "pip", "--isolated", "install", "--force-reinstall",
+         "--no-deps", "$oracles_spec"),
+    ],
 }
 
-# Locked forms an install may take, as (requirement suffix, hash-checked).
-LOCKED_REQUIREMENTS = {
-    '--require-hashes --no-deps -r "$locked"',
-    '--no-deps "$oracles"',
-    '--no-deps "$encoder"',
-    '--require-hashes --no-deps --no-build --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"',
-    '--require-hashes --constraints "$tests_locked" "$pytest_pin"',
-}
+
+def installer_violations(text: str) -> list[str]:
+    """Every way validate-rulespec.yml's installers differ from INSTALLERS."""
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    violations = []
+    seen = {}
+    for job_name, job in workflow.get("jobs", {}).items():
+        steps = job.get("steps", [])
+        for item in steps:
+            found, hidden = installers(item.get("run", ""))
+            key = (job_name, item.get("name"))
+            violations += [f"{key}: installer hidden from parsing: {line}" for line in hidden]
+            if found:
+                seen[key] = seen.get(key, []) + found
+        if job_name == "validate":
+            names = [item.get("name") for item in steps]
+            consumers = [index for index, item in enumerate(steps)
+                         if any(runtime in item.get("run", "") for runtime in PROTECTED_RUNTIMES)]
+            if not consumers or names[max(consumers)] != "Require money proof atoms":
+                violations.append("the last protected-runtime consumer moved")
+            elif CLASSIFIER in names and names.index(CLASSIFIER) < max(consumers):
+                violations.append("the classifier's pip installs precede a protected consumer")
+    for key in sorted(set(seen) | set(INSTALLERS), key=str):
+        if seen.get(key, []) != INSTALLERS.get(key, []):
+            violations.append(f"{key}: {seen.get(key, [])} != {INSTALLERS.get(key, [])}")
+    return violations
 
 
 FAKE_UV = r'''
@@ -370,24 +498,70 @@ def execute(name: str, *, unhashed_export: str = UNHASHED_EXPORT,
 
 
 class LockedSitePackagesTests(unittest.TestCase):
-    def test_every_target_install_is_a_locked_uv_install(self):
-        installs = list(pip_installs(target=True))
-        # Non-vacuity: discovery sees every protected staging, and nothing else.
-        found: dict[str, int] = {}
-        for workflow, _job, _index, item, _line in installs:
-            self.assertEqual(workflow, WORKFLOW.name)
-            found[item["name"]] = found.get(item["name"], 0) + 1
-        self.assertEqual(found, TARGET_INSTALLS)
-        for _workflow, job, _index, item, line in installs:
-            where = f"{job}/{item['name']}: {line}"
-            self.assertTrue(line.startswith("uv pip install --python "), where)
-            self.assertIn("--no-deps", line.split(), where)
-            self.assertNotIn(".[", line, where)
-            self.assertTrue(any(line.endswith(" " + form) for form in LOCKED_REQUIREMENTS), where)
-            if '-r "$locked"' in line or "--requirement" in line:
-                self.assertIn("--require-hashes", line.split(), where)
-            else:
-                self.assertNotIn("--require-hashes", line.split(), where)
+    def test_every_directory_install_in_any_workflow_is_a_locked_uv_install(self):
+        directory = []
+        for workflow, job, _index, item in workflow_steps():
+            found, hidden = installers(item.get("run", ""))
+            self.assertEqual(hidden, [], f"{workflow}:{job}/{item.get('name')}")
+            directory += [(workflow, job, item.get("name"), argv) for argv in found
+                          if installs_into_a_directory(argv)]
+        expected = [(WORKFLOW.name, job, name, argv)
+                    for (job, name), commands in INSTALLERS.items()
+                    for argv in commands if installs_into_a_directory(argv)]
+        # Non-vacuity: 3 head, 3 protected-base and 1 composer staging install.
+        self.assertEqual(len(expected), 7)
+        self.assertEqual(sorted(directory, key=str), sorted(expected, key=str))
+        for *_where, argv in directory:
+            self.assertEqual(argv[:3], ("uv", "pip", "install"), argv)
+            self.assertIn("--no-deps", argv)
+            requirement_files = [argv[i + 1] for i, token in enumerate(argv)
+                                 if token in ("-r", "--requirement")]
+            self.assertEqual("--require-hashes" in argv, bool(requirement_files), argv)
+
+    def test_installers_are_exactly_the_locked_allowlist(self):
+        self.assertEqual(installer_violations(WORKFLOW.read_text(encoding="utf-8")), [])
+
+    def test_installer_guard_rejects_unlocked_variants(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        head_cleanup = '          rm -rf "$reference" "$uv_cache"\n'
+        self.assertEqual(text.count(head_cleanup), 2)
+
+        def after_head_cleanup(line: str) -> str:
+            return text.replace(head_cleanup, head_cleanup + "          " + line + "\n", 1)
+
+        new_step = (
+            "      - name: Late hostile install\n"
+            "        run: uv pip install --python \"$(command -v python)\" hostile-pkg\n\n"
+            "      - name: Require money proof atoms\n"
+        )
+        mutations = {
+            # The independent review's bypass: a quoted --target= and an extra requirement.
+            "quoted target, extra requirement": after_head_cleanup(
+                'uv pip install --python "$python_bin" "--target=$site_packages" hostile-pkg --no-deps "$encoder"'),
+            "short -t": after_head_cleanup('uv pip install --python "$python_bin" -t "$site_packages" --no-deps hostile-pkg'),
+            "glued -t": after_head_cleanup('uv pip install --python "$python_bin" "-t$site_packages" --no-deps hostile-pkg'),
+            "extra requirement file": after_head_cleanup(
+                'uv pip install --python "$python_bin" --target "$site_packages" --require-hashes --no-deps -r "$locked" -r extra.txt'),
+            "unlocked interpreter install": after_head_cleanup('uv pip install --python "$python_bin" --no-deps hostile-pkg'),
+            "pip into the interpreter": after_head_cleanup("python -I -m pip --isolated install hostile-pkg"),
+            "pip3": after_head_cleanup("pip3 install hostile-pkg"),
+            "sudo pip": after_head_cleanup("sudo pip install hostile-pkg"),
+            "hidden in a substitution": after_head_cleanup('noise="$(uv pip install --python "$python_bin" hostile-pkg)"'),
+            "chained": after_head_cleanup('true && uv pip install --python "$python_bin" hostile-pkg'),
+            "uv run --with": after_head_cleanup("uv run --with hostile-pkg python -c pass"),
+            "uvx": after_head_cleanup("uvx hostile-pkg"),
+            "prefix install": after_head_cleanup('uv pip install --python "$python_bin" --prefix /opt/x --no-deps "$encoder"'),
+            "extras on the project": text.replace('--no-deps "$encoder"\n', '--no-deps "$encoder[api]"\n', 1),
+            "dropped --require-hashes": text.replace(
+                '--require-hashes --no-deps -r "$locked"', '--no-deps -r "$locked"', 1),
+            "dropped composer --no-build": text.replace("            --no-build \\\n", "", 1),
+            "new step before the last consumer": text.replace(
+                "      - name: Require money proof atoms\n", new_step, 1),
+        }
+        for label, mutated in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertNotEqual(mutated, text)
+                self.assertNotEqual(installer_violations(mutated), [])
 
     def test_staging_blocks_are_exactly_the_locked_install(self):
         self.assertEqual(block(HEAD, HEAD_FIRST, HEAD_LAST), HEAD_CANONICAL)
@@ -405,32 +579,6 @@ class LockedSitePackagesTests(unittest.TestCase):
         compose = logical_lines(step(COMPOSE)["run"])
         for setting in ("export UV_NO_CONFIG=1", "export UV_NO_CACHE=1"):
             self.assertLess(compose.index(setting), compose.index(COMPOSE_FIRST))
-
-    def test_job_interpreter_installs_are_locked_until_protected_consumers_finish(self):
-        consumers = [index for index, item in enumerate(VALIDATE_STEPS)
-                     if any(runtime in item.get("run", "") for runtime in PROTECTED_RUNTIMES)]
-        last_consumer = max(consumers)
-        self.assertEqual(STEP_NAMES[last_consumer], "Require money proof atoms")
-        late = []
-        for workflow, job, index, item, line in pip_installs(target=False):
-            if workflow != WORKFLOW.name or job != "validate":
-                continue
-            if index <= last_consumer:
-                where = f"{item['name']}: {line}"
-                self.assertTrue(line.startswith('uv pip install --python "$python_bin" '), where)
-                self.assertTrue(any(line.endswith(" " + form) for form in LOCKED_REQUIREMENTS), where)
-            else:
-                late.append((item["name"], line))
-        # After the last protected consumer the classifier still reinstalls the
-        # same authenticated encoder commit, whose dependencies the locked set
-        # above already satisfies. Nothing else may install there.
-        self.assertEqual(late, [
-            (CLASSIFIER, 'python -I -m pip --isolated install "$RUNNER_TEMP/axiom-encode-oracle-coverage-install"'),
-            (CLASSIFIER, 'python -I -m pip --isolated install --force-reinstall --no-deps "$oracles_spec"'),
-        ])
-        self.assertGreater(STEP_NAMES.index(CLASSIFIER), last_consumer)
-        installs = logical_lines(step(HEAD)["run"])
-        self.assertFalse([line for line in installs if "-m pip" in line])
 
     def test_uv_is_pinned_and_set_up_before_every_staging(self):
         uses = [(index, item) for index, item in enumerate(VALIDATE_STEPS)
