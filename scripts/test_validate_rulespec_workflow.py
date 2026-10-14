@@ -38,7 +38,8 @@ def test_corpus_placement_runs_before_supervised_gates_with_step_only_credential
     assert names[index + 1] == "Provision protected verification supervisor"
     install = steps[names.index("Install Python dependencies")]
     assert names.index("Install Python dependencies") < index
-    assert 'python -I -m pip --isolated install "$RUNNER_TEMP/axiom-encode-install"' in install["run"]
+    assert 'encoder="$RUNNER_TEMP/axiom-encode-install"' in install["run"]
+    assert 'uv pip install --python "$python_bin" --no-deps "$encoder"' in install["run"]
 
     step = steps[index]
     assert step["shell"] == "bash"
