@@ -2304,8 +2304,20 @@ def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
         assert "retired_root_args=(--retired-corpus-release-root" in run, name
         assert '${retired_root_args[@]+"${retired_root_args[@]}"}' in run, name
         block = retired_root_block(run)
-        probe = block + '\nprintf "<%s>\\n" ${retired_root_args[@]+"${retired_root_args[@]}"}'
-        cases = {None: "", "": "", RETIRED: f"<--retired-corpus-release-root>\n<{RETIRED}>\n"}
+        # Expand the array exactly as the workflow passes it to the provisioner, then
+        # report the argument count and each argument, so an empty argument cannot
+        # pass for no argument.
+        probe = (
+            block
+            + '\nshow() { echo "n=$#"; for arg in "$@"; do printf "<%s>\\n" "$arg"; done; }'
+            + '\nshow ${retired_root_args[@]+"${retired_root_args[@]}"}'
+        )
+        absent = "n=0\n"
+        cases = {
+            None: absent,
+            "": absent,
+            RETIRED: f"n=2\n<--retired-corpus-release-root>\n<{RETIRED}>\n",
+        }
         for value, expected in cases.items():
             env = {k: v for k, v in os.environ.items() if k != "TRUST_RETIRED_CORPUS_RELEASE_ROOT"}
             if value is not None:
@@ -2315,9 +2327,7 @@ def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
                 env=env, capture_output=True, text=True, timeout=30, check=False,
             )
             assert result.returncode == 0, (name, value, result.stderr)
-            # printf with no arguments still prints its format once; normalise that case.
-            output = "" if result.stdout == "<>\n" else result.stdout
-            assert output == expected, (name, value, result.stdout)
+            assert result.stdout == expected, (name, value, result.stdout)
     print("optional retired corpus release root: ok")
 
 
