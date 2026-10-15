@@ -2543,6 +2543,13 @@ jobs:
           # invoking interpreter's sys.base_prefix, i.e. it would copytree
           # /usr until the runner disk dies. Resolve the setup-python
           # interpreter in this shell and pass its absolute path through.
+          # The retired corpus release root is optional: pass it only while the
+          # organization still sets it, so deleting the variable after re-signing
+          # does not hand the provisioner an empty root (which it refuses).
+          retired_root_args=()
+          if [ -n "${TRUST_RETIRED_CORPUS_RELEASE_ROOT:-}" ]; then
+            retired_root_args=(--retired-corpus-release-root "$TRUST_RETIRED_CORPUS_RELEASE_ROOT")
+          fi
           python -I /opt/axiom-dependency-integrity/check.py verify
           sudo "$(command -v python)" -I scripts/provision_verification_supervisor.py \
             --destination /opt/axiom-verification \
@@ -2550,7 +2557,7 @@ jobs:
             --site-packages "$RUNNER_TEMP/axiom-verification-site-packages" \
             --apply-root "$TRUST_APPLY_ROOT" --eval-root "$TRUST_EVAL_ROOT" \
             --corpus-release-root "$TRUST_CORPUS_RELEASE_ROOT" \
-            --retired-corpus-release-root "$TRUST_RETIRED_CORPUS_RELEASE_ROOT" \
+            ${retired_root_args[@]+"${retired_root_args[@]}"} \
             --git "$(command -v git)"
           sudo chown -R 0:0 /opt/axiom-verification
           sudo chmod -R go-w /opt/axiom-verification
@@ -3257,6 +3264,13 @@ jobs:
             CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-buildid=' \
               -o "$audit_root/supervisor" ./cmd/axiom-encode-signing-supervisor
           )
+          # The retired corpus release root is optional: pass it only while the
+          # organization still sets it, so deleting the variable after re-signing
+          # does not hand the provisioner an empty root (which it refuses).
+          retired_root_args=()
+          if [ -n "${TRUST_RETIRED_CORPUS_RELEASE_ROOT:-}" ]; then
+            retired_root_args=(--retired-corpus-release-root "$TRUST_RETIRED_CORPUS_RELEASE_ROOT")
+          fi
           python -I /opt/axiom-dependency-integrity/check.py verify
           sudo rm -rf /opt/axiom-base-verification
           sudo "$(command -v python)" -I -B "$base_dependencies/axiom-encode/scripts/provision_verification_supervisor.py" \
@@ -3264,7 +3278,7 @@ jobs:
             --site-packages "$audit_root/site-packages" \
             --apply-root "$TRUST_APPLY_ROOT" --eval-root "$TRUST_EVAL_ROOT" \
             --corpus-release-root "$TRUST_CORPUS_RELEASE_ROOT" \
-            --retired-corpus-release-root "$TRUST_RETIRED_CORPUS_RELEASE_ROOT" --git "$(command -v git)"
+            ${retired_root_args[@]+"${retired_root_args[@]}"} --git "$(command -v git)"
           sudo chown -R root:root /opt/axiom-base-verification
           sudo chmod -R go-w /opt/axiom-base-verification
           python -I /opt/axiom-dependency-integrity/check.py verify
