@@ -102,6 +102,28 @@ broadened waiver; entries may only be removed. A toolchain or caller-workflow
 change runs full RuleSpec validation so a release or waiver-set change cannot
 hide behind changed-file selection.
 
+### Import-aware PR selection
+
+The `import-aware-selection` input defaults to `false`. With automatic roots,
+opted-in pull requests select changed jurisdictions and transitive importers
+from both base and head trees. Unchanged affected importers receive full atomic
+validation in their selected legs. An unresolved graph selects the full matrix
+and full targets.
+
+Before a caller opts in, its waiver audit must not land wholesale on the
+selected validation legs. An incremental, change-scoped waiver audit is being
+built separately in the encoder. Until the caller adopts it, selecting fewer
+legs can concentrate the entire audit on one leg. If audit work instead uses
+separate partitions, require exhaustive, disjoint coverage independent of the
+selected validation matrix and include every audit partition in the aggregate
+required `validate` check.
+
+A successful replay on that caller within the existing timeouts is required
+before opt-in. Compare selected and full validation on the same base/head
+revisions and pinned inputs; require that selection misses no deterministic
+validation failure and preserves global gates and exhaustive waiver coverage.
+Keep the input disabled until both the audit prerequisite and replay are met.
+
 The workflow rejects singular rule roots, separate parameter or test fixture
 files, YAML fixtures under `tests/`, non-RuleSpec YAML outside the approved
 roots, obsolete generated formula artifacts, manual RuleSpec YAML edits without

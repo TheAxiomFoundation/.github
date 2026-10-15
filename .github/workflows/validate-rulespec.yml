@@ -1086,13 +1086,16 @@ jobs:
                           raise ValueError(f"not an atomic module: {path}")
                       return owner + ":" + path.split("/", 1)[1].rsplit(".", 1)[0]
 
-                  def program_owner(path):
+                  def program_spec_path(path):
+                      # Match every path the ProgramSpec shape precheck accepts,
+                      # including flat files and nonjurisdiction directories.
+                      if not path.endswith((".yaml", ".yml")):
+                          return False
                       parts = clean_path(path).split("/")
-                      if len(parts) >= 3 and parts[0] == "programs" and jurisdiction.fullmatch(parts[1]):
-                          return parts[1]
-                      if len(parts) >= 3 and jurisdiction.fullmatch(parts[0]) and parts[1] == "programs":
-                          return parts[0]
-                      return None
+                      return (len(parts) >= 2 and parts[0] == "programs") or (
+                          len(parts) >= 3 and parts[1] == "programs"
+                          and re.fullmatch(r"[a-z]{2}(?:-[a-z0-9_]+)*", parts[0]) is not None
+                      )
 
                   def manifest_prefix(path):
                       parts = clean_path(path).split("/")
@@ -1123,7 +1126,7 @@ jobs:
                   for entries in trees:
                       for path, (mode, kind, oid) in entries.items():
                           if ((atomic_owner(path) and not is_companion(path))
-                                  or (program_owner(path) and path.endswith((".yaml", ".yml")))
+                                  or program_spec_path(path)
                                   or (path in changed and manifest_prefix(path) is not None)):
                               if kind != "blob" or mode not in {"100644", "100755"}:
                                   raise ValueError(f"non-regular graph input: {path}")
@@ -1165,6 +1168,7 @@ jobs:
 
                   reverse = {}
                   node_owners = {}
+                  program_owners = {}
 
                   def edge(provider, importer):
                       reverse.setdefault(provider, set()).add(importer)
@@ -1221,15 +1225,20 @@ jobs:
                           proof_edges(payload, key)
 
                       for path in entries:
-                          owner = program_owner(path)
-                          if owner is None or not path.endswith((".yaml", ".yml")):
+                          if not program_spec_path(path):
                               continue
-                          if owner not in shard_set:
-                              raise ValueError(f"undiscovered program owner: {path}")
                           payload = document(entries, path)
                           name = payload.get("program")
-                          if not isinstance(name, str) or name.split("/", 1)[0] != owner or "/" not in name:
+                          if not isinstance(name, str) or not re.fullmatch(
+                              r"[a-z]{2}(?:-[a-z0-9_]+)*(?:/[a-z0-9_-]+)+", name
+                          ):
                               raise ValueError(f"ambiguous program owner: {path}")
+                          owner = name.split("/", 1)[0]
+                          if owner not in shard_set:
+                              raise ValueError(f"undiscovered program owner: {path}")
+                          if path in program_owners and program_owners[path] != owner:
+                              raise ValueError(f"program owner changed between trees: {path}")
+                          program_owners[path] = owner
                           node = "program:" + path
                           node_owners[node] = owner
                           scope = payload.get("scope")
@@ -1266,7 +1275,7 @@ jobs:
                       return mapping
 
                   for path in changed:
-                      owner = atomic_owner(path) or program_owner(path)
+                      owner = atomic_owner(path) or program_owners.get(path)
                       prefix = manifest_prefix(path)
                       if prefix is not None:
                           found = False
@@ -1300,7 +1309,7 @@ jobs:
                                                       or not re.fullmatch(r"[0-9a-f]{64}", digest)):
                                       raise ValueError("invalid manifest applied hash")
                                   resolved_path = prefix + "/" + recorded if prefix else recorded
-                                  applied_owner = atomic_owner(resolved_path) or program_owner(resolved_path)
+                                  applied_owner = atomic_owner(resolved_path) or program_owners.get(resolved_path)
                                   if deleted and resolved_path in entries:
                                       raise ValueError("manifest deletion names an existing path")
                                   if (applied_owner not in shard_set

@@ -449,6 +449,7 @@ def run_import_aware_selection(
     guard_programs: bool = False,
     roots_input: str = "auto",
     fail_git: str = "",
+    shape_programs: tuple[str, ...] = (),
 ) -> dict:
     """Run real compute, root-resolution and target shell against protected Git trees."""
     import yaml
@@ -469,9 +470,28 @@ def run_import_aware_selection(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
 
-        for path, content in (selection_files() if files is None else files).items():
-            write(path, content)
+        baseline = selection_files() if files is None else files
+        for path, content in baseline.items():
+            if path not in shape_programs:
+                write(path, content)
+        if shape_programs:
+            shape_base = commit(root, "before program specs")
+            for path in shape_programs:
+                write(path, baseline[path])
         base = commit(root, "selection base")
+        if shape_programs:
+            precheck = next(s for s in workflow["jobs"]["shards"]["steps"]
+                            if s.get("name") == "Reject unmanifested RuleSpec content")
+            shape = subprocess.run(
+                ["bash", "-c", precheck["run"]], cwd=root,
+                env={**os.environ, "BASE_SHA": shape_base, "GITHUB_SHA": base,
+                     "GITHUB_REPOSITORY": "TheAxiomFoundation/rulespec-us",
+                     "EVENT_NAME": "pull_request", "RUN_GENERATED_GUARD": "true",
+                     "GUARD_PROGRAMS_ROOT": "false"},
+                capture_output=True, text=True, timeout=60,
+            )
+            assert shape.returncode == 0, shape.stdout + shape.stderr
+            assert f"{len(shape_programs)} changed ProgramSpec file(s) have the ProgramSpec shape (scan=diff)" in shape.stdout
         for path, content in changes.items():
             if content is None:
                 (root / path).unlink()
@@ -855,6 +875,77 @@ def test_import_selection_program_scopes_and_proof_provenance() -> None:
         assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
 
 
+def test_import_selection_program_paths_provider_only(program_paths: tuple[str, ...] = (
+    "programs/federal/fixture.yaml", "programs/fixture.yml",
+    "programs/helpers/deep/fixture.test.yaml", "programs/us-ca/fixture.yaml",
+    "us-ca/programs/fixture.yml", "us-ab_cd/programs/fixture.yaml",
+)) -> None:
+    # Every shape-accepted ProgramSpec participates, regardless of its directory.
+    for program in program_paths:
+        files = selection_files()
+        files[program] = selection_program("us-fl", {"federal": ["statutes/local"]})
+        result = run_import_aware_selection(
+            {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"},
+            files=files, shape_programs=(program,),
+        )
+        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
+        assert_full_leg(result, "us-fl", files)
+
+
+def test_import_selection_program_paths_base_head_and_manifests(program_paths: tuple[str, ...] = (
+    "programs/fixture.yaml", "programs/federal/fixture.yml",
+)) -> None:
+    for program in program_paths:
+        files = selection_files()
+        files[program] = selection_program("us-fl", {"federal": ["statutes/local"]})
+        provider_change = {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"}
+        # The base edge survives removal at head, including deletion of the spec.
+        for replacement in (selection_program("us-fl", {"state": ["regulations/independent"]}), None):
+            result = run_import_aware_selection({**provider_change, program: replacement}, files=files)
+            assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
+            assert_full_leg(result, "us-fl", files)
+        # Head-only specs and state aliases use the declared owner.
+        result = run_import_aware_selection({**provider_change, program: files[program]}, files=selection_files())
+        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
+        state_files = {**files, program: selection_program("us-fl", {"state": ["statutes/local"]})}
+        result = run_import_aware_selection(
+            {"us-fl/statutes/local.yaml": state_files["us-fl/statutes/local.yaml"] + "# changed\n"}, files=state_files,
+        )
+        assert_selection(result, ["us-fl"], revalidate=["us-fl"])
+        assert_full_leg(result, "us-fl", state_files)
+        # A manifest-only program edit must use the same declared ownership.
+        manifest = ".axiom/encoding-manifests/programs/fixture.json"
+        result = run_import_aware_selection({manifest: selection_manifest(program)}, files=files)
+        assert_selection(result, ["us-fl"], revalidate=[])
+        deletion = json.loads(selection_manifest(program))
+        deletion["applied_files"][0] = {"path": program, "deleted": True}
+        result = run_import_aware_selection({program: None, manifest: json.dumps(deletion)}, files=files)
+        assert_selection(result, ["us-fl"], revalidate=[])
+
+
+def test_import_selection_unresolved_program_ownership_falls_back() -> None:
+    for owner in ("us-zz", "us-fl_extra"):
+        program = "programs/federal/fixture.yaml"
+        files = {**selection_files(), program: selection_program(owner, {"federal": ["statutes/local"]})}
+        result = run_import_aware_selection(
+            {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"},
+            files=files, shape_programs=(program,),
+        )
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in result["matrix"]:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+    # A path-keyed graph must not overwrite the base declaration's owner.
+    program = "programs/us-fl/fixture.yaml"
+    files = {**selection_files(), program: selection_program("us-fl", {"federal": ["statutes/local"]})}
+    result = run_import_aware_selection({
+        "us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n",
+        program: selection_program("us-ca", {"federal": ["statutes/local"]}),
+    }, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    for shard in result["matrix"]:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
 def test_import_selection_contradictory_manifest_deletion() -> None:
     manifest = ".axiom/encoding-manifests/us-fl/local.json"
     module = "us-fl/statutes/local.yaml"
@@ -979,23 +1070,62 @@ def test_import_selection_events_refs_index_and_opt_in_default() -> None:
     assert result["targets"]["__all__"] == ("changed", ["us-fl/statutes/local.yaml"], ["us-fl/statutes/local.test.yaml"])
 
 
-def test_import_selection_generated_graph_property() -> None:
-    rng = random.Random(20261012)
-    for case in range(20):
+def test_import_selection_generated_graph_property(cases: range = range(20)) -> None:
+    for case in cases:
+        rng = random.Random(20261012 + case)
         files = selection_files()
-        nodes = [f"{shard}/statutes/{name}.yaml" for shard in SELECTION_JURISDICTIONS for name in ("local", "generated")]
-        dependencies = {node: {other for other in nodes if rng.random() < 0.17} for node in nodes}
-        for node in nodes:
+        modules = [f"{shard}/statutes/{name}.yaml" for shard in SELECTION_JURISDICTIONS for name in ("local", "generated")]
+        program_owners = {
+            "programs/federal/fixture.yaml": "us-fl",
+            "programs/fixture.yml": "us-ma",
+            "programs/helpers/deep/fixture.test.yaml": "us-sc",
+            "us-fl/programs/fixture.yml": "us-fl",
+            "programs/us-ma/fixture.yaml": "us-ma",
+        }
+        if case:
+            for program in list(program_owners)[:3]:
+                program_owners[program] = rng.choice(SELECTION_JURISDICTIONS)
+        owners = {node: node.split("/", 1)[0] for node in modules} | program_owners
+        nodes = modules + list(program_owners)
+        dependencies = {node: {other for other in modules if rng.random() < 0.17} for node in modules}
+        for program in program_owners:
+            dependencies[program] = {other for other in modules if rng.random() < 0.17} or {rng.choice(modules)}
+        if case == 0:
+            # A sparse provider-only graph guarantees that the declaration-owned
+            # importer cannot be selected accidentally through another module.
+            dependencies = {node: set() for node in modules}
+            dependencies.update({
+                program: {f"{owner}/statutes/generated.yaml"}
+                for program, owner in program_owners.items()
+            })
+            dependencies["programs/federal/fixture.yaml"] = {"us/statutes/local.yaml"}
+            changed_modules = {"us/statutes/local.yaml"}
+        else:
+            changed_modules = set(rng.sample(modules, rng.randint(1, 3)))
+
+        def target(node: str) -> str:
+            return f"{owners[node]}:{node.split('/', 1)[1].removesuffix('.yaml')}#fixture"
+
+        for node in modules:
             files[node] = selection_module(*[
-                f"{target.split('/', 1)[0]}:{target.split('/', 1)[1].removesuffix('.yaml')}#fixture"
-                for target in sorted(dependencies[node])
+                target(provider) for provider in sorted(dependencies[node])
             ])
-        changed = set(rng.sample(nodes, rng.randint(1, 3)))
+        for program, owner in program_owners.items():
+            files[program] = selection_program(owner, {
+                "federal": [target(provider).removesuffix("#fixture") for provider in sorted(dependencies[program])],
+            })
+        changed_programs = {rng.choice(list(program_owners))} if case % 3 == 1 else set()
+        changed = changed_modules | changed_programs
         head_dependencies = {
-            node: ({other for other in nodes if rng.random() < 0.17} if node in changed else imports)
+            node: ({other for other in modules if rng.random() < 0.17} if node in changed else imports)
             for node, imports in dependencies.items()
         }
-        affected = set(changed)
+        for program in changed_programs:
+            head_dependencies[program] = head_dependencies[program] or {rng.choice(modules)}
+        # Compute the reverse closure independently over both complete trees.
+        # Changed programs are owned directly; only changed atomic providers
+        # seed imports, and programs are sink nodes rather than atomic targets.
+        affected = set(changed_modules)
         while True:
             expanded = affected | {
                 node for node in nodes
@@ -1004,25 +1134,36 @@ def test_import_selection_generated_graph_property() -> None:
             if expanded == affected:
                 break
             affected = expanded
-        required = {node.split("/", 1)[0] for node in affected}
+        required = {owners[node] for node in affected | changed_programs}
         changes = {
             node: selection_module(*[
-                f"{target.split('/', 1)[0]}:{target.split('/', 1)[1].removesuffix('.yaml')}#fixture"
-                for target in sorted(head_dependencies[node])
+                target(provider) for provider in sorted(head_dependencies[node])
             ]) + f"# change {case}\n"
-            for node in changed
+            for node in changed_modules
         }
+        changes.update({
+            program: selection_program(program_owners[program], {
+                "federal": [target(provider).removesuffix("#fixture") for provider in sorted(head_dependencies[program])],
+            }) + f"# change {case}\n"
+            for program in changed_programs
+        })
         result = run_import_aware_selection(changes, files=files)
+        full_fallback = (
+            result["matrix"] == SELECTION_JURISDICTIONS
+            and result.get("full-targets") == "true"
+        )
+        for node in affected | changed_programs:
+            assert owners[node] in result["matrix"] or full_fallback, (case, node, dependencies, changed, result)
         assert required <= set(result["matrix"]), (case, dependencies, changed, result)
         expected = [shard for shard in SELECTION_JURISDICTIONS if shard in required]
-        revalidate = [shard for shard in SELECTION_JURISDICTIONS if any(node.startswith(f"{shard}/") for node in affected - changed)]
+        revalidate = [shard for shard in SELECTION_JURISDICTIONS if any(owners[node] == shard for node in affected - changed_modules)]
         assert_selection(result, expected, revalidate=revalidate)
         for shard in revalidate:
             assert_full_leg(result, shard, files)
         for shard in set(expected) - set(revalidate):
-            modules = sorted(node for node in changed if node.startswith(f"{shard}/"))
-            companions = sorted(node.removesuffix(".yaml") + ".test.yaml" for node in modules if node.removesuffix(".yaml") + ".test.yaml" in files)
-            assert result["targets"][shard] == ("changed", modules, companions), (case, result)
+            targets = sorted(node for node in changed_modules if owners[node] == shard)
+            companions = sorted(node.removesuffix(".yaml") + ".test.yaml" for node in targets if node.removesuffix(".yaml") + ".test.yaml" in files)
+            assert result["targets"][shard] == ("changed", targets, companions), (case, result)
 
 
 def test_import_selection_preserves_enforcement_wiring() -> None:
@@ -1034,8 +1175,16 @@ def test_import_selection_preserves_enforcement_wiring() -> None:
     assert inputs["import-aware-selection"]["type"] == "boolean"
     assert inputs["import-aware-selection"]["default"] is False
     jobs = workflow["jobs"]
+    compute = next(s for s in jobs["shards"]["steps"] if s.get("id") == "compute")
+    assert compute["env"]["IMPORT_AWARE_SELECTION"] == "${{ inputs.import-aware-selection }}"
+    assert jobs["shards"]["outputs"]["revalidate-shards"] == "${{ steps.compute.outputs.revalidate-shards }}"
+    assert jobs["shards"]["outputs"]["full-targets"] == "${{ steps.compute.outputs.full-targets }}"
     assert jobs["validate"]["strategy"]["matrix"]["shard"] == "${{ fromJSON(needs.shards.outputs.matrix) }}"
     steps = {s.get("name"): s for s in jobs["validate"]["steps"]}
+    target_env = steps["Select RuleSpec validation targets"]["env"]
+    assert target_env["REVALIDATE_SHARDS"] == "${{ needs.shards.outputs.revalidate-shards }}"
+    assert target_env["FULL_TARGETS"] == "${{ needs.shards.outputs.full-targets }}"
+    assert target_env["VALIDATION_SHARD"] == "${{ matrix.shard }}"
     first = "matrix.shard == needs.shards.outputs.first"
     for name in ("Reject obsolete generated files", "Reject disallowed repository layout", "Reject manual RuleSpec changes", "Require money proof atoms", "Run repository tests"):
         assert first in steps[name]["if"], name
@@ -1067,6 +1216,9 @@ def run_selector_tests() -> None:
         test_import_selection_manifest_deletions_and_ambiguity,
         test_import_selection_contradictory_manifest_deletion,
         test_import_selection_program_scopes_and_proof_provenance,
+        test_import_selection_program_paths_provider_only,
+        test_import_selection_program_paths_base_head_and_manifests,
+        test_import_selection_unresolved_program_ownership_falls_back,
         test_import_selection_graph_parse_and_read_failures,
         test_import_selection_shared_paths_and_toolchains,
         test_import_selection_events_refs_index_and_opt_in_default,
@@ -1076,7 +1228,7 @@ def run_selector_tests() -> None:
     for test in tests:
         test()
         print(f"{test.__name__}: passed", flush=True)
-    print("actual workflow selectors: passed (20 generated-graph property cases; Bash 3 mapfile compatibility when needed)", flush=True)
+    print("actual workflow selectors: passed (20 generated module/program graph property cases; Bash 3 mapfile compatibility when needed)", flush=True)
 
 
 def authorization_source() -> str:
