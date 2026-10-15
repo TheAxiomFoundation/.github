@@ -2279,7 +2279,60 @@ def test_conflicted_merge_is_rejected() -> None:
         assert result.returncode != 0
 
 
+RETIRED_ROOT_STEPS = (
+    "Provision protected verification supervisor",
+    "Prepare protected-base manifest audit",
+)
+
+
+def retired_root_block(run: str) -> str:
+    lines = run.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "retired_root_args=()")
+    end = next(i for i in range(start, len(lines)) if lines[i].strip() == "fi")
+    return "\n".join(line.strip() for line in lines[start : end + 1])
+
+
+def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    by_name = {step.get("name"): step for step in steps}
+    for name in RETIRED_ROOT_STEPS:
+        run = by_name[name]["run"]
+        # The flag appears only inside the conditional array, never as a bare argument.
+        assert run.count("--retired-corpus-release-root") == 1, name
+        assert "retired_root_args=(--retired-corpus-release-root" in run, name
+        assert '${retired_root_args[@]+"${retired_root_args[@]}"}' in run, name
+        block = retired_root_block(run)
+        # Expand the array exactly as the workflow passes it to the provisioner, then
+        # report the argument count and each argument, so an empty argument cannot
+        # pass for no argument.
+        probe = (
+            block
+            + '\nshow() { echo "n=$#"; for arg in "$@"; do printf "<%s>\\n" "$arg"; done; }'
+            + '\nshow ${retired_root_args[@]+"${retired_root_args[@]}"}'
+        )
+        absent = "n=0\n"
+        cases = {
+            None: absent,
+            "": absent,
+            RETIRED: f"n=2\n<--retired-corpus-release-root>\n<{RETIRED}>\n",
+        }
+        for value, expected in cases.items():
+            env = {k: v for k, v in os.environ.items() if k != "TRUST_RETIRED_CORPUS_RELEASE_ROOT"}
+            if value is not None:
+                env["TRUST_RETIRED_CORPUS_RELEASE_ROOT"] = value
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", probe],
+                env=env, capture_output=True, text=True, timeout=30, check=False,
+            )
+            assert result.returncode == 0, (name, value, result.stderr)
+            assert result.stdout == expected, (name, value, result.stdout)
+    print("optional retired corpus release root: ok")
+
+
 def main() -> None:
+    test_retired_corpus_release_root_is_passed_only_when_set()
     test_caller_scalar_loader_matches_ruleset_guard()
     test_literal_numeric_looking_pins_keep_exact_string_identity()
     test_binding_rejects_caller_pin_lines_outside_printable_ascii_lf()
