@@ -1572,19 +1572,42 @@ jobs:
                               modules[key] = path
                               node_owners[key] = atomic_owner(path)
 
-                      def resolve(target):
+                      def resolve(target, program=False):
                           if not isinstance(target, str):
                               raise ValueError("non-string import")
-                          key = target.split("#", 1)[0]
+                          key = target if program else target.split("#", 1)[0]
                           prefix, separator, relative = key.partition(":")
                           if not separator or not jurisdiction.fullmatch(prefix):
                               raise ValueError(f"invalid import: {target}")
+                          if program:
+                              # Match the shape precheck: trim the scope entry,
+                              # then append .yaml without removing its suffix.
+                              relative = relative.strip().strip("/")
+                              if re.fullmatch(r"[A-Za-z0-9_~-][A-Za-z0-9_.~-]*(?:/[A-Za-z0-9_~-][A-Za-z0-9_.~-]*)*", relative) is None:
+                                  raise ValueError(f"invalid program import: {target}")
                           clean_path(relative)
+                          spellings = {relative}
                           if relative.endswith((".yaml", ".yml")):
+                              spellings.add(relative.rsplit(".", 1)[0])
+                          # Include the precheck's root candidates and both
+                          # module suffix rules. Even an otherwise unsupported
+                          # location must not hide a second possible provider.
+                          candidates = {
+                              root + spelling + suffix
+                              for root in ("", prefix + "/", "rulespec-" + prefix + "/")
+                              for spelling in spellings
+                              for suffix in (".yaml", ".yml")
+                              if root + spelling + suffix in entries
+                          }
+                          if len(candidates) > 1:
+                              raise ValueError(f"ambiguous import: {target}")
+                          if not program and relative.endswith((".yaml", ".yml")):
                               relative = relative.rsplit(".", 1)[0]
                           key = prefix + ":" + relative
                           if key not in modules or prefix not in shard_set:
                               raise ValueError(f"unresolved import: {target}")
+                          if program and modules[key] != f"{prefix}/{relative}.yaml":
+                              raise ValueError(f"unresolved program import: {target}")
                           return key
 
                       def proof_edges(value, importer, in_proof=False):
@@ -1643,7 +1666,7 @@ jobs:
                               for target in targets if isinstance(targets, list) else [targets]:
                                   if not isinstance(target, str):
                                       raise ValueError("non-string program target")
-                                  edge(resolve(target if ":" in target else prefix + ":" + target), node)
+                                  edge(resolve(target if ":" in target else prefix + ":" + target, program=True), node)
                                   count += 1
                           if not count:
                               raise ValueError(f"program scope resolves across entire checkout: {path}")

@@ -109,12 +109,12 @@ validation in their selected legs. An unresolved graph selects the full matrix
 and full targets.
 
 Before a caller opts in, its waiver audit must not land wholesale on the
-selected validation legs. An incremental, change-scoped waiver audit is being
-built separately in the encoder. Until the caller adopts it, selecting fewer
-legs can concentrate the entire audit on one leg. If audit work instead uses
-separate partitions, require exhaustive, disjoint coverage independent of the
-selected validation matrix and include every audit partition in the aggregate
-required `validate` check.
+selected validation legs. Incremental, change-scoped waiver audit work is tracked
+in [TheAxiomFoundation/axiom-encode#1867](https://github.com/TheAxiomFoundation/axiom-encode/issues/1867).
+Until the caller adopts it, selecting fewer legs can concentrate the entire
+audit on one leg. If audit work instead uses separate partitions, require
+exhaustive, disjoint coverage independent of the selected validation matrix and
+include every audit partition in the aggregate required `validate` check.
 
 A successful replay on that caller within the existing timeouts is required
 before opt-in. Compare selected and full validation on the same base/head

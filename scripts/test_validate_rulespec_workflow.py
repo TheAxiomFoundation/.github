@@ -1387,20 +1387,28 @@ def test_import_selection_manifest_deletions_and_ambiguity() -> None:
 def test_import_selection_program_scopes_and_proof_provenance() -> None:
     for program in ("programs/us-fl/fixture.yaml", "us-fl/programs/fixture.yaml"):
         files = selection_files()
+        # ProgramSpec resolution appends .yaml; ordinary module/proof imports
+        # still exercise the .yml providers in the other jurisdictions below.
+        for ending in ("", ".test"):
+            files[f"us-fl/regulations/independent{ending}.yaml"] = files.pop(
+                f"us-fl/regulations/independent{ending}.yml"
+            )
         files[program] = selection_program("us-fl", {
             "federal": ["statutes/local"],
             "state": ["regulations/independent"],
             "us-ma": ["statutes/local"],
             "jurisdictions": ["us-fl"], "include": ["fixture"], "exclude": [],
         })
-        result = run_import_aware_selection({program: files[program] + "# changed\n"}, files=files)
+        result = run_import_aware_selection(
+            {program: files[program] + "# changed\n"}, files=files, shape_programs=(program,),
+        )
         assert_selection(result, ["us-fl"], revalidate=[])
         assert result["targets"]["us-fl"] == ("changed", [], [])
         manifest = ".axiom/encoding-manifests/programs/wrong-name.json"
         result = run_import_aware_selection({manifest: selection_manifest(program)}, files=files)
         assert_selection(result, ["us-fl"], revalidate=[])
         assert result["targets"]["us-fl"] == ("changed", [], [])
-        for provider, owner in (("us/statutes/local.yaml", "us"), ("us-fl/regulations/independent.yml", "us-fl"), ("us-ma/statutes/local.yaml", "us-ma")):
+        for provider, owner in (("us/statutes/local.yaml", "us"), ("us-fl/regulations/independent.yaml", "us-fl"), ("us-ma/statutes/local.yaml", "us-ma")):
             result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
             expected = [s for s in SELECTION_JURISDICTIONS if s in {owner, "us-fl"}]
             assert_selection(result, expected, revalidate=["us-fl"])
@@ -1437,11 +1445,69 @@ def test_import_selection_program_paths_provider_only(program_paths: tuple[str, 
         assert_full_leg(result, "us-fl", files)
 
 
+def assert_program_suffix_provider_selection(suffix: str, *, ambiguous: bool) -> None:
+    files = selection_files()
+    program = "programs/fixture.yaml"
+    provider = f"us/statutes/local.{suffix}.yaml"
+    files[provider] = selection_module()
+    files[program] = selection_program("us-fl", {"federal": [f"statutes/local.{suffix}"]})
+    if not ambiguous:
+        del files["us/statutes/local.yaml"]
+    # The actual ProgramSpec precheck appends .yaml to the entire scope entry.
+    # Its successful execution proves that the unchanged spec consumes provider.
+    result = run_import_aware_selection(
+        {provider: files[provider] + "# changed provider\n"},
+        files=files, shape_programs=(program,),
+    )
+    if ambiguous:
+        # Stripping the suffix names a different existing provider. Neither the
+        # matrix nor target selection may rely on choosing one interpretation.
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in result["matrix"]:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+    else:
+        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
+        assert_full_leg(result, "us-fl", files)
+
+
+def test_import_selection_program_yaml_suffix_provider_ambiguity() -> None:
+    assert_program_suffix_provider_selection("yaml", ambiguous=True)
+
+
+def test_import_selection_program_yml_suffix_provider_ambiguity() -> None:
+    assert_program_suffix_provider_selection("yml", ambiguous=True)
+
+
+def test_import_selection_program_suffix_unique_provider() -> None:
+    for suffix in ("yaml", "yml"):
+        assert_program_suffix_provider_selection(suffix, ambiguous=False)
+
+
+def test_import_selection_program_candidate_location_ambiguity() -> None:
+    for alternate in ("statutes/local.yaml", "rulespec-us/statutes/local.yaml"):
+        files = selection_files()
+        program = "programs/location-ambiguity.yaml"
+        provider = "us/statutes/local.yaml"
+        files[alternate] = selection_module()
+        files[program] = selection_program("us-fl", {"federal": ["statutes/local"]})
+        result = run_import_aware_selection(
+            {provider: files[provider] + "# changed prefixed provider\n"},
+            files=files, shape_programs=(program,),
+        )
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in result["matrix"]:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
 def test_import_selection_program_paths_base_head_and_manifests(program_paths: tuple[str, ...] = (
     "programs/fixture.yaml", "programs/federal/fixture.yml",
 )) -> None:
     for program in program_paths:
         files = selection_files()
+        for ending in ("", ".test"):
+            files[f"us-fl/regulations/independent{ending}.yaml"] = files.pop(
+                f"us-fl/regulations/independent{ending}.yml"
+            )
         files[program] = selection_program("us-fl", {"federal": ["statutes/local"]})
         provider_change = {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"}
         # The base edge survives removal at head, including deletion of the spec.
@@ -1713,6 +1779,40 @@ def test_import_selection_generated_graph_property(cases: range = range(20)) -> 
             assert result["targets"][shard] == ("changed", targets, companions), (case, result)
 
 
+def test_import_selection_generated_suffix_ambiguity_property(cases: range = range(8)) -> None:
+    for case in cases:
+        rng = random.Random(20261015 + case)
+        provider_owner, program_owner, bridge_owner = rng.sample(SELECTION_JURISDICTIONS, 3)
+        suffix = ("yaml", "yml")[case % 2]
+        alternate_suffix = ("yaml", "yml")[(case // 2) % 2]
+        relative = f"statutes/generated-{rng.randrange(1000000)}.{suffix}"
+        provider = f"{provider_owner}/{relative}.yaml"
+        alternate = f"{provider_owner}/{relative.rsplit('.', 1)[0]}.{alternate_suffix}"
+        bridge = f"{bridge_owner}/statutes/suffix-bridge.yaml"
+        program = "programs/suffix-property.yaml"
+        files = selection_files()
+        files[provider] = selection_module()
+        files[alternate] = selection_module()
+        # A second importer supplies a module graph edge to the actual
+        # provider, independently of the ambiguous ProgramSpec scope spelling.
+        files[bridge] = selection_module(f"{provider_owner}:{relative}.yaml#fixture")
+        label = "federal" if provider_owner == "us" else provider_owner
+        entry = f"{provider_owner}:{relative}" if case % 2 else relative
+        files[program] = selection_program(program_owner, {label: [entry]})
+        result = run_import_aware_selection(
+            {provider: files[provider] + f"# generated change {case}\n"},
+            files=files, shape_programs=(program,),
+        )
+        # The independent candidate set has two different existing files. A
+        # selector must fall back even if one resolver could choose a winner.
+        assert provider != alternate and {provider, alternate} <= files.keys()
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for owner in (program_owner, bridge_owner):
+            assert owner in result["matrix"], (case, owner, result)
+        for shard in result["matrix"]:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
 def test_import_selection_preserves_enforcement_wiring() -> None:
     import yaml
 
@@ -1765,18 +1865,23 @@ def run_selector_tests() -> None:
         test_import_selection_contradictory_manifest_deletion,
         test_import_selection_program_scopes_and_proof_provenance,
         test_import_selection_program_paths_provider_only,
+        test_import_selection_program_yaml_suffix_provider_ambiguity,
+        test_import_selection_program_yml_suffix_provider_ambiguity,
+        test_import_selection_program_suffix_unique_provider,
+        test_import_selection_program_candidate_location_ambiguity,
         test_import_selection_program_paths_base_head_and_manifests,
         test_import_selection_unresolved_program_ownership_falls_back,
         test_import_selection_graph_parse_and_read_failures,
         test_import_selection_shared_paths_and_toolchains,
         test_import_selection_events_refs_index_and_opt_in_default,
         test_import_selection_generated_graph_property,
+        test_import_selection_generated_suffix_ambiguity_property,
         test_import_selection_preserves_enforcement_wiring,
     ]
     for test in tests:
         test()
         print(f"{test.__name__}: passed", flush=True)
-    print("actual workflow selectors: passed (20 generated module/program graph property cases; Bash 3 mapfile compatibility when needed)", flush=True)
+    print("actual workflow selectors: passed (20 generated module/program graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
 
 
 def literal_pin_caller(pins: dict[str, str]) -> str:
