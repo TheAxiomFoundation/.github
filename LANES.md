@@ -4,8 +4,9 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-15 — Merge pull request #1772 from TheAxiomFoundation/hub/retire-key-reader | 95 | us-rulespec-2026-10-13-snap-fy2026-memo-source-corrected | ${{ | queued |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-15 — Merge pull request #466 from TheAxiomFoundation/hub/retire-key-reader | 37 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | failure |
+| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-15 — Merge pull request #133 from TheAxiomFoundation/nzhub/wep-s75-land | 0 | nz-rulespec-2026-07-25 | e0ce1ca9befd45022287675c919db31e83d61850 | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-15 — Merge pull request #1772 from TheAxiomFoundation/hub/retire-key-reader | 96 | us-rulespec-2026-10-13-snap-fy2026-memo-source-corrected | ${{ | success |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-15 — Merge pull request #466 from TheAxiomFoundation/hub/retire-key-reader | 37 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-15 — Merge pull request #28 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
@@ -13,7 +14,6 @@
 | [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-15 — Merge pull request #42 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-10-14 — Merge pull request #106 from TheAxiomFoundation/hub/retire-signed-apply | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-10-14 — Merge pull request #29 from TheAxiomFoundation/hub/retire-signed-apply | 1 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-13 — Merge pull request #130 from TheAxiomFoundation/nzhub/lf-guard | 2 | nz-rulespec-2026-07-25 | 630aa73931e5aa87c51d25fe448e38dbcfaed50f | success |
 | [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-10-11 — Merge pull request #16 from TheAxiomFoundation/hub/encoder-guard-on | 0 | ng-rulespec-2026-07-22 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-10-11 — Merge pull request #131 from TheAxiomFoundation/hub/encoder-guard-on | 5 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 178 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
