@@ -1,0 +1,32 @@
+{
+  "name": "RuleSpec encoder guard",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "repository_name": {
+      "include": ["rulespec-*"],
+      "exclude": ["rulespec-graph-viewer"],
+      "protected": false
+    },
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "workflows",
+      "parameters": {
+        "do_not_enforce_on_create": true,
+        "workflows": [
+          {
+            "repository_id": 1146671719,
+            "path": ".github/workflows/encoder-guard.yml",
+            "sha": "0000000000000000000000000000000000000000"
+          }
+        ]
+      }
+    }
+  ]
+}
