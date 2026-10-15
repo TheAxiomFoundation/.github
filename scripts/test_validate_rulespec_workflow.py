@@ -1217,6 +1217,73 @@ def test_import_selection_transitive_graph_and_cycles() -> None:
         assert_full_leg(result, shard, files)
 
 
+def test_import_selection_dependencies_at_any_depth_and_in_companions() -> None:
+    import yaml
+
+    provider = "us/statutes/local.yaml"
+    target = "us:statutes/local#fixture"
+    atom = {"kind": "import", "import": {
+        "target": target, "output": "fixture", "hash": "a" * 64,
+    }}
+    probes = [
+        # These three forms were the independent review's missed-edge probes.
+        ("us-fl/statutes/local.test.yaml", {"imports": [target], "tests": []}),
+        ("us-fl/statutes/local.yaml", {"rules": [{"imports": [target]}]}),
+        ("us-fl/statutes/local.yaml", {"rules": [{"metadata": {"proofs": [atom]}}]}),
+        # Companion files also have a real root-array schema. Neither that
+        # shape nor nesting an atom within it may hide a dependency.
+        ("us-fl/statutes/local.test.yaml", [{"metadata": {"provenance": [atom]}}]),
+        ("us-fl/statutes/local.test.yaml", [{"metadata": {"imports": [target]}}]),
+        ("us-fl/statutes/local.yaml", {"imports": [target], "rules": [{
+            "versions": [{"values": {2026: "fixture"}}],
+        }]}),
+    ]
+    for importer, document in probes:
+        files = {**selection_files(), importer: yaml.safe_dump(document, sort_keys=False)}
+        result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
+        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
+        assert_full_leg(result, "us-fl", files)
+
+
+def test_import_selection_unmodelled_dependency_shapes_fail_closed() -> None:
+    import yaml
+
+    target = "us:statutes/local#fixture"
+    atom_import = {"target": target, "output": "fixture", "hash": "a" * 64}
+    probes = [
+        {"metadata": {"imports": target}},
+        {"metadata": {"imports": {"provider": target}}},
+        {"metadata": {"imports": [{"target": target}]}},
+        {"metadata": {"kind": "import", "import": target}},
+        {"metadata": {"kind": "import", "import": {"output": "fixture"}}},
+        {"metadata": {"kind": "import", "import": {**atom_import, "fallback": target}}},
+        {"metadata": {"kind": "import", "import": atom_import, "fallback": target}},
+        {"metadata": {"kind": "import", "import": {**atom_import, "target": [target]}}},
+        {"metadata": {"kind": "import", "import": {**atom_import, "output": ["fixture"]}}},
+        {"metadata": {"kind": "import", "import": {**atom_import, "hash": {"value": "a" * 64}}}},
+        {"metadata": {"kind": "import", "path": ["fixture"], "import": atom_import}},
+        {"metadata": {"import": atom_import}},
+        {"metadata": {None: {"imports": [target]}}},
+        {"metadata": {True: {"imports": [target]}}},
+        {"metadata": {1.5: {"imports": [target]}}},
+    ]
+    sources = [yaml.safe_dump(document) for document in probes] + [
+        "metadata: !!omap\n  - imports: ['us:statutes/local#fixture']\n",
+        "metadata: !!pairs\n  - imports: ['us:statutes/local#fixture']\n",
+        "metadata: !!set\n  ? imports\n",
+        "- scalar-companion-item\n",
+        "- - imports: ['us:statutes/local#fixture']\n",
+    ]
+    for source in sources:
+        files = {**selection_files(), "us-fl/statutes/local.test.yaml": source}
+        result = run_import_aware_selection(
+            {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"}, files=files,
+        )
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in result["matrix"]:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
 def test_import_selection_federal_fanout() -> None:
     states = [f"us-{number:02d}" for number in range(51)]
     jurisdictions = states + ["us"]
@@ -1246,11 +1313,32 @@ def test_import_selection_base_head_union_and_deleted_provider() -> None:
     assert result["targets"]["us-sc"] == (
         "changed", ["us-sc/statutes/local.yaml"], ["us-sc/statutes/local.test.yaml"],
     )
+    # A changed companion is not itself a module seed. Its removed import must
+    # therefore survive through the base graph to reach the unchanged module
+    # and its transitive importer; using only the head graph loses us-fl.
+    companion_files = {**files, "us-sc/statutes/local.yaml": selection_module(),
+                       "us-sc/statutes/local.test.yaml": selection_module("us-ma:statutes/local#fixture")}
+    result = run_import_aware_selection({
+        "us-ma/statutes/local.yaml": selection_module() + "# changed\n",
+        "us-sc/statutes/local.test.yaml": "tests: []\n",
+    }, files=companion_files)
+    assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+    assert_full_leg(result, "us-fl", companion_files)
+    assert_full_leg(result, "us-sc", companion_files)
+    # An unmodelled base dependency must also fail closed after it is repaired
+    # at head. This directly kills the head-tree-only mutation for modules.
+    invalid_base = {**selection_files(), "us-sc/statutes/local.yaml": "imports: [{target: unmodelled}]\n"}
+    result = run_import_aware_selection({"us-sc/statutes/local.yaml": selection_module()}, files=invalid_base)
+    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    for shard in result["matrix"]:
+        assert_full_leg(result, shard, invalid_base, "full-selection-fallback")
     # Renaming a provider and updating its direct importer still revalidates
     # the unchanged transitive importer using the union of both module graphs.
     result = run_import_aware_selection({
         "us-ma/statutes/local.yaml": None,
+        "us-ma/statutes/local.test.yaml": None,
         "us-ma/statutes/renamed.yaml": selection_module(),
+        "us-ma/statutes/renamed.test.yaml": "tests: []\n",
         "us-sc/statutes/local.yaml": selection_module("us-ma:statutes/renamed#fixture"),
     }, files=files)
     assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl"])
@@ -1265,7 +1353,9 @@ def test_import_selection_base_head_union_and_deleted_provider() -> None:
     # A clean deletion still includes the base importer jurisdiction.
     result = run_import_aware_selection({
         "us-ma/statutes/local.yaml": None,
+        "us-ma/statutes/local.test.yaml": None,
         "us-sc/statutes/local.yaml": None,
+        "us-sc/statutes/local.test.yaml": None,
     }, files=files)
     assert_selection(result, ["us-ma", "us-sc"], revalidate=[])
 
@@ -1453,6 +1543,7 @@ def assert_program_suffix_provider_selection(suffix: str, *, ambiguous: bool) ->
     files[program] = selection_program("us-fl", {"federal": [f"statutes/local.{suffix}"]})
     if not ambiguous:
         del files["us/statutes/local.yaml"]
+        files[provider[:-5] + ".test.yaml"] = files.pop("us/statutes/local.test.yaml")
     # The actual ProgramSpec precheck appends .yaml to the entire scope entry.
     # Its successful execution proves that the unchanged spec consumes provider.
     result = run_import_aware_selection(
@@ -1497,6 +1588,19 @@ def test_import_selection_program_candidate_location_ambiguity() -> None:
         assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
         for shard in result["matrix"]:
             assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def test_import_selection_program_requires_canonical_yaml_provider() -> None:
+    # The module resolver accepts a unique .yml provider, but ProgramSpec's
+    # precheck appends .yaml. Its graph must reject that disagreement rather
+    # than infer a scoped result from the more permissive module resolver.
+    files = selection_files()
+    files["programs/fixture.yaml"] = selection_program("us-fl", {"federal": ["regulations/independent"]})
+    provider = "us/regulations/independent.yml"
+    result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    for shard in result["matrix"]:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
 
 
 def test_import_selection_program_paths_base_head_and_manifests(program_paths: tuple[str, ...] = (
@@ -1584,6 +1688,127 @@ def test_import_selection_graph_parse_and_read_failures() -> None:
     files = {**selection_files(), "us-ma/statutes/local.yaml": "broken: ["}
     result = run_import_aware_selection({"us-fl/statutes/local.yaml": selection_module() + "# changed\n"}, files=files)
     assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    # A companion without its module has no modeled importer identity, even
+    # when its own YAML is valid and the changed provider is well formed.
+    files = {**selection_files(), "us-fl/statutes/orphan.test.yaml": "tests: []\n"}
+    result = run_import_aware_selection({"us/statutes/local.yaml": selection_module() + "# changed\n"}, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    for shard in result["matrix"]:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def selector_document_helpers(loader_base: type | None = None, *, c_available: bool = True) -> dict:
+    """Execute the real embedded loader/cache helpers without invoking Git."""
+    import ast
+    import types
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    compute = next(step for step in workflow["jobs"]["shards"]["steps"] if step.get("id") == "compute")
+    source = compute["run"].split("python3 -I <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+    nodes = list(ast.walk(ast.parse(source)))
+    loader = next(node for node in nodes if isinstance(node, ast.ClassDef) and node.name == "UniqueLoader")
+    mapping = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "unique_mapping")
+    constructor = next(node for node in nodes if isinstance(node, ast.Expr)
+                       and isinstance(node.value, ast.Call)
+                       and isinstance(node.value.func, ast.Attribute)
+                       and isinstance(node.value.func.value, ast.Name)
+                       and node.value.func.value.id == "UniqueLoader"
+                       and node.value.func.attr == "add_constructor")
+    cache = next(node for node in nodes if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "documents" for target in node.targets))
+    document = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "document")
+    if loader_base is None:
+        yaml_module = yaml
+    else:
+        # Both names resolve to the requested implementation, exercising the
+        # exact constructor with the C and Python SafeLoader code paths.
+        yaml_module = types.SimpleNamespace(SafeLoader=loader_base, CSafeLoader=loader_base,
+                                            resolver=yaml.resolver, load=yaml.load)
+        if not c_available:
+            del yaml_module.CSafeLoader
+    namespace = {"yaml": yaml_module, "is_companion": lambda path: path.endswith((".test.yaml", ".test.yml"))}
+    exec(compile(ast.Module(body=[loader, mapping, constructor, cache, document], type_ignores=[]),
+                 str(WORKFLOW), "exec"), namespace)
+    return namespace
+
+
+def test_import_selection_c_and_python_loader_safety_parity() -> None:
+    import yaml
+
+    expected_base = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    assert selector_document_helpers()["UniqueLoader"].__bases__ == (expected_base,)
+    assert selector_document_helpers(yaml.SafeLoader, c_available=False)["UniqueLoader"].__bases__ == (yaml.SafeLoader,)
+    accepted = [
+        "imports: []\nrules: []\n",
+        "first: &shared {value: fixture}\nsecond: *shared\n",
+        "defaults: &defaults {field: fixture}\nmodule:\n  <<: *defaults\n  extra: value\n",
+        "metadata: !!omap\n  - imports: ['us:statutes/local#fixture']\n",
+        "metadata: !!pairs\n  - imports: ['us:statutes/local#fixture']\n",
+        "metadata: !!set\n  ? imports\n",
+    ]
+    rejected = [
+        "imports: []\nimports: []\n",
+        "metadata: {name: first, name: second}\n",
+        "defaults: &defaults {field: first}\nmodule:\n  <<: *defaults\n  field: second\n",
+        "defaults: &defaults {field: first}\nmodule:\n  <<: [*defaults, *defaults]\n",
+        "module: !!python/object/apply:os.system ['printf should-not-run']\n",
+        "module: !unknown fixture\n",
+        "? [unhashable, key]\n: fixture\n",
+        "imports: []\n---\nimports: []\n",
+    ]
+    implementations = []
+    bases = [yaml.SafeLoader]
+    if hasattr(yaml, "CSafeLoader"):
+        bases.append(yaml.CSafeLoader)
+    for base in bases:
+        loader = selector_document_helpers(base)["UniqueLoader"]
+        implementations.append([yaml.load(source, Loader=loader) for source in accepted])
+        for source in rejected:
+            try:
+                yaml.load(source, Loader=loader)
+            except (ValueError, TypeError, yaml.YAMLError):
+                pass
+            else:
+                raise AssertionError(f"{base.__name__} accepted unsafe/ambiguous YAML: {source!r}")
+    assert all(implementation == implementations[0] for implementation in implementations)
+
+
+def test_import_selection_documents_cached_by_blob_across_trees() -> None:
+    namespace = selector_document_helpers()
+    original_load = namespace["yaml"].load
+    calls = []
+
+    def count_load(payload, **kwargs):
+        calls.append(payload)
+        return original_load(payload, **kwargs)
+
+    import types
+    namespace["yaml"] = types.SimpleNamespace(load=count_load)
+    namespace["blobs"] = {"same": b"imports: []\nrules: []\n", "changed": b"imports: null\nrules: []\n"}
+    base = {"us/statutes/base.yaml": ("100644", "blob", "same")}
+    head = {"us/statutes/base.yaml": ("100644", "blob", "same"),
+            "us-ma/statutes/copy.yaml": ("100644", "blob", "same"),
+            "us-fl/statutes/changed.yaml": ("100644", "blob", "changed")}
+    document = namespace["document"]
+    first = document(base, "us/statutes/base.yaml")
+    assert document(head, "us/statutes/base.yaml") is first
+    assert document(head, "us-ma/statutes/copy.yaml") is first
+    assert document(head, "us-fl/statutes/changed.yaml")["imports"] is None
+    assert calls == [namespace["blobs"]["same"], namespace["blobs"]["changed"]], calls
+    # Cache hits must still apply each path's shape rule: a root array is a
+    # valid companion but cannot become a valid atomic module through reuse.
+    namespace["blobs"]["array"] = b"[]\n"
+    shared = {"us/statutes/base.test.yaml": ("100644", "blob", "array"),
+              "us-ma/statutes/invalid.yaml": ("100644", "blob", "array")}
+    assert document(shared, "us/statutes/base.test.yaml") == []
+    try:
+        document(shared, "us-ma/statutes/invalid.yaml")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("cached companion array accepted as an atomic module")
+    assert calls.count(namespace["blobs"]["array"]) == 1, calls
 
 
 def test_import_selection_shared_paths_and_toolchains() -> None:
@@ -1858,6 +2083,8 @@ def run_selector_tests() -> None:
         test_validation_targets_preserve_other_path_classifications,
         test_import_selection_local_modules_and_companions,
         test_import_selection_transitive_graph_and_cycles,
+        test_import_selection_dependencies_at_any_depth_and_in_companions,
+        test_import_selection_unmodelled_dependency_shapes_fail_closed,
         test_import_selection_federal_fanout,
         test_import_selection_base_head_union_and_deleted_provider,
         test_import_selection_manifest_ownership_and_failures,
@@ -1869,9 +2096,12 @@ def run_selector_tests() -> None:
         test_import_selection_program_yml_suffix_provider_ambiguity,
         test_import_selection_program_suffix_unique_provider,
         test_import_selection_program_candidate_location_ambiguity,
+        test_import_selection_program_requires_canonical_yaml_provider,
         test_import_selection_program_paths_base_head_and_manifests,
         test_import_selection_unresolved_program_ownership_falls_back,
         test_import_selection_graph_parse_and_read_failures,
+        test_import_selection_c_and_python_loader_safety_parity,
+        test_import_selection_documents_cached_by_blob_across_trees,
         test_import_selection_shared_paths_and_toolchains,
         test_import_selection_events_refs_index_and_opt_in_default,
         test_import_selection_generated_graph_property,

@@ -1514,7 +1514,7 @@ jobs:
                   needed = set()
                   for entries in trees:
                       for path, (mode, kind, oid) in entries.items():
-                          if ((atomic_owner(path) and not is_companion(path))
+                          if (atomic_owner(path)
                                   or program_spec_path(path)
                                   or (path in changed and manifest_prefix(path) is not None)):
                               if kind != "blob" or mode not in {"100644", "100755"}:
@@ -1534,7 +1534,7 @@ jobs:
                           raise ValueError("incomplete graph object read")
                       blobs[oid] = payload
 
-                  class UniqueLoader(yaml.SafeLoader):
+                  class UniqueLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
                       pass
 
                   def unique_mapping(loader, node, deep=False):
@@ -1549,9 +1549,20 @@ jobs:
 
                   UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 
+                  # Git object identity spans paths and both protected trees.
+                  # Documents are read-only below, so unchanged content needs
+                  # only one safe parse, including shared companion blobs.
+                  documents = {}
+
                   def document(entries, path):
-                      payload = yaml.load(blobs[entries[path][2]], Loader=UniqueLoader)
-                      if not isinstance(payload, dict):
+                      oid = entries[path][2]
+                      if oid not in documents:
+                          documents[oid] = yaml.load(blobs[oid], Loader=UniqueLoader)
+                      payload = documents[oid]
+                      if not isinstance(payload, dict) and not (
+                          is_companion(path) and isinstance(payload, list)
+                          and all(isinstance(case, dict) for case in payload)
+                      ):
                           raise ValueError(f"not a module/program mapping: {path}")
                       return payload
 
@@ -1610,31 +1621,69 @@ jobs:
                               raise ValueError(f"unresolved program import: {target}")
                           return key
 
-                      def proof_edges(value, importer, in_proof=False):
-                          if isinstance(value, dict):
-                              if in_proof and value.get("kind") == "import":
+                      def dependency_edges(payload, importer):
+                          # RuleSpec metadata is open-ended, and companion test
+                          # documents can be lists. Visit every mapping/list,
+                          # including side channels outside metadata.proof.
+                          pending = [payload]
+                          seen = set()
+                          while pending:
+                              value = pending.pop()
+                              # Safe YAML tags such as !!pairs and !!omap can
+                              # wrap mappings in tuples; never skip a container
+                              # that could conceal another dependency.
+                              if isinstance(value, (tuple, set)):
+                                  raise ValueError("unsupported dependency container")
+                              if not isinstance(value, (dict, list)):
+                                  continue
+                              if id(value) in seen:
+                                  continue
+                              seen.add(id(value))
+                              if isinstance(value, list):
+                                  pending.extend(value)
+                                  continue
+                              # Integer keys occur in RuleSpec versions.values;
+                              # other non-string keys are outside this model.
+                              if any(type(key) not in (str, int) for key in value):
+                                  raise ValueError("unsupported dependency mapping key")
+                              if "imports" in value:
+                                  imports = value["imports"]
+                                  if imports is None:
+                                      imports = []
+                                  if not isinstance(imports, list):
+                                      raise ValueError("imports is not a list")
+                                  for target in imports:
+                                      edge(resolve(target), importer)
+                              if value.get("kind") == "import":
+                                  # Unknown keys could encode another provider;
+                                  # fail closed instead of interpreting a subset.
+                                  if set(value) - {"kind", "path", "import"}:
+                                      raise ValueError("unknown import atom key")
+                                  if "path" in value and not isinstance(value["path"], str):
+                                      raise ValueError("invalid import atom path")
                                   imported = value.get("import")
-                                  if not isinstance(imported, dict) or "target" not in imported:
-                                      raise ValueError("malformed proof import")
+                                  if (not isinstance(imported, dict) or "target" not in imported
+                                          or set(imported) - {"target", "output", "hash"}
+                                          or any(not isinstance(item, str) for item in imported.values())):
+                                      raise ValueError("malformed/unknown import atom payload")
                                   edge(resolve(imported["target"]), importer)
-                              for key, child in value.items():
-                                  proof_edges(child, importer, in_proof or key == "proof")
-                          elif isinstance(value, list):
-                              for child in value:
-                                  proof_edges(child, importer, in_proof)
+                              elif "import" in value:
+                                  raise ValueError("import payload without kind: import")
+                              pending.extend(value.values())
 
-                      for key, path in modules.items():
+                      for path in entries:
+                          if not atomic_owner(path):
+                              continue
+                          module = module_path(path)
+                          key = identity(module)
+                          if modules.get(key) != module:
+                              raise ValueError(f"companion has no unique module: {path}")
                           if node_owners[key] not in shard_set:
                               raise ValueError(f"undiscovered module owner: {path}")
-                          payload = document(entries, path)
-                          imports = payload.get("imports")
-                          if imports is None:
-                              imports = []
-                          if not isinstance(imports, list):
-                              raise ValueError(f"imports is not a list: {path}")
-                          for target in imports:
-                              edge(resolve(target), key)
-                          proof_edges(payload, key)
+                          try:
+                              dependency_edges(document(entries, path), key)
+                          except Exception as error:
+                              raise ValueError(f"{path}: {error}") from error
 
                       for path in entries:
                           if not program_spec_path(path):
@@ -1676,7 +1725,6 @@ jobs:
                   force_full = False
                   changed_modules = {identity(path) for path in changed
                                      if atomic_owner(path) and not is_companion(path)}
-                  manifest_modules = set()
 
                   def unique_json(pairs):
                       mapping = {}
@@ -1739,7 +1787,6 @@ jobs:
                                           deleted and any(module in other for other in trees)
                                       ):
                                           raise ValueError("manifest companion has no module")
-                                      manifest_modules.add(key)
                                       seeds.add(key)
                           if not found:
                               raise ValueError("unreadable changed manifest")
@@ -1762,7 +1809,6 @@ jobs:
                   selected = owners | {node_owners[node] for node in affected if node in node_owners}
                   revalidate = {node_owners[node] for node in affected
                                 if node in node_owners and node not in changed_modules}
-                  revalidate |= {node_owners[node] for node in manifest_modules - changed_modules}
                   if force_full or not selected:
                       selected = shard_set
                   print("scope=import-aware", file=sys.stderr)

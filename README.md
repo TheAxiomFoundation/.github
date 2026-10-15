@@ -106,11 +106,16 @@ The `import-aware-selection` input defaults to `false`. With automatic roots,
 opted-in pull requests select changed jurisdictions and transitive importers
 from both base and head trees. Unchanged affected importers receive full atomic
 validation in their selected legs. An unresolved graph selects the full matrix
-and full targets.
+and full targets. In particular, an import whose jurisdiction is not a
+discovered shard, anywhere in either tree, forces every PR to use the full
+matrix and full targets. Such out-of-repository imports can make opt-in more
+expensive than default selection. Revalidated importer legs also run the
+stricter changed-file oracle-coverage check over every atomic module in the
+leg.
 
 Before a caller opts in, its waiver audit must not land wholesale on the
 selected validation legs. Incremental, change-scoped waiver audit work is tracked
-in [TheAxiomFoundation/axiom-encode#1867](https://github.com/TheAxiomFoundation/axiom-encode/issues/1867).
+in [TheAxiomFoundation/axiom-encode#1867](https://github.com/TheAxiomFoundation/axiom-encode/pull/1867).
 Until the caller adopts it, selecting fewer legs can concentrate the entire
 audit on one leg. If audit work instead uses separate partitions, require
 exhaustive, disjoint coverage independent of the selected validation matrix and
@@ -121,6 +126,20 @@ before opt-in. Compare selected and full validation on the same base/head
 revisions and pinned inputs; require that selection misses no deterministic
 validation failure and preserves global gates and exhaustive waiver coverage.
 Keep the input disabled until both the audit prerequisite and replay are met.
+
+Measure the real `Compute validation shards` step during that replay, including
+both git trees, with the timing harness (Python with PyYAML and Bash 4+ required):
+
+```sh
+python3 scripts/benchmark_rulespec_selector.py \
+  --repo ../rulespec-us --base BASE_SHA --head HEAD_SHA --bash bash \
+  -o .hub-scratch/rulespec-us-selector-timing.json
+```
+
+The harness leaves the target checkout untouched and records elapsed seconds,
+outputs, and fallback diagnostics. Retain its report alongside the selected/full
+validation comparison and verify that the complete `shards` job fits its
+10-minute timeout.
 
 The workflow checks repository layout and runs the pinned encoder's generated
 content and PolicyEngine oracle-coverage gates. The local precheck requires
