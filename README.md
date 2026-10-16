@@ -111,6 +111,54 @@ may coexist with import evidence. Null-valued floating-point mapping keys from
 unquoted commas in descriptive flow mappings name no dependency and are ignored;
 all mapping values are still scanned for import evidence.
 
+Source-relation targets also create edges, including `restates` records without
+imports, and every `basis.delegation` reference. All five relation types
+(`amends`, `delegates`, `implements`, `restates`, `sets`) retain their targets.
+Resolution follows the pinned encoder's canonical jurisdiction and atomic-root
+parser: trim outer whitespace/quotes and append `.yaml` unless already present.
+Unresolved or unsupported references are contained to their owning module.
+Scalar `derived_relation.source_relation` references also create direct edges.
+Absolute references in companion input/output/table keys and deferred-output
+`blocked_by` references also create edges. These compose transitively with imports.
+A bare proof-import symbol such as `reciprocal_japan_duty_rate` names no file;
+the encoder skips it in its hash check, so it creates no edge or opacity. The
+tariff overlay's active waiver continues to have its existing global effect
+when a change reaches that overlay.
+The minimal bare-overlay regression selects just `us` for an unrelated federal
+tariff edit. A real-tree changed-path probe at the revision below for the
+federal `china-301/list-1-9903-88-03` overlay still selects 52 legs with full
+targets: another module, `us/regulations/42-cfr/457/344.yaml`, has the unresolved
+target `us:regulation/42/457/344` and is named by shared validation evidence.
+Its required containment causes global selection; the tariff overlay is no
+longer opaque. This probe substitutes a changed path against identical trees;
+it is separate from the exact-pair historical replay.
+
+Sibling dependencies cover additions, removals, renames and content edits.
+The encoder's section is wider than the immediate directory: statutes use
+title/section, CFR regulations use CFR-title/part/section, and other regulations
+use title/section, including all descendants and the section-root module.
+Immediate siblings also share exported-name checks, and child modules feed
+ancestor-module checks under every atomic root. Synthetic group nodes preserve
+these dependencies without building a quadratic graph. Statute membership
+changes additionally revalidate every local numeric-title statutory module:
+cross-section definition and placeholder checks can infer references from text
+and depend on the existence of a previously absent section. Executable rules
+with matching names create conservative upstream edges within a jurisdiction
+and from its ancestor jurisdictions, covering the encoder's duplicate-rule
+signature check.
+If strict parsing hides a provider's exported names, its containment also
+reaches every possible executable-name consumer in its jurisdiction and
+descendant jurisdictions. This covers duplicate-key documents that the
+encoder's permissive name index can still read.
+
+These rules mirror axiom-encode `5ddb5ea4`,
+`src/axiom_encode/harness/validator_pipeline.py`: source targets at 33645/33705,
+companion references at 34636, blockers at 35272, same-section boundaries at
+30164, sibling names at 30322, child checks at 30689/32399, descendant terms at
+38538, inferred section existence at 37909/38085/39805, executable-name
+indexing at 21087/21192, and bare proof imports at 26564. Delegation resolution
+uses the same target parser through `src/axiom_encode/cli.py:37548/37634`.
+
 Shared validation records also create dependencies. The keys under
 `known-validation-gaps.yaml:validate_failures` and the `modules` keys in
 `.axiom/pending-validation-fingerprints.json` and
@@ -122,6 +170,12 @@ shared references use the global fallback because their consumers cannot be
 attributed safely to one jurisdiction. These rules preserve historical
 whole-ledger checks and the compatibility audit for older encoders, even when
 the shared file itself is unchanged.
+
+This round keeps that whole-ledger rule unchanged. At rulespec-us `origin/main`
+`d8511cca76b060e40fba90ae8af7f7643e6edf11`, 3,607 of 4,879 atomic modules
+(73.9%) are directly named by the union of shared validation records. A change
+to any of them therefore requires all 52 legs with full targets; transitive
+dependencies can increase that cost. Per-leg partitioning is separate work.
 
 Repository tests and other first-leg gates run on the first selected leg; their
 coverage moves with that leg. Omitting their historical hosting leg does not
@@ -158,6 +212,8 @@ changes, index-only diffs, and a modeled dependency closure covering every
 jurisdiction. Other shared paths keep their existing target behavior;
 ledger/digest and audit-manifest changes can still require all legs. This input remains
 disabled unless a caller opts in.
+The default selector remains unchanged; [TheAxiomFoundation/.github#140](https://github.com/TheAxiomFoundation/.github/issues/140)
+tracks the corresponding dependency gap in that path.
 
 Before a caller opts in, its waiver audit must not land wholesale on the
 selected validation legs. Incremental, change-scoped waiver audit work is tracked
@@ -172,10 +228,10 @@ before opt-in. Compare selected and full validation on the same base/head
 revisions and pinned inputs; require that selection misses no deterministic
 validation failure and preserves global gates and exhaustive waiver coverage.
 Keep the input disabled until both the audit prerequisite and replay are met.
-Round 4 replayed all 53 historical exact pairs with no omitted recorded failures.
-Every pair selected all 52 legs with full targets: the shared validation records
-require global selection on this sample. This closes the recorded false
-negatives without demonstrating reduced matrix work. Caller runtime and audit
+Rounds 4 and 5 each replayed all 53 historical exact pairs with no omitted
+recorded failures. Every pair selected all 52 legs with full targets: shared
+validation records and required containment cause global selection on this
+sample. It demonstrates no matrix reduction. Caller runtime and audit
 prerequisites remain necessary before opt-in.
 
 Measure the real `Compute validation shards` step during that replay, including

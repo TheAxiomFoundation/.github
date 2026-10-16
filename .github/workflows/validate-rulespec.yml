@@ -1440,6 +1440,7 @@ jobs:
           if import_aware:
               try:
                   import yaml
+                  from pathlib import PurePosixPath
 
                   atomic_roots = {"statutes", "regulations", "policies", "legislation"}
                   jurisdiction = re.compile(r"[a-z]{2}(?:-[a-z0-9-]+)*")
@@ -1655,7 +1656,39 @@ jobs:
                   node_owners = {}
                   program_owners = {}
                   opaque_modules = set()
+                  opaque_exports = set()
+                  executable_modules = {}
                   contained_reasons = set()
+                  section_modules = {}
+                  statute_existence_modules = {}
+
+                  def sections(path):
+                      # validator_pipeline.py:30164 (encoder 5ddb5ea4) uses
+                      # Path.stem on every component, then groups statutes by
+                      # title/section, CFR by title/part/section, and other
+                      # regulations by title/section. Descendants count too:
+                      # :30207 tests both a .yaml file and a child directory.
+                      parts = path.split("/")
+                      normalized = [PurePosixPath(part).stem for part in parts[1:]]
+                      root = normalized[0]
+                      count = 4 if (root == "regulations" and len(normalized) >= 4
+                                    and normalized[1].endswith("-cfr")) else 3
+                      groups = {tuple(parts[:-1])}
+                      if root in {"statutes", "regulations"} and len(normalized) >= count:
+                          groups.add((parts[0], *normalized[:count]))
+                      return groups
+
+                  # The --no-renames diff exposes renames as removal/addition.
+                  # A uniquely owned companion shares its module's directory,
+                  # so companion-only changes cannot alter directory existence.
+                  changed_sections = set()
+                  statute_topology_owners = set()
+                  for path in changed:
+                      if (atomic_owner(path) and not is_companion(path)
+                              and ((path in trees[0]) != (path in trees[1]))):
+                          changed_sections.update(sections(path))
+                          if path.split("/")[1] == "statutes":
+                              statute_topology_owners.add(atomic_owner(path))
 
                   def edge(provider, importer):
                       reverse.setdefault(provider, set()).add(importer)
@@ -1685,6 +1718,36 @@ jobs:
                                   raise ValueError(f"ambiguous module identity: {key}")
                               modules[key] = path
                               node_owners[key] = atomic_owner(path)
+                              parts = path.split("/")
+                              # Cross-statute definition/placeholder checks
+                              # infer references from source text/formulas and
+                              # test file/directory existence (:37880/:38085).
+                              # A membership change revalidates the entire
+                              # finite local domain admitted by :39805, even
+                              # when no explicit import names the new section.
+                              if (parts[1] == "statutes" and re.fullmatch(r"[0-9A-Za-z.-]+", parts[2])
+                                      and any(c.isdigit() for c in parts[2])):
+                                  statute_existence_modules.setdefault(parts[0], set()).add(key)
+                              for section in sections(path):
+                                  section_modules.setdefault(section, set()).add(key)
+                                  # Other encoder checks read sibling exported
+                                  # names (:30322), descendant definitions
+                                  # (:38538), and child exceptions (:32399).
+                                  # A group node models their mutual dependence
+                                  # without materializing a quadratic clique.
+                                  node = "section:" + json.dumps(section)
+                                  edge(key, node)
+                                  edge(node, key)
+
+                      # Child-fragment checks are not restricted to statutes
+                      # and regulations (:30689/:32399). A parent.yaml module
+                      # reads its parent/ descendants in every atomic root.
+                      for key, path in modules.items():
+                          parts = path.split("/")
+                          for length in range(3, len(parts)):
+                              ancestor = parts[0] + ":" + "/".join(parts[1:length])
+                              if ancestor in modules:
+                                  edge(key, ancestor)
 
                       def resolve(target, program=False):
                           if not isinstance(target, str):
@@ -1724,10 +1787,61 @@ jobs:
                               raise ValueError(f"unresolved program import: {target}")
                           return key
 
-                      def dependency_edges(payload, importer):
+                      def resolve_source(target):
+                          # Mirror _parse_rulespec_target (:33705) and canonical
+                          # _resolve_rulespec_target_file (:33968), also used by
+                          # the delegation resolver in cli.py:37548/37634.
+                          # Source refs append .yaml even to a .yml spelling.
+                          if not isinstance(target, str):
+                              raise ValueError("non-string source/delegation target")
+                          match = re.fullmatch(
+                              r"([a-z]{2}(?:-[a-z0-9]+)*):([^#]+)(?:#([^#]+))?",
+                              target.strip().strip("'\""),
+                          )
+                          if match is None:
+                              raise ValueError(f"invalid source/delegation target: {target}")
+                          prefix, relative, _symbol = match.groups()
+                          clean_path(relative)
+                          if relative != relative.strip() or relative.split("/", 1)[0] not in atomic_roots:
+                              raise ValueError(f"invalid source/delegation target: {target}")
+                          path = prefix + "/" + relative + ("" if relative.endswith(".yaml") else ".yaml")
+                          key = identity(path)
+                          if modules.get(key) != path or prefix not in shard_set:
+                              raise ValueError(f"unresolved source/delegation target: {target}")
+                          return key
+
+                      def executable_edges(payload, importer):
+                          if payload.get("format") == "rulespec/v1":
+                              rules = payload.get("rules")
+                              for rule in rules if isinstance(rules, list) else []:
+                                  if (not isinstance(rule, dict) or str(rule.get("kind") or "").strip().lower()
+                                          not in {"parameter", "derived", "derived_relation"}):
+                                      continue
+                                  # Upstream duplicate validation (:21087)
+                                  # indexes executable names in this jurisdiction
+                                  # and its ancestors (:21192). Matching names
+                                  # conservatively covers any signature change.
+                                  executable_modules.setdefault(node_owners[importer], set()).add(importer)
+                                  name = str(rule.get("name") or "<unknown>").strip() or "<unknown>"
+                                  owner_parts = node_owners[importer].split("-")
+                                  own_symbol = "symbol:" + json.dumps([node_owners[importer], name])
+                                  edge(importer, own_symbol)
+                                  for length in range(1, len(owner_parts) + 1):
+                                      upstream = "-".join(owner_parts[:length])
+                                      edge("symbol:" + json.dumps([upstream, name]), importer)
+
+                      def dependency_edges(payload, importer, companion=False):
                           # RuleSpec metadata is open-ended, and companion test
                           # documents can be lists. Visit every mapping/list,
                           # including side channels outside metadata.proof.
+                          def companion_reference(value):
+                              # Absolute test keys resolve a target's exported
+                              # names and input slots (:34636/:34769). Include
+                              # nested keys/values, not just imports evidence.
+                              if (companion and isinstance(value, str)
+                                      and re.match(r"^[a-z]{2}(?:-[a-z0-9]+)*:", value)):
+                                  edge(resolve_source(value), importer)
+
                           pending = [payload]
                           seen = set()
                           while pending:
@@ -1738,6 +1852,7 @@ jobs:
                               if isinstance(value, (tuple, set)):
                                   raise ValueError("unsupported dependency container")
                               if not isinstance(value, (dict, list)):
+                                  companion_reference(value)
                                   continue
                               if id(value) in seen:
                                   continue
@@ -1754,6 +1869,8 @@ jobs:
                                      and not (type(key) is float and item is None)
                                      for key, item in value.items()):
                                   raise ValueError("unsupported dependency mapping key")
+                              for key in value:
+                                  companion_reference(key)
                               if "imports" in value:
                                   imports = value["imports"]
                                   if imports is None:
@@ -1762,6 +1879,33 @@ jobs:
                                       raise ValueError("imports is not a list")
                                   for target in imports:
                                       edge(resolve(target), importer)
+                              if "source_relation" in value:
+                                  relation = value["source_relation"]
+                                  if isinstance(relation, str):
+                                      # derived_relation.source_relation uses a
+                                      # canonical scalar relation reference.
+                                      target = relation
+                                  elif isinstance(relation, dict) and "target" in relation:
+                                      target = relation["target"]
+                                  else:
+                                      raise ValueError("malformed source relation")
+                                  # All relation types retain target edges; in
+                                  # particular restates verification loads target
+                                  # values at validator_pipeline.py:33645.
+                                  edge(resolve_source(target), importer)
+                              basis = value.get("basis")
+                              if isinstance(basis, dict) and "delegation" in basis:
+                                  edge(resolve_source(basis["delegation"]), importer)
+                              if "blocked_by" in value:
+                                  blockers = value["blocked_by"]
+                                  if blockers is None:
+                                      blockers = []
+                                  if not isinstance(blockers, list):
+                                      raise ValueError("blocked_by is not a list")
+                                  # Deferred-output authentication loads each
+                                  # blocker export (:35272/:35315).
+                                  for target in blockers:
+                                      edge(resolve_source(target), importer)
                               if value.get("kind") == "import" or "import" in value:
                                   kind = value.get("kind")
                                   if not isinstance(kind, str) or kind not in proof_atom_kinds:
@@ -1777,7 +1921,10 @@ jobs:
                                           or set(imported) - {"target", "output", "hash"}
                                           or any(not isinstance(item, str) for item in imported.values())):
                                       raise ValueError("malformed/unknown import atom payload")
-                                  edge(resolve(imported["target"]), importer)
+                                  # The encoder's proof hash check (:26564)
+                                  # skips bare symbols: they name no file.
+                                  if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", imported["target"]) is None:
+                                      edge(resolve(imported["target"]), importer)
                               pending.extend(value.values())
 
                       # Read small inputs first, preferring watched modules
@@ -1795,14 +1942,21 @@ jobs:
                               raise ValueError(f"companion has no unique module: {path}")
                           if node_owners[key] not in shard_set:
                               raise ValueError(f"undiscovered module owner: {path}")
+                          exports_known = is_companion(path)
                           try:
-                              dependency_edges(document(entries, path), key)
+                              payload = document(entries, path)
+                              if not is_companion(path):
+                                  executable_edges(payload, key)
+                                  exports_known = True
+                              dependency_edges(payload, key, companion=is_companion(path))
                           except Exception as error:
                               # Ownership is established before parsing. Unknown
                               # outgoing dependencies can only affect this
                               # importer, so seed it on every change and retain
                               # all known incoming edges from either tree.
                               opaque_modules.add(key)
+                              if not exports_known:
+                                  opaque_exports.add(key)
                               reason = f"{path}: {' '.join(str(error).split())}"
                               if reason not in contained_reasons:
                                   contained_reasons.add(reason)
@@ -1844,8 +1998,22 @@ jobs:
                           if not count:
                               raise ValueError(f"program scope resolves across entire checkout: {path}")
 
+                  # A strict parse failure can hide exported names which the
+                  # encoder's permissive loader still indexes (duplicate keys
+                  # are one example). Cover every possible implicit consumer
+                  # in the provider's jurisdiction and descendant jurisdictions.
+                  for provider in opaque_exports:
+                      owner = node_owners[provider]
+                      for consumer_owner, consumers in executable_modules.items():
+                          if consumer_owner == owner or consumer_owner.startswith(owner + "-"):
+                              for consumer in consumers:
+                                  edge(provider, consumer)
+
                   owners = set()
-                  seeds = set()
+                  seeds = {key for section in changed_sections
+                           for key in section_modules.get(section, ())}
+                  seeds.update(key for owner in statute_topology_owners
+                               for key in statute_existence_modules.get(owner, ()))
                   full_reasons = []
                   changed_modules = {identity(path) for path in changed
                                      if atomic_owner(path) and not is_companion(path)}

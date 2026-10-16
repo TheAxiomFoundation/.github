@@ -982,6 +982,26 @@ def selection_evidence_module(atom: dict) -> str:
     }, sort_keys=False)
 
 
+def selection_source_relation_module(
+    target: str, *, relation: str = "restates", delegation: str | None = None,
+) -> str:
+    import yaml
+
+    # Minimal shapes from SNAP restatements and delegated policy settings.
+    # These are temporary selector fixtures, never RuleSpec corpus modules.
+    source_relation = {"type": relation, "target": target}
+    if delegation is not None or relation == "sets":
+        source_relation.update(value="fixture", basis={"delegation": delegation or target})
+    return yaml.safe_dump({
+        "format": "rulespec/v1",
+        "rules": [{
+            "name": "fixture_relation", "kind": "source_relation",
+            "source_relation": source_relation,
+            "verification": {"values": {"fixture": {2026: 1}}},
+        }],
+    }, sort_keys=False)
+
+
 def selection_program(owner: str, scope: dict) -> str:
     import yaml
 
@@ -2266,7 +2286,11 @@ def test_import_selection_yaml_merge_ny_companion_unrelated_leg() -> None:
     jurisdictions = ["us-ca", "us-fl", "us-ma", "us-ny", "us-sc", "us"]
     module = "us-ny/regulations/18-nycrr/387/12/f/3/v/a.yaml"
     path = module.removesuffix(".yaml") + ".test.yaml"
-    files = {**selection_files(jurisdictions), module: selection_module(), path: companion}
+    files = {
+        **selection_files(jurisdictions), module: selection_module(), path: companion,
+        "us/statutes/7/2012/j.yaml": selection_module(),
+        "us/regulations/7-cfr/273/9.yaml": selection_module(),
+    }
     for changed, expected in (("us-fl/statutes/local.yaml", "us-fl"), (path, "us-ny")):
         result = run_import_aware_selection({changed: files[changed] + "# changed\n"}, files=files)
         assert_selection(result, [expected], jurisdictions=jurisdictions, revalidate=[])
@@ -2624,6 +2648,8 @@ def test_import_selection_generated_opaque_graph_property(cases: range = range(2
                 expanded = affected | {
                     node for node in modules if (base_edges[node] | head_edges[node]) & affected
                 }
+                affected_parents = {Path(node).parent for node in affected}
+                expanded.update(node for node in modules if Path(node).parent in affected_parents)
                 if expanded == affected:
                     return affected
                 affected = expanded
@@ -2834,6 +2860,344 @@ def test_import_selection_opaque_global_validation_dependency() -> None:
         assert "global validation dependency:" in result["scope-diagnostics"], result
 
 
+def test_import_selection_source_relation_restates_without_imports() -> None:
+    provider = "us/policies/usda/snap/fy-2026-cola/deductions.yaml"
+    restater = "us-ma/policies/dta/snap/cola.yaml"
+    files = {
+        **selection_files(), provider: selection_module(),
+        restater: selection_source_relation_module(
+            "us:policies/usda/snap/fy-2026-cola/deductions#snap_standard_deduction",
+        ),
+    }
+    assert "imports:" not in files[restater]
+    result = run_import_aware_selection({provider: files[provider] + "# changed value\n"}, files=files)
+    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma"])
+    assert_full_leg(result, "us-ma", files)
+    assert "contained=" not in result["scope-diagnostics"], result
+
+
+def test_import_selection_source_relation_delegation() -> None:
+    provider = "us/policies/usda/snap/delegation.yaml"
+    setting = "us-ma/policies/dta/snap/local-setting.yaml"
+    files = {
+        **selection_files(), provider: selection_module(),
+        setting: selection_source_relation_module(
+            "us-ma:policies/dta/snap/local-setting#fixture", relation="sets",
+            delegation="us:policies/usda/snap/delegation#authority",
+        ),
+    }
+    result = run_import_aware_selection({provider: files[provider] + "# changed authority\n"}, files=files)
+    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma"])
+    assert_full_leg(result, "us-ma", files)
+    assert "contained=" not in result["scope-diagnostics"], result
+
+
+def test_import_selection_source_relation_transitive_import_chain() -> None:
+    provider = "us/policies/usda/snap/fy-2026-cola/deductions.yaml"
+    restater = "us-ma/policies/dta/snap/cola.yaml"
+    importer = "us-fl/statutes/local.yaml"
+    files = {
+        **selection_files(), provider: selection_module(),
+        restater: selection_source_relation_module(
+            "us:policies/usda/snap/fy-2026-cola/deductions#snap_standard_deduction",
+        ),
+        importer: selection_module("us-ma:policies/dta/snap/cola#fixture_relation"),
+    }
+    for restates_first in (True, False):
+        if not restates_first:
+            # Value extraction from a restated module follows that module's
+            # ordinary imports, so the opposite ordering is required too.
+            files[restater] = selection_module(
+                "us:policies/usda/snap/fy-2026-cola/deductions#snap_standard_deduction",
+            )
+            files[importer] = selection_source_relation_module("us-ma:policies/dta/snap/cola#fixture")
+        result = run_import_aware_selection({provider: files[provider] + "# changed value\n"}, files=files)
+        assert_selection(result, ["us-fl", "us-ma", "us"], revalidate=["us-fl", "us-ma"])
+        for owner in ("us-fl", "us-ma"):
+            assert_full_leg(result, owner, files)
+
+
+def selection_same_section_fixture() -> tuple[dict[str, str], str]:
+    import yaml
+
+    cited = "us-ma/statutes/39/39-22-104/1.5.yaml"
+    payload = yaml.safe_load(selection_module())
+    payload["source"] = {
+        "citation": "C.R.S. 39-22-104(1.5)",
+        "text": "Net income is determined except as provided in subsection (2) of this section.",
+    }
+    payload["rules"] = [{"name": "fixture", "kind": "parameter"}]
+    files = {
+        **selection_files(), cited: yaml.safe_dump(payload, sort_keys=False),
+        "us-fl/statutes/local.yaml": selection_module("us-ma:statutes/39/39-22-104/1.5#fixture"),
+    }
+    return files, cited
+
+
+def test_import_selection_same_section_sibling_added() -> None:
+    files, _ = selection_same_section_fixture()
+    sibling = "us-ma/statutes/39/39-22-104/2.yaml"
+    changes = {sibling: selection_module()}
+    result = run_import_aware_selection(changes, files=files)
+    assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl", "us-ma"])
+    for owner in ("us-fl", "us-ma"):
+        assert_full_leg(result, owner, {**files, **changes})
+
+
+def test_import_selection_same_section_sibling_removed() -> None:
+    files, _ = selection_same_section_fixture()
+    sibling = "us-ma/statutes/39/39-22-104/2.yaml"
+    files[sibling] = selection_module()
+    result = run_import_aware_selection({sibling: None}, files=files)
+    assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl", "us-ma"])
+    remaining = {path: content for path, content in files.items() if path != sibling}
+    for owner in ("us-fl", "us-ma"):
+        assert_full_leg(result, owner, remaining)
+
+
+def test_import_selection_same_section_descendants_and_rename() -> None:
+    # The encoder's 30164/30207 helpers use the entire legal section and the
+    # existence of directories, rather than only a module's immediate parent.
+    files, _ = selection_same_section_fixture()
+    for added in (
+        "us-ma/statutes/39/39-22-104/2/a.yaml",
+        "us-ma/statutes/39/39-22-104.yaml",
+    ):
+        changes = {added: selection_module()}
+        result = run_import_aware_selection(changes, files=files)
+        assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl", "us-ma"])
+        for owner in ("us-fl", "us-ma"):
+            assert_full_leg(result, owner, {**files, **changes})
+    removed = "us-ma/statutes/39/39-22-104/2/a.yaml"
+    renamed = "us-sc/statutes/39/39-22-104/2/a.yaml"
+    files[removed] = selection_module()
+    changes = {removed: None, renamed: files[removed]}
+    result = run_import_aware_selection(changes, files=files)
+    assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-ma"])
+    remaining = {path: content for path, content in {**files, **changes}.items() if content is not None}
+    for owner in ("us-fl", "us-ma"):
+        assert_full_leg(result, owner, remaining)
+
+
+def test_import_selection_same_section_sibling_content_changed() -> None:
+    files, _ = selection_same_section_fixture()
+    sibling = "us-ma/statutes/39/39-22-104/2/a.yaml"
+    files[sibling] = selection_module()
+    changes = {sibling: files[sibling] + "# exported rule or value changed\n"}
+    result = run_import_aware_selection(changes, files=files)
+    assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl", "us-ma"])
+    for owner in ("us-fl", "us-ma"):
+        assert_full_leg(result, owner, {**files, **changes})
+
+
+def test_import_selection_parent_child_fragment_dependency() -> None:
+    parent = "us-ma/policies/snap/allowance.yaml"
+    child = "us-ma/policies/snap/allowance/exceptions/a.yaml"
+    files = {
+        **selection_files(), parent: selection_module(), child: selection_module(),
+        "us-fl/statutes/local.yaml": selection_module("us-ma:policies/snap/allowance#fixture"),
+    }
+    changes = {child: files[child] + "# changed child numeric output\n"}
+    result = run_import_aware_selection(changes, files=files)
+    assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl", "us-ma"])
+    for owner in ("us-fl", "us-ma"):
+        assert_full_leg(result, owner, {**files, **changes})
+
+
+def test_import_selection_bare_import_overlay_preserves_waiver() -> None:
+    overlay = "us/policies/usitc/us-tariff-duty/overlays/ieepa/reciprocal-japan-9903-02-73.yaml"
+    tariff = "us/policies/usitc/us-tariff-duty/base.yaml"
+    files = {
+        **selection_files(), tariff: selection_module(),
+        overlay: selection_evidence_module(selection_import_evidence(
+            "reciprocal_japan_duty_rate", kind="import",
+        )),
+        "known-validation-gaps.yaml": selection_validation_ledger(overlay, status="active"),
+    }
+    result = run_import_aware_selection({tariff: files[tariff] + "# changed tariff\n"}, files=files)
+    assert_selection(result, ["us"], revalidate=[])
+    assert result["targets"]["us"] == ("changed", [tariff], []), result
+    assert "contained=" not in result["scope-diagnostics"], result
+    assert "global validation dependency:" not in result["scope-diagnostics"], result
+    # A direct waiver fingerprint change retains round 4's global effect.
+    changes = {overlay: files[overlay] + "# changed overlay\n"}
+    result = run_import_aware_selection(changes, files=files)
+    assert_global_validation_selection(result, {**files, **changes})
+    assert "global validation dependency:" in result["scope-diagnostics"], result
+
+
+def test_import_selection_source_relation_unresolved_contained() -> None:
+    opaque = "us-ma/policies/dta/snap/cola.yaml"
+    dependent = "us-fl/statutes/local.yaml"
+    changed = "us-sc/statutes/local.yaml"
+    for content in (
+        selection_source_relation_module("us:policies/missing#fixture"),
+        selection_source_relation_module("dynamic_provider"),
+        selection_source_relation_module(
+            "us-ma:policies/dta/snap/cola#fixture", relation="sets", delegation="dynamic_authority",
+        ),
+    ):
+        files = {
+            **selection_files(), opaque: content,
+            dependent: selection_module("us-ma:policies/dta/snap/cola#fixture"),
+        }
+        result = run_import_aware_selection({changed: files[changed] + "# unrelated\n"}, files=files)
+        assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-ma"])
+        for owner in ("us-fl", "us-ma"):
+            assert_full_leg(result, owner, files)
+        assert f"contained={opaque}:" in result["scope-diagnostics"], result
+        assert "scope=full" not in result["scope-diagnostics"], result
+
+
+def test_import_selection_source_relation_types_and_exact_target_resolution() -> None:
+    restater = "us-ma/policies/snap/relation.yaml"
+    for relation in ("amends", "delegates", "implements", "restates", "sets"):
+        for provider, target in (
+            ("us/policies/snap/provider.yaml", '  "us:policies/snap/provider#fixture"  '),
+            # _parse_rulespec_target appends .yaml to .yml rather than using
+            # the import resolver's suffix normalization.
+            ("us/policies/snap/provider.yml.yaml", "us:policies/snap/provider.yml#fixture"),
+        ):
+            files = {
+                **selection_files(), provider: selection_module(),
+                restater: selection_source_relation_module(target, relation=relation),
+            }
+            result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
+            assert_selection(result, ["us-ma", "us"], revalidate=["us-ma"])
+            assert_full_leg(result, "us-ma", files)
+            assert "contained=" not in result["scope-diagnostics"], (relation, target, result)
+
+
+def test_import_selection_absolute_companion_input_key_dependency() -> None:
+    import yaml
+
+    provider = "us/policies/snap/allowance.yaml"
+    companion = "us-ma/statutes/local.test.yaml"
+    files = {
+        **selection_files(), provider: selection_module(),
+        companion: yaml.safe_dump({"tests": [{
+            "name": "absolute_input", "inputs": {"us:policies/snap/allowance#input.gross_income": 1},
+        }]}, sort_keys=False),
+    }
+    result = run_import_aware_selection({provider: files[provider] + "# input slot removed\n"}, files=files)
+    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma"])
+    assert_full_leg(result, "us-ma", files)
+    assert "contained=" not in result["scope-diagnostics"], result
+
+
+def test_import_selection_executable_upstream_symbol_added() -> None:
+    import yaml
+
+    provider = "us/policies/snap/standard-deduction.yaml"
+    duplicate = "us-ma/policies/snap/local-standard-deduction.yaml"
+    module = yaml.safe_dump({
+        "format": "rulespec/v1", "rules": [{
+            "name": "snap_standard_deduction", "kind": "parameter", "dtype": "Money",
+            "entity": "Household", "period": "Month",
+            "versions": [{"from": "2026-01-01", "values": {2026: 1}}],
+        }],
+    }, sort_keys=False)
+    files = {**selection_files(), duplicate: module}
+    changes = {provider: module}
+    result = run_import_aware_selection(changes, files=files)
+    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma"])
+    assert_full_leg(result, "us-ma", {**files, **changes})
+    assert "contained=" not in result["scope-diagnostics"], result
+
+
+def test_import_selection_deferred_output_blocker_dependency() -> None:
+    import yaml
+
+    provider = "us/policies/snap/definition.yaml"
+    deferred = "us-ma/policies/snap/definition-pipeline.yaml"
+    files = {
+        **selection_files(), provider: selection_module(),
+        deferred: yaml.safe_dump({
+            "format": "rulespec/v1", "rules": [],
+            "module": {"kind": "composition", "deferred_outputs": [{
+                "name": "deferred_definition",
+                "blocked_by": ["us:policies/snap/definition#fixture"],
+            }]},
+        }, sort_keys=False),
+    }
+    result = run_import_aware_selection({provider: files[provider] + "# changed export\n"}, files=files)
+    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma"])
+    assert_full_leg(result, "us-ma", files)
+    assert "contained=" not in result["scope-diagnostics"], result
+
+
+def test_import_selection_cross_statute_existence_dependency() -> None:
+    import yaml
+
+    consumer = "us-ma/statutes/39/39-22-104/1.yaml"
+    provider = "us-ma/statutes/26/2.yaml"
+    files = {
+        **selection_files(),
+        consumer: yaml.safe_dump({
+            "format": "rulespec/v1", "source": {
+                "text": "Qualified income has the meaning given in section 2 of title 26.",
+            },
+            "rules": [{
+                "name": "local_income_definition", "kind": "derived",
+                "versions": [{"from": "2026-01-01", "formula": "section_2_exception"}],
+            }],
+        }, sort_keys=False),
+        "us-fl/statutes/local.yaml": selection_module("us-ma:statutes/39/39-22-104/1#local_income_definition"),
+    }
+    changes = {provider: selection_module()}
+    result = run_import_aware_selection(changes, files=files)
+    assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl", "us-ma"])
+    for owner in ("us-fl", "us-ma"):
+        assert_full_leg(result, owner, {**files, **changes})
+
+
+def test_import_selection_opaque_executable_provider_symbol_containment() -> None:
+    import yaml
+
+    provider = "us/policies/snap/standard-deduction.yaml"
+    duplicate = "us-ma/policies/snap/local-standard-deduction.yaml"
+    module = yaml.safe_dump({
+        "format": "rulespec/v1", "rules": [{
+            "name": "snap_standard_deduction", "kind": "parameter", "dtype": "Money",
+            "entity": "Household", "period": "Month",
+            "versions": [{"from": "2026-01-01", "values": {2026: 1}}],
+        }],
+    }, sort_keys=False)
+    # The encoder's SafeLoader accepts the last rules key and indexes its
+    # exported name. The selector rejects the duplicate before learning that
+    # name, so an opaque provider must retain the implicit consumer domain.
+    files = {**selection_files(), provider: "rules: []\n" + module, duplicate: module}
+    changes = {provider: files[provider] + "# changed opaque provider\n"}
+    result = run_import_aware_selection(changes, files=files)
+    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma", "us"])
+    for owner in ("us-ma", "us"):
+        assert_full_leg(result, owner, {**files, **changes})
+    assert f"contained={provider}:" in result["scope-diagnostics"], result
+
+
+def test_import_selection_scalar_source_relation_dependency() -> None:
+    import yaml
+
+    provider = "us/policies/snap/definition.yaml"
+    consumer = "us-ma/policies/snap/derived-definition.yaml"
+    files = {
+        **selection_files(), provider: selection_module(),
+        consumer: yaml.safe_dump({
+            "format": "rulespec/v1", "rules": [{
+                "name": "local_snap_relation", "kind": "derived_relation",
+                "derived_relation": {
+                    "arity": 2, "source_relation": "us:policies/snap/definition#fixture",
+                    "current_slot": 1, "related_slot": 0,
+                },
+            }],
+        }, sort_keys=False),
+    }
+    result = run_import_aware_selection({provider: files[provider] + "# changed provider\n"}, files=files)
+    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma"])
+    assert_full_leg(result, "us-ma", files)
+    assert "contained=" not in result["scope-diagnostics"], result
+
+
 def test_import_selection_generated_global_validation_graph_property(cases: range = range(24)) -> None:
     import yaml
 
@@ -2844,36 +3208,57 @@ def test_import_selection_generated_global_validation_graph_property(cases: rang
             f"{owner}/statutes/{name}.yaml"
             for owner in SELECTION_JURISDICTIONS for name in ("local", "generated")
         ]
+        # Siblings below a legal section are coupled even across directories;
+        # direct parent siblings also participate in exported-name validation.
+        section_siblings = [
+            {f"{owner}/statutes/39/39-22-104/{fragment}.yaml" for fragment in ("1", "2/a")}
+            for owner in SELECTION_JURISDICTIONS
+        ]
+        modules += sorted(set().union(*section_siblings))
+        parent_siblings = [
+            {node for node in modules if str(Path(node).parent) == parent}
+            for parent in sorted({str(Path(node).parent) for node in modules})
+        ]
+        sibling_sets = section_siblings + parent_siblings
+        topology = sorted(section_siblings[case % len(section_siblings)])[-1]
+        base_exists = set(modules) - ({topology} if case % 2 else set())
+        head_exists = set(modules) - ({topology} if case and not case % 2 else set())
+        stable = sorted(base_exists & head_exists)
         owners = {node: node.split("/", 1)[0] for node in modules}
         globals_ = ["known-validation-gaps.yaml", ".axiom/pending-validation-fingerprints.json"]
         base_edges = {
-            node: {other for other in modules if rng.random() < (0.04 if case % 2 else 0.14)}
+            node: ({other for other in stable if rng.random() < (0.04 if case % 2 else 0.14)}
+                   if node in base_exists else set())
             for node in modules
         }
-        changed_modules = set(rng.sample(modules, rng.randint(1, 3)))
+        changed_modules = set(rng.sample(stable, rng.randint(1, 3)))
+        if case:
+            changed_modules.add(topology)
         head_edges = {
-            node: ({other for other in modules if rng.random() < 0.11}
-                   if node in changed_modules else set(providers))
+            node: (({other for other in stable if rng.random() < 0.11}
+                    if node in changed_modules else set(providers))
+                   if node in head_exists else set())
             for node, providers in base_edges.items()
         }
         for node in globals_:
-            base_edges[node] = set(rng.sample(modules, rng.randrange(4)))
+            base_edges[node] = set(rng.sample(stable, rng.randrange(4)))
             head_edges[node] = (
-                set(rng.sample(modules, rng.randrange(4)))
+                set(rng.sample(stable, rng.randrange(4)))
                 if case % 3 == 1 else set(base_edges[node])
             )
         if case == 0:
-            # The only route to a global check uses a proof import into an
-            # unchanged watched module. The round-3 selector misses three legs.
+            # The only route to a global check crosses a restatement and a
+            # delegation with no ordinary imports. Round 4 misses four legs.
             base_edges = {node: set() for node in modules + globals_}
             base_edges["us-ma/statutes/generated.yaml"] = {"us/statutes/local.yaml"}
-            base_edges[globals_[0]] = {"us-ma/statutes/generated.yaml"}
+            base_edges["us-sc/statutes/generated.yaml"] = {"us-ma/statutes/generated.yaml"}
+            base_edges[globals_[0]] = {"us-sc/statutes/generated.yaml"}
             head_edges = {node: set(providers) for node, providers in base_edges.items()}
             changed_modules = {"us/statutes/local.yaml"}
 
-        opaque_base = set(rng.sample(modules, rng.randrange(4))) if case else set()
+        opaque_base = set(rng.sample(stable, rng.randrange(4))) if case else set()
         opaque_head = (opaque_base - changed_modules) | {
-            node for node in sorted(changed_modules) if case and rng.random() < 0.35
+            node for node in sorted(changed_modules) if node in head_exists and case and rng.random() < 0.35
         }
         hidden_base = {
             node: ({provider for provider in sorted(base_edges[node]) if rng.random() < 0.7}
@@ -2907,24 +3292,50 @@ def test_import_selection_generated_global_validation_graph_property(cases: rang
                 )
             ordinary = []
             atoms = []
+            relations = []
+            blockers = []
             for index, provider in enumerate(sorted(providers)):
-                if case != 0 and (modules.index(node) + index + case) % 3 == 0:
+                mode = (modules.index(node) + index + case) % 5
+                if case == 0:
+                    mode = 2 if node == "us-ma/statutes/generated.yaml" else 3
+                if mode == 0:
                     ordinary.append(target(provider))
-                else:
+                elif mode == 1:
                     atoms.append(selection_import_evidence(
                         target(provider), kind="parameter" if index % 2 else "import",
                     ))
+                elif mode == 4:
+                    blockers.append(target(provider))
+                else:
+                    relation = {"type": "restates", "target": target(provider)}
+                    if mode == 3:
+                        relation = {
+                            "type": "sets", "target": target(node), "value": "fixture",
+                            "basis": {"delegation": target(provider)},
+                        }
+                    relations.append({
+                        "name": f"relation_{index}", "kind": "source_relation",
+                        "source_relation": relation,
+                        "verification": {"values": {"fixture": {2026: 1}}},
+                    })
             payload = yaml.safe_load(selection_module(*ordinary))
             if atoms:
                 payload["rules"] = [{"name": "fixture", "metadata": {"proof": {"atoms": atoms}}}]
+            payload["rules"].extend(relations)
+            if blockers:
+                payload["module"] = {"kind": "composition", "deferred_outputs": [{
+                    "name": "deferred_fixture", "blocked_by": blockers,
+                }]}
             return yaml.safe_dump(payload, sort_keys=False)
 
         for node in modules + globals_:
-            files[node] = render(node, modeled_base[node], hidden_base[node], opaque_base)
+            if node in globals_ or node in base_exists:
+                files[node] = render(node, modeled_base[node], hidden_base[node], opaque_base)
         changed_globals = {node for node in globals_ if base_edges[node] != head_edges[node]}
         changes = {
-            node: render(node, modeled_head[node], hidden_head[node], opaque_head)
-                  + (f"# changed {case}\n" if node in modules else "")
+            node: (render(node, modeled_head[node], hidden_head[node], opaque_head)
+                   + (f"# changed {case}\n" if node in modules else ""))
+                  if node in globals_ or node in head_exists else None
             for node in changed_modules | changed_globals
         }
         # Global checks are independent sink nodes: changing their shared file
@@ -2935,6 +3346,11 @@ def test_import_selection_generated_global_validation_graph_property(cases: rang
                 expanded = affected | {
                     node for node in modules + globals_ if (base[node] | head[node]) & affected
                 }
+                for siblings in sibling_sets:
+                    # Independent oracle: each validator-observed section or
+                    # direct parent is a clique over its base/head membership.
+                    if siblings & affected:
+                        expanded.update(siblings & (base_exists | head_exists))
                 if expanded == affected:
                     return affected
                 affected = expanded
@@ -2949,7 +3365,7 @@ def test_import_selection_generated_global_validation_graph_property(cases: rang
             else {owners[node] for node in true_affected | opaque}
         )
         result = run_import_aware_selection(changes, files=files)
-        head_files = {**files, **changes}
+        head_files = {node: content for node, content in {**files, **changes}.items() if content is not None}
         assert true_required <= set(result["matrix"]), (case, base_edges, head_edges, opaque, changes, result)
         if set(globals_) & affected:
             required = set(SELECTION_JURISDICTIONS)
@@ -3029,6 +3445,8 @@ def test_import_selection_generated_graph_property(cases: range = range(20)) -> 
                 node for node in nodes
                 if (dependencies[node] | head_dependencies[node]) & affected
             }
+            affected_parents = {Path(node).parent for node in affected if node in modules}
+            expanded.update(node for node in modules if Path(node).parent in affected_parents)
             if expanded == affected:
                 break
             affected = expanded
@@ -3193,6 +3611,23 @@ def run_selector_tests() -> None:
         test_import_selection_global_validation_evidence_without_ledger,
         test_import_selection_global_validation_malformed_shared_inputs,
         test_import_selection_opaque_global_validation_dependency,
+        test_import_selection_source_relation_restates_without_imports,
+        test_import_selection_source_relation_delegation,
+        test_import_selection_source_relation_transitive_import_chain,
+        test_import_selection_same_section_sibling_added,
+        test_import_selection_same_section_sibling_removed,
+        test_import_selection_same_section_descendants_and_rename,
+        test_import_selection_same_section_sibling_content_changed,
+        test_import_selection_parent_child_fragment_dependency,
+        test_import_selection_bare_import_overlay_preserves_waiver,
+        test_import_selection_source_relation_unresolved_contained,
+        test_import_selection_source_relation_types_and_exact_target_resolution,
+        test_import_selection_absolute_companion_input_key_dependency,
+        test_import_selection_executable_upstream_symbol_added,
+        test_import_selection_deferred_output_blocker_dependency,
+        test_import_selection_cross_statute_existence_dependency,
+        test_import_selection_opaque_executable_provider_symbol_containment,
+        test_import_selection_scalar_source_relation_dependency,
         test_import_selection_generated_global_validation_graph_property,
         test_import_selection_generated_graph_property,
         test_import_selection_generated_suffix_ambiguity_property,
