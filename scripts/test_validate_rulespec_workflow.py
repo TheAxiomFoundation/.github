@@ -1494,7 +1494,6 @@ def test_import_selection_parameter_evidence_full_selection_reasons() -> None:
         ({"README.md": "changed\n"}, "shared/root path: README.md"),
         ({".axiom/audit-manifests/audit.json": "{}\n"},
          "shared/root path: .axiom/audit-manifests/audit.json"),
-        ({"known-validation-gaps.yaml": "changed\n"}, "ledger change: known-validation-gaps.yaml"),
         ({"known-missing-money-atoms.yaml": "changed\n"}, "ledger change: known-missing-money-atoms.yaml"),
         ({".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace('"before"', '"after"')},
          "toolchain change: .axiom/toolchain.toml"),
@@ -1508,10 +1507,18 @@ def test_import_selection_parameter_evidence_full_selection_reasons() -> None:
         assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[])
         assert f"scope=full ({reason})" in result["scope-diagnostics"], result
     combined = run_import_aware_selection({
-        "README.md": "changed\n", "known-validation-gaps.yaml": "changed\n",
+        "README.md": "changed\n", "known-missing-money-atoms.yaml": "changed\n",
     })
-    assert "ledger change: known-validation-gaps.yaml" in combined["scope-diagnostics"], combined
+    assert "ledger change: known-missing-money-atoms.yaml" in combined["scope-diagnostics"], combined
     assert "shared/root path: README.md" in combined["scope-diagnostics"], combined
+    # A shared validation input is a sufficient global witness and also
+    # expands targets; other shared paths retain the behavior above.
+    combined = run_import_aware_selection({
+        "README.md": "changed\n",
+        "known-validation-gaps.yaml": selection_validation_ledger("us-ma/statutes/local.yaml"),
+    })
+    assert_global_validation_selection(combined, selection_files())
+    assert "scope=full (global validation input changed: known-validation-gaps.yaml)" in combined["scope-diagnostics"], combined
     # A modeled dependency fanout may legitimately cover the complete matrix;
     # its diagnostic must remain distinguishable from unsupported input.
     files = selection_files()
@@ -2307,7 +2314,7 @@ def test_import_selection_shared_paths_and_toolchains() -> None:
     paths = [
         "tests/test_shared.py", "tools/shared.py", "bulk/shared.py",
         ".axiom/structure.toml", ".axiom/oracle-registry.yaml", ".axiom/other.json",
-        "known-validation-gaps.yaml", "known-missing-money-atoms.yaml",
+        "known-missing-money-atoms.yaml",
         "sources/provision.yaml", ".axiom/replacement-receipts/receipt.json",
         "us-fl/sources/provision.yaml", "us-fl/manual/context.yaml", "unknown/file.txt",
     ]
@@ -2315,6 +2322,11 @@ def test_import_selection_shared_paths_and_toolchains() -> None:
         result = run_import_aware_selection({path: "changed\n"})
         assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[])
         assert all(target == ("changed", [], []) for target in result["targets"].values()), (path, result)
+    # Shared validation records now require full targets as well as all legs.
+    result = run_import_aware_selection({
+        "known-validation-gaps.yaml": selection_validation_ledger("us-ma/statutes/local.yaml"),
+    })
+    assert_global_validation_selection(result, selection_files())
     # A shared change keeps the matrix full while a changed provider still
     # expands targets in its unchanged importer's leg.
     files = selection_files()
@@ -2639,6 +2651,323 @@ def test_import_selection_generated_opaque_graph_property(cases: range = range(2
             assert f"contained={node}:" in result["scope-diagnostics"], (case, node, result)
 
 
+def selection_validation_ledger(*providers: str, status: str = "pending") -> str:
+    import yaml
+
+    # Minimal shared-ledger shape from the NY validation waiver in US PR #1307.
+    # These are selector inputs in a temporary hub fixture, not corpus modules.
+    return yaml.safe_dump({
+        "validate_failures": {
+            provider: {status: {
+                "fingerprint": "sha256:" + "a" * 64,
+                "owner": "@owner",
+                "issue": "https://github.com/TheAxiomFoundation/rulespec-us/issues/1",
+                "expires": "2026-11-01",
+            }} for provider in providers
+        },
+    }, sort_keys=False)
+
+
+def selection_validation_evidence(*providers: str, target_passes: bool = False) -> str:
+    return json.dumps({
+        "schema_version": 1,
+        "evidence_type": ("rulespec-target-validation-passes/v1" if target_passes
+                          else "rulespec-validation-fingerprints/v1"),
+        "modules": {
+            provider: {
+                "fingerprint": "sha256:" + "a" * 64,
+                "module_sha256": "sha256:" + "b" * 64,
+                "passed": target_passes,
+            } for provider in providers
+        },
+    }) + "\n"
+
+
+def assert_global_validation_selection(result: dict, files: dict[str, str]) -> None:
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def test_import_selection_global_validation_ledger_dependencies() -> None:
+    provider = "us-ma/statutes/local.yaml"
+    for status in ("pending", "active"):
+        files = {
+            **selection_files(),
+            "known-validation-gaps.yaml": selection_validation_ledger(provider, status=status),
+        }
+        changes = {provider: files[provider] + "# validation fingerprint changed\n"}
+        result = run_import_aware_selection(changes, files=files)
+        assert_global_validation_selection(result, {**files, **changes})
+        assert "global validation dependency:" in result["scope-diagnostics"], result
+        # A shared ledger is not itself a reason to select every leg when none
+        # of its provider modules is affected by an otherwise local change.
+        unrelated = "us-fl/statutes/local.yaml"
+        result = run_import_aware_selection({unrelated: files[unrelated] + "# unrelated\n"}, files=files)
+        assert_selection(result, ["us-fl"], revalidate=[])
+
+
+def test_import_selection_global_validation_base_head_and_removed_provider() -> None:
+    provider = "us-ma/statutes/local.yaml"
+    ledger = "known-validation-gaps.yaml"
+    files = {**selection_files(), ledger: selection_validation_ledger(provider)}
+    # Begin with an unchanged shared file, so this is a scoped red witness on
+    # the round-3 selector even before the deletion and rename cases below.
+    changes = {provider: files[provider] + "# changed\n"}
+    assert_global_validation_selection(run_import_aware_selection(changes, files=files), {**files, **changes})
+
+    deletions = {provider: None, provider.removesuffix(".yaml") + ".test.yaml": None}
+    result = run_import_aware_selection(deletions, files=files)
+    remaining = {path: content for path, content in files.items() if path not in deletions}
+    assert_global_validation_selection(result, remaining)
+
+    renamed = "us-fl/statutes/renamed.yaml"
+    changes = {**deletions, renamed: selection_module(), renamed.removesuffix(".yaml") + ".test.yaml": "tests: []\n"}
+    result = run_import_aware_selection(changes, files=files)
+    after_rename = {**remaining, **{path: content for path, content in changes.items() if content is not None}}
+    assert_global_validation_selection(result, after_rename)
+
+    for updated_ledger in (selection_validation_ledger("us-fl/statutes/local.yaml"), None):
+        changes = {provider: files[provider] + "# changed\n", ledger: updated_ledger}
+        result = run_import_aware_selection(changes, files=files)
+        head_files = {path: content for path, content in {**files, **changes}.items() if content is not None}
+        assert_global_validation_selection(result, head_files)
+    # A head-only ledger contributes the same global edge as a base ledger.
+    baseline = selection_files()
+    changes = {provider: baseline[provider] + "# changed\n", ledger: selection_validation_ledger(provider)}
+    assert_global_validation_selection(run_import_aware_selection(changes, files=baseline), {**baseline, **changes})
+
+
+def test_import_selection_global_validation_transitive_provider() -> None:
+    provider = "us-ma/statutes/local.yaml"
+    watched = "us-sc/statutes/local.yaml"
+    for consumer in (
+        selection_module("us-ma:statutes/local#fixture"),
+        selection_evidence_module(selection_import_evidence("us-ma:statutes/local#fixture")),
+    ):
+        files = {
+            **selection_files(),
+            watched: consumer,
+            "known-validation-gaps.yaml": selection_validation_ledger(watched),
+        }
+        changes = {provider: files[provider] + "# upstream fingerprint changed\n"}
+        result = run_import_aware_selection(changes, files=files)
+        assert_global_validation_selection(result, {**files, **changes})
+        assert "global validation dependency:" in result["scope-diagnostics"], result
+
+
+def test_import_selection_global_validation_evidence_without_ledger() -> None:
+    provider = "us-ma/statutes/local.yaml"
+    for evidence in (".axiom/pending-validation-fingerprints.json", ".axiom/target-validation-passes.json"):
+        files = {**selection_files(), evidence: selection_validation_evidence(
+            provider, target_passes=evidence.endswith("target-validation-passes.json"),
+        )}
+        assert "known-validation-gaps.yaml" not in files
+        changes = {provider: files[provider] + "# evidence digest changed\n"}
+        result = run_import_aware_selection(changes, files=files)
+        assert_global_validation_selection(result, {**files, **changes})
+        assert "global validation dependency:" in result["scope-diagnostics"], result
+        unrelated = "us-fl/statutes/local.yaml"
+        result = run_import_aware_selection({unrelated: files[unrelated] + "# unrelated\n"}, files=files)
+        assert_selection(result, ["us-fl"], revalidate=[])
+
+
+def test_import_selection_global_validation_malformed_shared_inputs() -> None:
+    provider = "us-ma/statutes/local.yaml"
+    ledger = "known-validation-gaps.yaml"
+    evidence = ".axiom/pending-validation-fingerprints.json"
+    probes = [
+        (ledger, "validate_failures: [unfinished\n"),
+        (ledger, "- not-a-shared-ledger\n"),
+        (ledger, "validate_failures: []\n"),
+        (ledger, "validate_failures: null\n"),
+        (ledger, "validate_failures:\n  us-ma/statutes/local.yaml: {}\n  us-ma/statutes/local.yaml: {}\n"),
+        (ledger, "validate_failures:\n  ../us-ma/statutes/local.yaml: {}\n"),
+        (ledger, "validate_failures:\n  README.md: {}\n"),
+        (ledger, "validate_failures:\n  us-ma/statutes/missing.yaml: {}\n"),
+        (ledger, "validate_failures:\n  us-ma/statutes/local.yaml: []\n"),
+        (evidence, "{invalid-json\n"),
+        (evidence, "[]\n"),
+        (evidence, '{"modules": []}\n'),
+        (evidence, '{"modules": {"us-ma/statutes/local.yaml": {}, "us-ma/statutes/local.yaml": {}}}\n'),
+        (evidence, '{"modules": {"us-ma/statutes/missing.yaml": {}}}\n'),
+        (evidence, '{"modules": {"us-ma/statutes/local.yaml": []}}\n'),
+    ]
+    for path, content in probes:
+        files = {**selection_files(), path: content}
+        changes = {provider: files[provider] + "# changed\n"}
+        result = run_import_aware_selection(changes, files=files)
+        assert_global_validation_selection(result, {**files, **changes})
+        assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
+    # A shared reference must not choose between duplicate module identities.
+    files = {
+        **selection_files(),
+        ledger: selection_validation_ledger(provider),
+        "us-ma/statutes/local.yml": selection_module(),
+    }
+    changes = {provider: files[provider] + "# changed\n"}
+    assert_global_validation_selection(run_import_aware_selection(changes, files=files), {**files, **changes})
+
+
+def test_import_selection_opaque_global_validation_dependency() -> None:
+    opaque = "us-ma/statutes/local.yaml"
+    bridge = "us-sc/statutes/local.yaml"
+    watched = "us-ca/statutes/local.yaml"
+    unrelated = "us-fl/statutes/local.yaml"
+    for companion_opacity in (False, True):
+        files = {
+            **selection_files(),
+            bridge: selection_module("us-ma:statutes/local#fixture"),
+            watched: selection_evidence_module(selection_import_evidence("us-sc:statutes/local#fixture")),
+            "known-validation-gaps.yaml": selection_validation_ledger(watched),
+        }
+        opaque_path = opaque.removesuffix(".yaml") + ".test.yaml" if companion_opacity else opaque
+        files[opaque_path] = selection_opaque_module(hidden_imports=("us:statutes/local#fixture",))
+        changes = {unrelated: files[unrelated] + "# unrelated provider change\n"}
+        if companion_opacity:
+            # Removing the unsupported companion shape at head cannot remove
+            # the base opacity seed or its path through both ordinary and proof
+            # imports into the shared validation check.
+            changes[opaque_path] = "tests: []\n"
+        result = run_import_aware_selection(changes, files=files)
+        assert_global_validation_selection(result, {**files, **changes})
+        assert "global validation dependency:" in result["scope-diagnostics"], result
+
+
+def test_import_selection_generated_global_validation_graph_property(cases: range = range(24)) -> None:
+    import yaml
+
+    for case in cases:
+        rng = random.Random(20261018 + case)
+        files = selection_files()
+        modules = [
+            f"{owner}/statutes/{name}.yaml"
+            for owner in SELECTION_JURISDICTIONS for name in ("local", "generated")
+        ]
+        owners = {node: node.split("/", 1)[0] for node in modules}
+        globals_ = ["known-validation-gaps.yaml", ".axiom/pending-validation-fingerprints.json"]
+        base_edges = {
+            node: {other for other in modules if rng.random() < (0.04 if case % 2 else 0.14)}
+            for node in modules
+        }
+        changed_modules = set(rng.sample(modules, rng.randint(1, 3)))
+        head_edges = {
+            node: ({other for other in modules if rng.random() < 0.11}
+                   if node in changed_modules else set(providers))
+            for node, providers in base_edges.items()
+        }
+        for node in globals_:
+            base_edges[node] = set(rng.sample(modules, rng.randrange(4)))
+            head_edges[node] = (
+                set(rng.sample(modules, rng.randrange(4)))
+                if case % 3 == 1 else set(base_edges[node])
+            )
+        if case == 0:
+            # The only route to a global check uses a proof import into an
+            # unchanged watched module. The round-3 selector misses three legs.
+            base_edges = {node: set() for node in modules + globals_}
+            base_edges["us-ma/statutes/generated.yaml"] = {"us/statutes/local.yaml"}
+            base_edges[globals_[0]] = {"us-ma/statutes/generated.yaml"}
+            head_edges = {node: set(providers) for node, providers in base_edges.items()}
+            changed_modules = {"us/statutes/local.yaml"}
+
+        opaque_base = set(rng.sample(modules, rng.randrange(4))) if case else set()
+        opaque_head = (opaque_base - changed_modules) | {
+            node for node in sorted(changed_modules) if case and rng.random() < 0.35
+        }
+        hidden_base = {
+            node: ({provider for provider in sorted(base_edges[node]) if rng.random() < 0.7}
+                   if node in opaque_base else set())
+            for node in modules + globals_
+        }
+        hidden_head = {
+            node: (set(hidden_base[node]) if node not in changed_modules else
+                   {provider for provider in sorted(head_edges[node]) if rng.random() < 0.7})
+            if node in opaque_head else set()
+            for node in modules + globals_
+        }
+        modeled_base = {node: providers - hidden_base[node] for node, providers in base_edges.items()}
+        modeled_head = {node: providers - hidden_head[node] for node, providers in head_edges.items()}
+        opaque = opaque_base | opaque_head
+
+        def target(node: str) -> str:
+            return owners[node] + ":" + node.split("/", 1)[1].removesuffix(".yaml") + "#fixture"
+
+        def render(node: str, providers: set[str], hidden: set[str], opaque_nodes: set[str]) -> str:
+            if node == globals_[0]:
+                return selection_validation_ledger(*sorted(providers))
+            if node == globals_[1]:
+                return selection_validation_evidence(*sorted(providers))
+            if node in opaque_nodes:
+                # Retain visible imports before encountering the unknown form;
+                # the independent oracle knows the arbitrary hidden providers.
+                return selection_opaque_module(
+                    *[target(provider) for provider in sorted(providers)],
+                    hidden_imports=tuple(target(provider) for provider in sorted(hidden)),
+                )
+            ordinary = []
+            atoms = []
+            for index, provider in enumerate(sorted(providers)):
+                if case != 0 and (modules.index(node) + index + case) % 3 == 0:
+                    ordinary.append(target(provider))
+                else:
+                    atoms.append(selection_import_evidence(
+                        target(provider), kind="parameter" if index % 2 else "import",
+                    ))
+            payload = yaml.safe_load(selection_module(*ordinary))
+            if atoms:
+                payload["rules"] = [{"name": "fixture", "metadata": {"proof": {"atoms": atoms}}}]
+            return yaml.safe_dump(payload, sort_keys=False)
+
+        for node in modules + globals_:
+            files[node] = render(node, modeled_base[node], hidden_base[node], opaque_base)
+        changed_globals = {node for node in globals_ if base_edges[node] != head_edges[node]}
+        changes = {
+            node: render(node, modeled_head[node], hidden_head[node], opaque_head)
+                  + (f"# changed {case}\n" if node in modules else "")
+            for node in changed_modules | changed_globals
+        }
+        # Global checks are independent sink nodes: changing their shared file
+        # or reaching any of their base/head providers requires all leg owners.
+        def closure(seeds: set[str], base: dict, head: dict) -> set[str]:
+            affected = set(seeds)
+            while True:
+                expanded = affected | {
+                    node for node in modules + globals_ if (base[node] | head[node]) & affected
+                }
+                if expanded == affected:
+                    return affected
+                affected = expanded
+
+        changed = changed_modules | changed_globals
+        true_affected = closure(changed, base_edges, head_edges)
+        # Every opaque node is conservatively dependent on every change. Keep
+        # its known reverse consumers, including global sink nodes, reachable.
+        affected = closure(changed | opaque, modeled_base, modeled_head)
+        true_required = (
+            set(SELECTION_JURISDICTIONS) if set(globals_) & true_affected
+            else {owners[node] for node in true_affected | opaque}
+        )
+        result = run_import_aware_selection(changes, files=files)
+        head_files = {**files, **changes}
+        assert true_required <= set(result["matrix"]), (case, base_edges, head_edges, opaque, changes, result)
+        if set(globals_) & affected:
+            required = set(SELECTION_JURISDICTIONS)
+            assert required <= set(result["matrix"]), (case, base_edges, head_edges, changes, result)
+            assert_global_validation_selection(result, head_files)
+        else:
+            required = {owners[node] for node in affected}
+            expected = [owner for owner in SELECTION_JURISDICTIONS if owner in required]
+            revalidate = [
+                owner for owner in SELECTION_JURISDICTIONS
+                if any(owners[node] == owner for node in (affected - changed_modules) | opaque)
+            ]
+            assert required <= set(result["matrix"]), (case, base_edges, head_edges, changes, result)
+            assert_selection(result, expected, revalidate=revalidate)
+            for owner in revalidate:
+                assert_full_leg(result, owner, head_files)
+
+
 def test_import_selection_generated_graph_property(cases: range = range(20)) -> None:
     for case in cases:
         rng = random.Random(20261012 + case)
@@ -2858,6 +3187,13 @@ def run_selector_tests() -> None:
         test_import_selection_two_opaque_modules_and_shared_change,
         test_import_selection_opaque_base_head_and_companion_union,
         test_import_selection_generated_opaque_graph_property,
+        test_import_selection_global_validation_ledger_dependencies,
+        test_import_selection_global_validation_base_head_and_removed_provider,
+        test_import_selection_global_validation_transitive_provider,
+        test_import_selection_global_validation_evidence_without_ledger,
+        test_import_selection_global_validation_malformed_shared_inputs,
+        test_import_selection_opaque_global_validation_dependency,
+        test_import_selection_generated_global_validation_graph_property,
         test_import_selection_generated_graph_property,
         test_import_selection_generated_suffix_ambiguity_property,
         test_import_selection_preserves_enforcement_wiring,
@@ -2865,7 +3201,7 @@ def run_selector_tests() -> None:
     for test in tests:
         test()
         print(f"{test.__name__}: passed", flush=True)
-    print("actual workflow selectors: passed (24 generated opaque graph cases; 20 generated module/program graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
+    print("actual workflow selectors: passed (24 generated opaque graph cases; 24 generated global-validation graph cases; 20 generated module/program graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
 
 
 def literal_pin_caller(pins: dict[str, str]) -> str:

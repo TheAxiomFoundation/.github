@@ -1515,13 +1515,22 @@ jobs:
                       return entries
 
                   trees = [tree(base), tree(head)]
+                  # These checks consume modules across jurisdiction boundaries.
+                  # Pending fingerprints were historically checked in every leg;
+                  # a local source edit can therefore invalidate the whole matrix.
+                  global_validation_inputs = {
+                      "known-validation-gaps.yaml": "validate_failures",
+                      ".axiom/pending-validation-fingerprints.json": "modules",
+                      ".axiom/target-validation-passes.json": "modules",
+                  }
                   # Batch object reads: graph construction does not spawn one
                   # Git process per module and never reads the checkout in place
                   # of a protected base or exact head tree.
                   needed = set()
                   for entries in trees:
                       for path, (mode, kind, oid) in entries.items():
-                          if (atomic_owner(path)
+                          if (path in global_validation_inputs
+                                  or atomic_owner(path)
                                   or program_spec_path(path)
                                   or (path in changed and manifest_prefix(path) is not None)):
                               if kind != "blob" or mode not in {"100644", "100755"}:
@@ -1593,6 +1602,55 @@ jobs:
                           raise ValueError(f"not a module/program mapping: {path}")
                       return payload
 
+                  def unique_json(pairs):
+                      mapping = {}
+                      for key, value in pairs:
+                          if key in mapping:
+                              raise ValueError("duplicate JSON key")
+                          mapping[key] = value
+                      return mapping
+
+                  # Union both protected trees, including references that head
+                  # deletes or repairs. A shared record has no single module
+                  # owner: malformed or unresolved references stay global.
+                  global_validation_modules = set()
+                  for entries in trees:
+                      for path, field in global_validation_inputs.items():
+                          if path not in entries:
+                              continue
+                          payload = (json.loads(blobs[entries[path][2]], object_pairs_hook=unique_json)
+                                     if path.endswith(".json") else document(entries, path))
+                          if not isinstance(payload, dict):
+                              raise ValueError(f"invalid global validation input: {path}")
+                          if path.endswith(".json") and field not in payload:
+                              raise ValueError(f"missing global validation references: {path}")
+                          records = payload.get(field, {})
+                          if not isinstance(records, dict):
+                              raise ValueError(f"invalid global validation references: {path}")
+                          for target, record in records.items():
+                              if (not isinstance(record, dict) or not atomic_owner(target)
+                                      or is_companion(target)
+                                      or not any(target in other for other in trees)):
+                                  raise ValueError(f"unresolved global validation reference: {path}: {target}")
+                              # Both suffixes would give the same graph identity.
+                              # Do not let a fast global path hide that ambiguity.
+                              key = identity(target)
+                              stem = target.rsplit(".", 1)[0]
+                              if any(all(stem + suffix in other for suffix in (".yaml", ".yml"))
+                                     for other in trees):
+                                  raise ValueError(f"ambiguous global validation reference: {target}")
+                              global_validation_modules.add(key)
+
+                  changed_global_inputs = sorted(set(changed) & global_validation_inputs.keys())
+                  if changed_global_inputs:
+                      full("global validation input changed: " + ", ".join(changed_global_inputs), full_targets=True)
+
+                  direct_global = sorted(path for path in changed
+                                         if atomic_owner(path) and not is_companion(path)
+                                         and identity(path) in global_validation_modules)
+                  if direct_global:
+                      full("global validation dependency: " + ", ".join(direct_global), full_targets=True)
+
                   reverse = {}
                   node_owners = {}
                   program_owners = {}
@@ -1601,6 +1659,22 @@ jobs:
 
                   def edge(provider, importer):
                       reverse.setdefault(provider, set()).add(importer)
+
+                  def opaque_global_dependency():
+                      if not global_validation_modules or not opaque_modules:
+                          return
+                      pending = list(opaque_modules)
+                      reached = set(pending)
+                      while pending:
+                          node = pending.pop()
+                          if node in global_validation_modules:
+                              # A partial graph is enough to prove all legs
+                              # are required; later inputs cannot enlarge it.
+                              full("global validation dependency: closure " + node, full_targets=True)
+                          for importer in reverse.get(node, ()):
+                              if importer not in reached:
+                                  reached.add(importer)
+                                  pending.append(importer)
 
                   for entries in trees:
                       modules = {}
@@ -1706,9 +1780,15 @@ jobs:
                                   edge(resolve(imported["target"]), importer)
                               pending.extend(value.values())
 
-                      for path in entries:
-                          if not atomic_owner(path):
-                              continue
+                      # Read small inputs first, preferring watched modules
+                      # at equal size. A global opacity witness can avoid
+                      # parsing unrelated, large documents.
+                      graph_paths = [path for path in entries if atomic_owner(path)]
+                      graph_paths.sort(key=lambda path: (
+                          len(blobs[entries[path][2]]),
+                          identity(module_path(path)) not in global_validation_modules, path,
+                      ))
+                      for path in graph_paths:
                           module = module_path(path)
                           key = identity(module)
                           if modules.get(key) != module:
@@ -1727,6 +1807,7 @@ jobs:
                               if reason not in contained_reasons:
                                   contained_reasons.add(reason)
                                   print(f"contained={reason}", file=sys.stderr)
+                          opaque_global_dependency()
 
                       for path in entries:
                           if not program_spec_path(path):
@@ -1768,14 +1849,6 @@ jobs:
                   full_reasons = []
                   changed_modules = {identity(path) for path in changed
                                      if atomic_owner(path) and not is_companion(path)}
-
-                  def unique_json(pairs):
-                      mapping = {}
-                      for key, value in pairs:
-                          if key in mapping:
-                              raise ValueError("duplicate manifest key")
-                          mapping[key] = value
-                      return mapping
 
                   for path in changed:
                       owner = atomic_owner(path) or program_owners.get(path)
@@ -1856,6 +1929,10 @@ jobs:
                           if importer not in affected:
                               affected.add(importer)
                               pending.append(importer)
+                  global_affected = affected & global_validation_modules
+                  if global_affected:
+                      full("global validation dependency: closure " + ", ".join(sorted(global_affected)),
+                           full_targets=True)
                   selected = owners | {node_owners[node] for node in affected if node in node_owners}
                   revalidate = {node_owners[node] for node in affected
                                 if node in node_owners
