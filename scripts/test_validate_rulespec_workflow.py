@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+from functools import lru_cache
 import os
 import random
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -699,7 +702,20 @@ SELECTOR_COMPANIONS = ["us/regulations/two.test.yml", "us/statutes/one.test.yaml
 
 
 def selector_shell_source(source: str) -> str:
-    """Supply only mapfile on macOS Bash 3; execute the actual workflow shell."""
+    """Supply Bash 3 compatibility while preserving the workflow Python body."""
+    bash_major = subprocess.run(
+        ["bash", "-c", 'printf "%s" "${BASH_VERSINFO[0]}"'],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    if int(bash_major) < 4:
+        # Bash 3 misparses the compute heredoc inside process substitution.
+        # Pass its exact Python body to isolated -c; keep the actual outer
+        # discovery, selection and output assembly shell under test.
+        source = re.sub(
+            r"python3 -I <<'PY'\n(.*?)^PY$",
+            lambda match: "python3 -I -c " + shlex.quote(match.group(1)),
+            source, flags=re.MULTILINE | re.DOTALL,
+        )
     return textwrap.dedent("""\
         if ! type mapfile >/dev/null 2>&1; then
           # Bash 3 expands braces in Python heredocs inside process substitution.
@@ -946,6 +962,26 @@ def selection_module(*imports: str, null_imports: bool = False, proof: str = "")
     return yaml.safe_dump(document, sort_keys=False)
 
 
+def selection_import_evidence(target: str, *, kind: str = "parameter") -> dict:
+    # The Colorado parameter proof uses local import evidence independently
+    # of its proof kind. These are selector fixtures, not corpus modules.
+    return {
+        "path": "versions[0].formula",
+        "kind": kind,
+        "import": {"target": target, "output": "fixture", "hash": "sha256:local"},
+    }
+
+
+def selection_evidence_module(atom: dict) -> str:
+    import yaml
+
+    return yaml.safe_dump({
+        "format": "rulespec/v1",
+        "imports": [],
+        "rules": [{"name": "fixture", "metadata": {"proof": {"atoms": [atom]}}}],
+    }, sort_keys=False)
+
+
 def selection_program(owner: str, scope: dict) -> str:
     import yaml
 
@@ -981,6 +1017,15 @@ def selection_files(jurisdictions: list[str] = SELECTION_JURISDICTIONS) -> dict[
     return files
 
 
+@lru_cache(maxsize=2)
+def selection_workflow(source: str) -> dict:
+    import yaml
+
+    # Fixture runs only read this workflow. Key by its exact content so
+    # differential runs still execute the appropriate base/current scripts.
+    return yaml.safe_load(source)
+
+
 def run_import_aware_selection(
     changes: dict[str, str | None],
     *,
@@ -996,9 +1041,7 @@ def run_import_aware_selection(
     dependency_pins_changed: bool = False,
 ) -> dict:
     """Run real compute, root-resolution and target shell against protected Git trees."""
-    import yaml
-
-    workflow = yaml.safe_load(WORKFLOW.read_text())
+    workflow = selection_workflow(WORKFLOW.read_text())
     compute = next(s for s in workflow["jobs"]["shards"]["steps"] if s.get("id") == "compute")
     steps = workflow["jobs"]["validate"]["steps"]
     resolve = next(s for s in steps if s.get("id") == "resolve_roots")
@@ -1078,6 +1121,9 @@ def run_import_aware_selection(
             wrapper.chmod(0o755)
             env["PATH"] = str(bin_path) + os.pathsep + env["PATH"]
 
+        raw_outputs = {}
+        diagnostics = {}
+
         def run(source: str, name: str, extra_env: dict[str, str] | None = None) -> dict[str, str]:
             output = runner_temp / f"{name}-output"
             result = subprocess.run(
@@ -1090,6 +1136,8 @@ def run_import_aware_selection(
             )
             assert result.returncode == 0, f"{name}: {result.stdout}{result.stderr}"
             assert output.exists(), f"{name}: no outputs; {result.stdout}{result.stderr}"
+            raw_outputs[name] = output.read_bytes()
+            diagnostics[name] = result.stderr
             return dict(line.split("=", 1) for line in output.read_text().splitlines())
 
         outputs = run(compute["run"], "compute")
@@ -1117,7 +1165,10 @@ def run_import_aware_selection(
                 (runner_temp / "rulespec-files.txt").read_text().splitlines(),
                 (runner_temp / "rulespec-test-files.txt").read_text().splitlines(),
             )
-        return {**outputs, "matrix": matrix, "revalidate": revalidate, "targets": selected_targets}
+            for filename in ("rulespec-files.txt", "rulespec-test-files.txt"):
+                raw_outputs[f"targets-{shard}/{filename}"] = (runner_temp / filename).read_bytes()
+        return {**outputs, "matrix": matrix, "revalidate": revalidate, "targets": selected_targets,
+                "scope-diagnostics": diagnostics["compute"], "raw-outputs": raw_outputs}
 
 
 def assert_selection(
@@ -1243,6 +1294,229 @@ def test_import_selection_dependencies_at_any_depth_and_in_companions() -> None:
         result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
         assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
         assert_full_leg(result, "us-fl", files)
+
+
+def test_import_selection_parameter_evidence_self_edge() -> None:
+    jurisdictions = ["us-ca", "us-co", "us-fl", "us-ma", "us-sc", "us"]
+    colorado = "us-co/statutes/39/39-22-509.yaml"
+    atom = selection_import_evidence(
+        "us-co:statutes/39/39-22-509#minimum_in_state_employee_count",
+    )
+    atom["import"]["output"] = "minimum_in_state_employee_count"
+    files = {**selection_files(jurisdictions), colorado: selection_evidence_module(atom)}
+    # The unchanged self-edge previously forced every unrelated change full.
+    result = run_import_aware_selection({
+        "us-fl/statutes/local.yaml": files["us-fl/statutes/local.yaml"] + "# changed\n",
+    }, files=files)
+    assert_selection(result, ["us-fl"], jurisdictions=jurisdictions, revalidate=[])
+    result = run_import_aware_selection({colorado: files[colorado] + "# changed\n"}, files=files)
+    assert_selection(result, ["us-co"], jurisdictions=jurisdictions, revalidate=[])
+    assert result["targets"]["us-co"] == ("changed", [colorado], [])
+
+
+def test_import_selection_every_proof_kind_can_carry_import_evidence() -> None:
+    # Encoder PROOF_ATOM_KINDS: proof kind and evidence are independent.
+    # Start with parameter so the pre-fix selector fails on the reported bug.
+    kinds = (
+        "parameter", "amount", "condition", "definition", "default", "effective_period",
+        "exception", "formula", "import", "ordering", "parameter_table", "predicate",
+        "table_cell", "unit",
+    )
+    provider = "us-ma/statutes/local.yaml"
+    for kind in kinds:
+        files = selection_files()
+        files["us-sc/statutes/local.yaml"] = selection_evidence_module(
+            selection_import_evidence("us-ma:statutes/local#fixture", kind=kind),
+        )
+        files["us-fl/statutes/local.yaml"] = selection_evidence_module(
+            selection_import_evidence("us-sc:statutes/local#fixture", kind=kind),
+        )
+        result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
+        assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+        for shard in ("us-fl", "us-sc"):
+            assert_full_leg(result, shard, files)
+
+
+def test_import_selection_parameter_evidence_in_companions_and_side_channels() -> None:
+    import yaml
+
+    provider = "us-ma/statutes/local.yaml"
+    atom = selection_import_evidence("us-ma:statutes/local#fixture")
+    probes = [
+        ("us-sc/statutes/local.test.yaml", {"tests": [{"metadata": {"proof": {"atoms": [atom]}}}]}),
+        ("us-sc/statutes/local.test.yaml", [{"metadata": {"provenance": [atom]}}]),
+        ("us-sc/statutes/local.yaml", {"metadata": {"audit": [{"nested": {"evidence": [atom]}}]}}),
+        ("us-sc/statutes/local.yaml", {"metadata": {"source": {"nested": [atom]}}}),
+        # A proof atom's source remains a recursive dependency side channel,
+        # even when the same atom already carries its own import evidence.
+        ("us-sc/statutes/local.yaml", {"metadata": {
+            **selection_import_evidence("us-sc:statutes/local#fixture"),
+            "source": {"nested": [atom]},
+        }}),
+    ]
+    for importer, document in probes:
+        files = {**selection_files(), importer: yaml.safe_dump(document, sort_keys=False)}
+        files["us-fl/statutes/local.yaml"] = selection_module("us-sc:statutes/local#fixture")
+        result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
+        assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+        for shard in ("us-fl", "us-sc"):
+            assert_full_leg(result, shard, files)
+    # The strict YAML loader rejects a recursive alias. That remains an
+    # explicit full fallback rather than concealing nested evidence.
+    cycle: dict = {"evidence": [atom]}
+    cycle["recursive"] = cycle
+    files = {**selection_files(), "us-sc/statutes/local.yaml": yaml.safe_dump({"metadata": cycle})}
+    result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
+
+
+def test_import_selection_parameter_evidence_base_only_and_deleted_provider() -> None:
+    provider = "us-ma/statutes/local.yaml"
+    importer = "us-sc/statutes/local.yaml"
+    companion = "us-sc/statutes/local.test.yaml"
+    files = selection_files()
+    evidence = selection_evidence_module(selection_import_evidence("us-ma:statutes/local#fixture"))
+    files[importer] = evidence
+    files["us-fl/statutes/local.yaml"] = selection_module("us-sc:statutes/local#fixture")
+    result = run_import_aware_selection({
+        provider: files[provider] + "# changed\n", importer: selection_module(),
+    }, files=files)
+    assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl"])
+    assert_full_leg(result, "us-fl", files)
+    # Removing or deleting a companion retains its base-only edge. It is not
+    # a module seed, so losing that edge would also lose the transitive leg.
+    companion_files = {**files, importer: selection_module(), companion: evidence}
+    for replacement in ("tests: []\n", None):
+        result = run_import_aware_selection({
+            provider: files[provider] + "# changed\n", companion: replacement,
+        }, files=companion_files)
+        assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+        assert_full_leg(result, "us-fl", companion_files)
+    # A deleted target still seeds reverse closure through the base tree.
+    result = run_import_aware_selection({
+        provider: None, "us-ma/statutes/local.test.yaml": None, importer: selection_module(),
+    }, files=files)
+    assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl"])
+    assert_full_leg(result, "us-fl", files)
+    # Leaving dangling evidence at head remains a full fallback.
+    result = run_import_aware_selection({
+        provider: None, "us-ma/statutes/local.test.yaml": None,
+    }, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+
+
+def assert_parameter_evidence_control() -> None:
+    files = selection_files()
+    files["us-sc/statutes/local.yaml"] = selection_evidence_module(
+        selection_import_evidence("us-ma:statutes/local#fixture"),
+    )
+    result = run_import_aware_selection({
+        "us-ma/statutes/local.yaml": files["us-ma/statutes/local.yaml"] + "# changed\n",
+    }, files=files)
+    assert_selection(result, ["us-ma", "us-sc"], revalidate=["us-sc"])
+
+
+def test_import_selection_parameter_evidence_duplicate_and_ambiguous_fails_closed() -> None:
+    import yaml
+
+    assert_parameter_evidence_control()
+    atom = selection_import_evidence("us-ma:statutes/local#fixture")
+    probes = [
+        # Duplicate singular evidence and duplicate target keys stay strict,
+        # even when their repeated values happen to agree.
+        ("metadata:\n  kind: parameter\n  import: {target: 'us-ma:statutes/local#fixture'}\n"
+         "  import: {target: 'us-ma:statutes/local#fixture'}\n", {}),
+        ("metadata:\n  kind: parameter\n  import:\n"
+         "    target: 'us-ma:statutes/local#fixture'\n"
+         "    target: 'us-ma:statutes/local#fixture'\n"
+         "    output: fixture\n    hash: sha256:local\n", {}),
+        # Both extensions resolve to the same logical provider identity.
+        (selection_evidence_module(atom), {"us-ma/statutes/local.yml": selection_module()}),
+        (selection_evidence_module({**atom, "fallback": "us-fl:statutes/local#fixture"}), {}),
+        (selection_evidence_module({**atom, "import": {
+            **atom["import"], "fallback": "us-fl:statutes/local#fixture",
+        }}), {}),
+        # A modeled import cannot hide an unmodeled evidence side channel.
+        (yaml.safe_dump({"metadata": {**atom, "source": {"imports": "us-fl:statutes/local#fixture"}}}), {}),
+    ]
+    for source, extras in probes:
+        files = {**selection_files(), **extras, "us-sc/statutes/local.yaml": source}
+        result = run_import_aware_selection({
+            "us-ma/statutes/local.yaml": files["us-ma/statutes/local.yaml"] + "# changed\n",
+        }, files=files)
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
+        for shard in result["matrix"]:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def test_import_selection_parameter_evidence_malformed_fails_closed() -> None:
+    assert_parameter_evidence_control()
+    atom = selection_import_evidence("us-ma:statutes/local#fixture")
+    probes = [
+        {**atom, "kind": "unknown-proof-kind"},
+        {key: value for key, value in atom.items() if key != "kind"},
+        {**atom, "kind": ["parameter"]},
+        {**atom, "path": ["versions[0].formula"]},
+        {**atom, "import": None},
+        {**atom, "import": "us-ma:statutes/local#fixture"},
+        {**atom, "import": {"output": "fixture", "hash": "sha256:local"}},
+        {**atom, "import": {**atom["import"], "target": ["us-ma:statutes/local#fixture"]}},
+        {**atom, "import": {**atom["import"], "target": "us-ma:statutes/missing#fixture"}},
+        {**atom, "import": {**atom["import"], "target": "../us-ma/statutes/local#fixture"}},
+        {**atom, "import": {**atom["import"], "target": ""}},
+        {**atom, "import": {**atom["import"], "output": ["fixture"]}},
+        {**atom, "import": {**atom["import"], "hash": {"value": "sha256:local"}}},
+    ]
+    for malformed in probes:
+        files = {**selection_files(), "us-sc/statutes/local.yaml": selection_evidence_module(malformed)}
+        result = run_import_aware_selection({
+            "us-ma/statutes/local.yaml": files["us-ma/statutes/local.yaml"] + "# changed\n",
+        }, files=files)
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
+        for shard in result["matrix"]:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def test_import_selection_parameter_evidence_full_selection_reasons() -> None:
+    assert_parameter_evidence_control()
+    cases = [
+        ({"README.md": "changed\n"}, "shared/root path: README.md"),
+        ({".axiom/audit-manifests/audit.json": "{}\n"},
+         "shared/root path: .axiom/audit-manifests/audit.json"),
+        ({"known-validation-gaps.yaml": "changed\n"}, "ledger change: known-validation-gaps.yaml"),
+        ({"known-missing-money-atoms.yaml": "changed\n"}, "ledger change: known-missing-money-atoms.yaml"),
+        ({".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace('"before"', '"after"')},
+         "toolchain change: .axiom/toolchain.toml"),
+        ({".axiom/workflow-toolchain.toml": SELECTOR_WORKFLOW_TOOLCHAIN + "# changed\n"},
+         "toolchain change: .axiom/workflow-toolchain.toml"),
+        ({".axiom/index/provisions_to_rules.json": "{}\n"},
+         "no affected jurisdiction (index-only diff)"),
+    ]
+    for changes, reason in cases:
+        result = run_import_aware_selection(changes)
+        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[])
+        assert f"scope=full ({reason})" in result["scope-diagnostics"], result
+    combined = run_import_aware_selection({
+        "README.md": "changed\n", "known-validation-gaps.yaml": "changed\n",
+    })
+    assert "ledger change: known-validation-gaps.yaml" in combined["scope-diagnostics"], combined
+    assert "shared/root path: README.md" in combined["scope-diagnostics"], combined
+    # A modeled dependency fanout may legitimately cover the complete matrix;
+    # its diagnostic must remain distinguishable from unsupported input.
+    files = selection_files()
+    for shard in SELECTION_JURISDICTIONS:
+        if shard != "us":
+            files[f"{shard}/statutes/local.yaml"] = selection_evidence_module(
+                selection_import_evidence("us:statutes/local#fixture"),
+            )
+    result = run_import_aware_selection({
+        "us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n",
+    }, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=SELECTION_JURISDICTIONS[:-1])
+    assert "scope=full (modeled import closure covers all jurisdictions)" in result["scope-diagnostics"], result
 
 
 def test_import_selection_unmodelled_dependency_shapes_fail_closed() -> None:
@@ -2084,6 +2358,13 @@ def run_selector_tests() -> None:
         test_import_selection_local_modules_and_companions,
         test_import_selection_transitive_graph_and_cycles,
         test_import_selection_dependencies_at_any_depth_and_in_companions,
+        test_import_selection_parameter_evidence_self_edge,
+        test_import_selection_every_proof_kind_can_carry_import_evidence,
+        test_import_selection_parameter_evidence_in_companions_and_side_channels,
+        test_import_selection_parameter_evidence_base_only_and_deleted_provider,
+        test_import_selection_parameter_evidence_duplicate_and_ambiguous_fails_closed,
+        test_import_selection_parameter_evidence_malformed_fails_closed,
+        test_import_selection_parameter_evidence_full_selection_reasons,
         test_import_selection_unmodelled_dependency_shapes_fail_closed,
         test_import_selection_federal_fanout,
         test_import_selection_base_head_union_and_deleted_provider,

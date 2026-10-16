@@ -1443,6 +1443,13 @@ jobs:
 
                   atomic_roots = {"statutes", "regulations", "policies", "legislation"}
                   jurisdiction = re.compile(r"[a-z]{2}(?:-[a-z0-9-]+)*")
+                  # Encoder proof kinds describe the claim being proved;
+                  # source/import evidence is independent of that kind.
+                  proof_atom_kinds = {
+                      "amount", "condition", "definition", "default", "effective_period",
+                      "exception", "formula", "import", "ordering", "parameter",
+                      "parameter_table", "predicate", "table_cell", "unit",
+                  }
 
                   def clean_path(path):
                       if not isinstance(path, str) or not path or path.startswith("/"):
@@ -1654,10 +1661,13 @@ jobs:
                                       raise ValueError("imports is not a list")
                                   for target in imports:
                                       edge(resolve(target), importer)
-                              if value.get("kind") == "import":
+                              if value.get("kind") == "import" or "import" in value:
+                                  kind = value.get("kind")
+                                  if not isinstance(kind, str) or kind not in proof_atom_kinds:
+                                      raise ValueError("unknown/missing import evidence proof kind")
                                   # Unknown keys could encode another provider;
                                   # fail closed instead of interpreting a subset.
-                                  if set(value) - {"kind", "path", "import"}:
+                                  if set(value) - {"kind", "path", "source", "import"}:
                                       raise ValueError("unknown import atom key")
                                   if "path" in value and not isinstance(value["path"], str):
                                       raise ValueError("invalid import atom path")
@@ -1667,8 +1677,6 @@ jobs:
                                           or any(not isinstance(item, str) for item in imported.values())):
                                       raise ValueError("malformed/unknown import atom payload")
                                   edge(resolve(imported["target"]), importer)
-                              elif "import" in value:
-                                  raise ValueError("import payload without kind: import")
                               pending.extend(value.values())
 
                       for path in entries:
@@ -1722,7 +1730,7 @@ jobs:
 
                   owners = set()
                   seeds = set()
-                  force_full = False
+                  full_reasons = []
                   changed_modules = {identity(path) for path in changed
                                      if atomic_owner(path) and not is_companion(path)}
 
@@ -1797,7 +1805,14 @@ jobs:
                           if atomic_owner(path) and not is_companion(path):
                               seeds.add(identity(path))
                       elif not path.startswith(".axiom/index/"):
-                          force_full = True
+                          category = (
+                              "toolchain change" if path in {
+                                  ".axiom/toolchain.toml", ".axiom/workflow-toolchain.toml",
+                              } else "ledger change" if path in {
+                                  "known-validation-gaps.yaml", "known-missing-money-atoms.yaml",
+                              } else "shared/root path"
+                          )
+                          full_reasons.append(f"{category}: {path}")
 
                   affected = set(seeds)
                   pending = list(seeds)
@@ -1809,9 +1824,14 @@ jobs:
                   selected = owners | {node_owners[node] for node in affected if node in node_owners}
                   revalidate = {node_owners[node] for node in affected
                                 if node in node_owners and node not in changed_modules}
-                  if force_full or not selected:
+                  if full_reasons or not selected:
                       selected = shard_set
-                  print("scope=import-aware", file=sys.stderr)
+                      reason = "; ".join(sorted(full_reasons)) or "no affected jurisdiction (index-only diff)"
+                      print(f"scope=full ({reason})", file=sys.stderr)
+                  elif selected == shard_set:
+                      print("scope=full (modeled import closure covers all jurisdictions)", file=sys.stderr)
+                  else:
+                      print("scope=import-aware", file=sys.stderr)
                   emit(selected, revalidate)
                   raise SystemExit
               except Exception as error:

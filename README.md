@@ -104,14 +104,27 @@ evidence to retain at the exact adopted validator SHA.
 
 The `import-aware-selection` input defaults to `false`. With automatic roots,
 opted-in pull requests select changed jurisdictions and transitive importers
-from both base and head trees. Unchanged affected importers receive full atomic
-validation in their selected legs. An unresolved graph selects the full matrix
+from both base and head trees. Import evidence on any encoder-supported proof
+kind (including `parameter`) creates the same dependency edge as `kind: import`.
+This includes self imports, companion tests and nested metadata; source evidence
+may coexist with import evidence. Unknown proof kinds, duplicate keys, ambiguous
+targets and malformed import payloads fail closed.
+
+Unchanged affected importers receive full atomic validation in their selected
+legs. An unresolved graph selects the full matrix
 and full targets. In particular, an import whose jurisdiction is not a
 discovered shard, anywhere in either tree, forces every PR to use the full
 matrix and full targets. Such out-of-repository imports can make opt-in more
 expensive than default selection. Revalidated importer legs also run the
 stricter changed-file oracle-coverage check over every atomic module in the
 leg.
+
+Full-matrix selections report specific reasons. The import-aware classifier logs
+`scope=full (...)` for graph failures, shared/root paths, toolchain or ledger
+changes, index-only diffs, and a modeled dependency closure covering every
+jurisdiction. Shared paths keep their existing target behavior; ledger/digest
+and audit-manifest changes can still require all legs. This input remains
+disabled unless a caller opts in.
 
 Before a caller opts in, its waiver audit must not land wholesale on the
 selected validation legs. Incremental, change-scoped waiver audit work is tracked
