@@ -1542,17 +1542,37 @@ jobs:
                       blobs[oid] = payload
 
                   class UniqueLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
-                      pass
+                      def __init__(self, *args, **kwargs):
+                          super().__init__(*args, **kwargs)
+                          self.checked_mappings = set()
+
+                      def flatten_mapping(self, node):
+                          # Check original explicit keys before PyYAML expands
+                          # merges in place, including every merge source. An
+                          # alias may revisit an already flattened mapping.
+                          if node not in self.checked_mappings:
+                              keys = set()
+                              for key_node, _ in node.value:
+                                  if key_node.tag == "tag:yaml.org,2002:merge":
+                                      continue
+                                  if key_node.tag == "tag:yaml.org,2002:value":
+                                      key_node.tag = "tag:yaml.org,2002:str"
+                                  key = self.construct_object(key_node)
+                                  if key in keys:
+                                      raise ValueError("duplicate YAML key")
+                                  keys.add(key)
+                              self.checked_mappings.add(node)
+                          return super().flatten_mapping(node)
 
                   def unique_mapping(loader, node, deep=False):
-                      loader.flatten_mapping(node)
                       mapping = {}
+                      # SafeLoader publishes the mapping before filling it so
+                      # recursive aliases retain their normal object identity.
+                      yield mapping
+                      loader.flatten_mapping(node)
                       for key_node, value_node in node.value:
                           key = loader.construct_object(key_node, deep=deep)
-                          if key in mapping:
-                              raise ValueError("duplicate YAML key")
                           mapping[key] = loader.construct_object(value_node, deep=deep)
-                      return mapping
 
                   UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 

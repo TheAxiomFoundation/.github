@@ -1361,14 +1361,14 @@ def test_import_selection_parameter_evidence_in_companions_and_side_channels() -
         assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
         for shard in ("us-fl", "us-sc"):
             assert_full_leg(result, shard, files)
-    # The strict YAML loader rejects a recursive alias. That remains an
-    # explicit full fallback rather than concealing nested evidence.
+    # SafeLoader preserves recursive aliases. The graph walk visits each
+    # container once and still discovers the nested evidence.
     cycle: dict = {"evidence": [atom]}
     cycle["recursive"] = cycle
     files = {**selection_files(), "us-sc/statutes/local.yaml": yaml.safe_dump({"metadata": cycle})}
     result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
-    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
-    assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
+    assert_selection(result, ["us-ma", "us-sc"], revalidate=["us-sc"])
+    assert_full_leg(result, "us-sc", files)
 
 
 def test_import_selection_parameter_evidence_base_only_and_deleted_provider() -> None:
@@ -2017,6 +2017,8 @@ def test_import_selection_c_and_python_loader_safety_parity() -> None:
         "imports: []\nrules: []\n",
         "first: &shared {value: fixture}\nsecond: *shared\n",
         "defaults: &defaults {field: fixture}\nmodule:\n  <<: *defaults\n  extra: value\n",
+        "defaults: &defaults {field: first}\nmodule:\n  <<: *defaults\n  field: second\n",
+        "defaults: &defaults {field: first}\nmodule:\n  <<: [*defaults, *defaults]\n",
         "metadata: !!omap\n  - imports: ['us:statutes/local#fixture']\n",
         "metadata: !!pairs\n  - imports: ['us:statutes/local#fixture']\n",
         "metadata: !!set\n  ? imports\n",
@@ -2024,8 +2026,6 @@ def test_import_selection_c_and_python_loader_safety_parity() -> None:
     rejected = [
         "imports: []\nimports: []\n",
         "metadata: {name: first, name: second}\n",
-        "defaults: &defaults {field: first}\nmodule:\n  <<: *defaults\n  field: second\n",
-        "defaults: &defaults {field: first}\nmodule:\n  <<: [*defaults, *defaults]\n",
         "module: !!python/object/apply:os.system ['printf should-not-run']\n",
         "module: !unknown fixture\n",
         "? [unhashable, key]\n: fixture\n",
@@ -2046,6 +2046,216 @@ def test_import_selection_c_and_python_loader_safety_parity() -> None:
             else:
                 raise AssertionError(f"{base.__name__} accepted unsafe/ambiguous YAML: {source!r}")
     assert all(implementation == implementations[0] for implementation in implementations)
+
+
+
+def selector_merge_loaders() -> list[type]:
+    import yaml
+
+    bases = [yaml.SafeLoader]
+    if hasattr(yaml, "CSafeLoader"):
+        bases.append(yaml.CSafeLoader)
+    return [selector_document_helpers(base)["UniqueLoader"] for base in bases]
+
+
+def test_import_selection_yaml_merge_explicit_override() -> None:
+    import yaml
+
+    for loader in selector_merge_loaders():
+        for fields in ("  <<: *base\n  field: override\n",
+                       "  field: override\n  <<: *base\n"):
+            source = "base: &base {field: inherited, retained: true}\nresult:\n" + fields
+            actual = yaml.load(source, Loader=loader)
+            assert actual == yaml.load(source, Loader=yaml.SafeLoader)
+            assert actual["result"] == {"field": "override", "retained": True}
+
+
+def test_import_selection_yaml_merge_sequence_precedence() -> None:
+    import yaml
+
+    source = (
+        "a: &a {field: first, only_a: 1}\n"
+        "b: &b {field: second, only_b: 2}\n"
+        "result: {<<: [*a, *b]}\n"
+    )
+    for loader in selector_merge_loaders():
+        actual = yaml.load(source, Loader=loader)
+        assert actual == yaml.load(source, Loader=yaml.SafeLoader)
+        assert actual["result"] == {"field": "first", "only_a": 1, "only_b": 2}
+
+
+def test_import_selection_yaml_merge_nested_and_reused_aliases() -> None:
+    import yaml
+
+    source = (
+        "a: &a {field: first, retained: true}\n"
+        "b: &b {<<: *a, field: second}\n"
+        "result: {<<: [*b, *a, *b], extra: value}\n"
+        "again: {<<: *b, field: third}\n"
+        "multiple: {<<: *a, <<: *b}\n"
+        "special: {=: value, '<<': literal}\n"
+    )
+    for loader in selector_merge_loaders():
+        actual = yaml.load(source, Loader=loader)
+        assert actual == yaml.load(source, Loader=yaml.SafeLoader)
+        assert actual["result"] == {"field": "second", "retained": True, "extra": "value"}
+        assert actual["again"]["field"] == "third"
+
+
+def test_import_selection_yaml_explicit_duplicates_rejected() -> None:
+    import yaml
+
+    for loader in selector_merge_loaders():
+        for source in (
+            "field: first\nfield: second\n",
+            "base: &base {field: inherited}\nresult: {<<: *base, field: first, field: second}\n",
+            "true: first\n1: second\n",
+        ):
+            try:
+                yaml.load(source, Loader=loader)
+            except ValueError as error:
+                assert str(error) == "duplicate YAML key", error
+            else:
+                raise AssertionError(f"accepted explicit duplicate: {source!r}")
+
+
+def test_import_selection_yaml_recursive_alias_parity() -> None:
+    import yaml
+
+    source = "root: &root {self: *root, <<: {field: inherited}, field: override}\n"
+    for loader in [yaml.SafeLoader, getattr(yaml, "CSafeLoader", yaml.SafeLoader), *selector_merge_loaders()]:
+        actual = yaml.load(source, Loader=loader)
+        assert actual["root"]["self"] is actual["root"]
+        assert actual["root"]["field"] == "override"
+
+
+def test_import_selection_yaml_anchored_duplicates_rejected() -> None:
+    import yaml
+
+    for loader in selector_merge_loaders():
+        for source in (
+            "base: &base {field: first, field: second}\nresult: {<<: *base}\n",
+            "result: {<<: &base {field: first, field: second}}\n",
+            "result: {<<: [{<<: &base {field: first, field: second}}, {other: value}]}\n",
+        ):
+            try:
+                yaml.load(source, Loader=loader)
+            except ValueError as error:
+                assert str(error) == "duplicate YAML key", error
+            else:
+                raise AssertionError(f"accepted anchored explicit duplicate: {source!r}")
+
+
+def test_import_selection_yaml_merge_generated_property() -> None:
+    import yaml
+
+    # This suite uses deterministic generated tables rather than Hypothesis.
+    # Each mapping has unique explicit keys; collisions across merge sources
+    # and overrides deliberately exercise PyYAML's precedence rules.
+    rng = random.Random(139)
+    loaders = selector_merge_loaders()
+    for case in range(256):
+        lines = []
+        for index in range(rng.randint(2, 6)):
+            fields = []
+            if index and rng.choice((True, False)):
+                sources = [f"*a{rng.randrange(index)}" for _ in range(rng.randint(1, 4))]
+                fields.append("<<: [" + ", ".join(sources) + "]")
+            for key in rng.sample(range(7), rng.randint(1, 7)):
+                value = rng.choice((None, True, False, rng.randint(-100, 100),
+                                    f"case-{case}-{index}", [case, index], {"value": index}))
+                fields.append(f"k{key}: " + json.dumps(value))
+            rng.shuffle(fields)  # Explicit overrides can precede or follow <<.
+            lines.append(f"a{index}: &a{index} {{" + ", ".join(fields) + "}")
+        sources = [f"*a{rng.randrange(index + 1)}" for _ in range(rng.randint(2, 6))]
+        lines.append("result: {<<: [" + ", ".join(sources) + f"], k0: {case}" + "}")
+        source = "\n".join(lines) + "\n"
+        expected = yaml.load(source, Loader=yaml.SafeLoader)
+        if hasattr(yaml, "CSafeLoader"):
+            assert yaml.load(source, Loader=yaml.CSafeLoader) == expected, source
+        for loader in loaders:
+            assert yaml.load(source, Loader=loader) == expected, source
+
+
+def test_import_selection_yaml_merge_ny_companion_unrelated_leg() -> None:
+    # Exact NY heating/cooling companion shape, including input overrides,
+    # the nested relation list, and the second shared oracle_inputs anchor.
+    # This is a selector-only fixture, never encoded RuleSpec content.
+    companion = textwrap.dedent("""\
+        - name: heating_cooling_allowance_applies_in_new_york_city
+          period: 2026-01
+          input: &base_heating_cooling
+            us:statutes/7/2012/j#relation.member_of_household: []
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_incurred_or_anticipated_heating_or_cooling_costs_separate_from_rent_or_mortgage: true
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_in_central_meter_housing_charged_only_for_excess_heating_or_cooling: false
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_entitled_to_heap_or_liheaa_payment: false
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_resides_in_new_york_city: true
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_resides_in_nassau_or_suffolk_county: false
+          oracle_inputs: &oracle_new_york_city
+            policyengine:
+              snap_utility_region_str: NY_NYC
+          output:
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#snap_heating_cooling_standard_allowance_eligible: holds
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#snap_standard_utility_allowance: 1062
+            us:regulations/7-cfr/273/9#snap_standard_utility_allowance_state_option: 1062
+            us:regulations/7-cfr/273/9#snap_utility_allowance_for_shelter_costs: 1062
+
+        - name: heating_cooling_allowance_applies_in_nassau_or_suffolk
+          period: 2026-01
+          input:
+            <<: *base_heating_cooling
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_resides_in_new_york_city: false
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_resides_in_nassau_or_suffolk_county: true
+          oracle_inputs:
+            policyengine:
+              snap_utility_region_str: NY_NAS
+          output:
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#snap_standard_utility_allowance: 988
+            us:regulations/7-cfr/273/9#snap_standard_utility_allowance_state_option: 988
+
+        - name: heating_cooling_allowance_applies_in_rest_of_state
+          period: 2026-01
+          input:
+            <<: *base_heating_cooling
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_resides_in_new_york_city: false
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_resides_in_nassau_or_suffolk_county: false
+          oracle_inputs:
+            policyengine:
+              snap_utility_region_str: NY_ONY
+          output:
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#snap_standard_utility_allowance: 877
+            us:regulations/7-cfr/273/9#snap_standard_utility_allowance_state_option: 877
+
+        - name: central_meter_excess_cost_only_household_needs_heap_or_liheaa
+          period: 2026-01
+          input:
+            <<: *base_heating_cooling
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_in_central_meter_housing_charged_only_for_excess_heating_or_cooling: true
+          oracle_inputs: *oracle_new_york_city
+          output:
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#snap_heating_cooling_standard_allowance_eligible: not_holds
+
+        - name: elderly_or_disabled_household_with_heap_or_liheaa_qualifies
+          period: 2026-01
+          input:
+            <<: *base_heating_cooling
+            us:statutes/7/2012/j#relation.member_of_household:
+              - us:statutes/7/2012/j#input.snap_member_is_elderly_or_disabled: true
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_incurred_or_anticipated_heating_or_cooling_costs_separate_from_rent_or_mortgage: false
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_in_central_meter_housing_charged_only_for_excess_heating_or_cooling: true
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#input.household_entitled_to_heap_or_liheaa_payment: true
+          oracle_inputs: *oracle_new_york_city
+          output:
+            us-ny:regulations/18-nycrr/387/12/f/3/v/a#snap_heating_cooling_standard_allowance_eligible: holds
+    """)
+    jurisdictions = ["us-ca", "us-fl", "us-ma", "us-ny", "us-sc", "us"]
+    module = "us-ny/regulations/18-nycrr/387/12/f/3/v/a.yaml"
+    path = module.removesuffix(".yaml") + ".test.yaml"
+    files = {**selection_files(jurisdictions), module: selection_module(), path: companion}
+    for changed, expected in (("us-fl/statutes/local.yaml", "us-fl"), (path, "us-ny")):
+        result = run_import_aware_selection({changed: files[changed] + "# changed\n"}, files=files)
+        assert_selection(result, [expected], jurisdictions=jurisdictions, revalidate=[])
+        assert "import analysis failed" not in result["scope-diagnostics"]
 
 
 def test_import_selection_documents_cached_by_blob_across_trees() -> None:
@@ -2382,6 +2592,14 @@ def run_selector_tests() -> None:
         test_import_selection_unresolved_program_ownership_falls_back,
         test_import_selection_graph_parse_and_read_failures,
         test_import_selection_c_and_python_loader_safety_parity,
+        test_import_selection_yaml_merge_explicit_override,
+        test_import_selection_yaml_merge_sequence_precedence,
+        test_import_selection_yaml_merge_nested_and_reused_aliases,
+        test_import_selection_yaml_explicit_duplicates_rejected,
+        test_import_selection_yaml_recursive_alias_parity,
+        test_import_selection_yaml_anchored_duplicates_rejected,
+        test_import_selection_yaml_merge_generated_property,
+        test_import_selection_yaml_merge_ny_companion_unrelated_leg,
         test_import_selection_documents_cached_by_blob_across_trees,
         test_import_selection_shared_paths_and_toolchains,
         test_import_selection_events_refs_index_and_opt_in_default,
