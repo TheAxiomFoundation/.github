@@ -107,20 +107,33 @@ opted-in pull requests select changed jurisdictions and transitive importers
 from both base and head trees. Import evidence on any encoder-supported proof
 kind (including `parameter`) creates the same dependency edge as `kind: import`.
 This includes self imports, companion tests and nested metadata; source evidence
-may coexist with import evidence. Unknown proof kinds, duplicate keys, ambiguous
-targets and malformed import payloads fail closed.
+may coexist with import evidence. Null-valued floating-point mapping keys from
+unquoted commas in descriptive flow mappings name no dependency and are ignored;
+all mapping values are still scanned for import evidence.
 
 Unchanged affected importers receive full atomic validation in their selected
-legs. An unresolved graph selects the full matrix
-and full targets. In particular, an import whose jurisdiction is not a
-discovered shard, anywhere in either tree, forces every PR to use the full
-matrix and full targets. Such out-of-repository imports can make opt-in more
-expensive than default selection. Revalidated importer legs also run the
+legs. Unknown proof kinds, unsupported dependency shapes, malformed YAML,
+duplicate keys, and unresolved imports inside a uniquely owned atomic module
+or its companion are contained to that module. The module is treated as
+depending on everything: every nonempty change selects its jurisdiction leg
+with full atomic targets, even when the opaque module itself changed. Its known
+reverse dependents are also selected transitively. Opacity and known edges are
+unioned across both trees, so a head-only repair cannot erase base-tree risk.
+Each distinct file/reason emits `contained=path: reason` once per selection.
+
+An unknown shape can only hide edges out of the module containing it, never
+edges into other modules. Selecting that module on every change is therefore a
+superset of its true dependencies. Seeding it into the reverse traversal also
+preserves every known consumer; other opaque consumers are always seeded too.
+Ownership ambiguity, orphan companions, shared/root paths, toolchain and
+workflow changes, and failures that cannot be attributed to a single module
+retain global full selection. Graph-read and program-ownership failures still
+use full targets globally. Revalidated importer legs also run the
 stricter changed-file oracle-coverage check over every atomic module in the
 leg.
 
 Full-matrix selections report specific reasons. The import-aware classifier logs
-`scope=full (...)` for graph failures, shared/root paths, toolchain or ledger
+`scope=full (...)` for uncontained graph failures, shared/root paths, toolchain or ledger
 changes, index-only diffs, and a modeled dependency closure covering every
 jurisdiction. Shared paths keep their existing target behavior; ledger/digest
 and audit-manifest changes can still require all legs. This input remains
@@ -139,6 +152,9 @@ before opt-in. Compare selected and full validation on the same base/head
 revisions and pinned inputs; require that selection misses no deterministic
 validation failure and preserves global gates and exhaustive waiver coverage.
 Keep the input disabled until both the audit prerequisite and replay are met.
+The round-3 containment candidate has not met that replay gate: replay stopped
+at the first historical miss in RuleSpec US PR #1307. Its generated graph
+property passes, but historical validation coverage remains blocked.
 
 Measure the real `Compute validation shards` step during that replay, including
 both git trees, with the timing harness (Python with PyYAML and Bash 4+ required):

@@ -1596,6 +1596,8 @@ jobs:
                   reverse = {}
                   node_owners = {}
                   program_owners = {}
+                  opaque_modules = set()
+                  contained_reasons = set()
 
                   def edge(provider, importer):
                       reverse.setdefault(provider, set()).add(importer)
@@ -1669,9 +1671,14 @@ jobs:
                               if isinstance(value, list):
                                   pending.extend(value)
                                   continue
-                              # Integer keys occur in RuleSpec versions.values;
-                              # other non-string keys are outside this model.
-                              if any(type(key) not in (str, int) for key in value):
+                              # Integer keys occur in versions.values. Unquoted
+                              # commas in flow-map descriptions/citations can
+                              # also produce float keys with null values. Those
+                              # entries name no provider and hide no container;
+                              # still scan every value for dependency evidence.
+                              if any(type(key) not in (str, int)
+                                     and not (type(key) is float and item is None)
+                                     for key, item in value.items()):
                                   raise ValueError("unsupported dependency mapping key")
                               if "imports" in value:
                                   imports = value["imports"]
@@ -1711,7 +1718,15 @@ jobs:
                           try:
                               dependency_edges(document(entries, path), key)
                           except Exception as error:
-                              raise ValueError(f"{path}: {error}") from error
+                              # Ownership is established before parsing. Unknown
+                              # outgoing dependencies can only affect this
+                              # importer, so seed it on every change and retain
+                              # all known incoming edges from either tree.
+                              opaque_modules.add(key)
+                              reason = f"{path}: {' '.join(str(error).split())}"
+                              if reason not in contained_reasons:
+                                  contained_reasons.add(reason)
+                                  print(f"contained={reason}", file=sys.stderr)
 
                       for path in entries:
                           if not program_spec_path(path):
@@ -1834,8 +1849,8 @@ jobs:
                           )
                           full_reasons.append(f"{category}: {path}")
 
-                  affected = set(seeds)
-                  pending = list(seeds)
+                  affected = seeds | opaque_modules
+                  pending = list(affected)
                   while pending:
                       for importer in reverse.get(pending.pop(), ()):
                           if importer not in affected:
@@ -1843,7 +1858,8 @@ jobs:
                               pending.append(importer)
                   selected = owners | {node_owners[node] for node in affected if node in node_owners}
                   revalidate = {node_owners[node] for node in affected
-                                if node in node_owners and node not in changed_modules}
+                                if node in node_owners
+                                and (node not in changed_modules or node in opaque_modules)}
                   if full_reasons or not selected:
                       selected = shard_set
                       reason = "; ".join(sorted(full_reasons)) or "no affected jurisdiction (index-only diff)"

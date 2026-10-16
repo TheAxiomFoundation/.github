@@ -1399,11 +1399,14 @@ def test_import_selection_parameter_evidence_base_only_and_deleted_provider() ->
     }, files=files)
     assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl"])
     assert_full_leg(result, "us-fl", files)
-    # Leaving dangling evidence at head remains a full fallback.
+    # Dangling evidence is attributed to its importer and contained there.
     result = run_import_aware_selection({
         provider: None, "us-ma/statutes/local.test.yaml": None,
     }, files=files)
-    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+    assert "contained=us-sc/statutes/local.yaml:" in result["scope-diagnostics"], result
+    assert_full_leg(result, "us-fl", companion_files)
+    assert_full_leg(result, "us-sc", companion_files)
 
 
 def assert_parameter_evidence_control() -> None:
@@ -1445,10 +1448,16 @@ def test_import_selection_parameter_evidence_duplicate_and_ambiguous_fails_close
         result = run_import_aware_selection({
             "us-ma/statutes/local.yaml": files["us-ma/statutes/local.yaml"] + "# changed\n",
         }, files=files)
-        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
-        assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
-        for shard in result["matrix"]:
-            assert_full_leg(result, shard, files, "full-selection-fallback")
+        if extras:
+            # Two files claiming one module identity remain globally ambiguous.
+            assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+            assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
+            for shard in result["matrix"]:
+                assert_full_leg(result, shard, files, "full-selection-fallback")
+        else:
+            assert_selection(result, ["us-ma", "us-sc"], revalidate=["us-sc"])
+            assert "contained=us-sc/statutes/local.yaml:" in result["scope-diagnostics"], result
+            assert_full_leg(result, "us-sc", files)
 
 
 def test_import_selection_parameter_evidence_malformed_fails_closed() -> None:
@@ -1474,10 +1483,9 @@ def test_import_selection_parameter_evidence_malformed_fails_closed() -> None:
         result = run_import_aware_selection({
             "us-ma/statutes/local.yaml": files["us-ma/statutes/local.yaml"] + "# changed\n",
         }, files=files)
-        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
-        assert "scope=full (import analysis failed:" in result["scope-diagnostics"], result
-        for shard in result["matrix"]:
-            assert_full_leg(result, shard, files, "full-selection-fallback")
+        assert_selection(result, ["us-ma", "us-sc"], revalidate=["us-sc"])
+        assert "contained=us-sc/statutes/local.yaml:" in result["scope-diagnostics"], result
+        assert_full_leg(result, "us-sc", files)
 
 
 def test_import_selection_parameter_evidence_full_selection_reasons() -> None:
@@ -1553,9 +1561,9 @@ def test_import_selection_unmodelled_dependency_shapes_fail_closed() -> None:
         result = run_import_aware_selection(
             {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"}, files=files,
         )
-        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
-        for shard in result["matrix"]:
-            assert_full_leg(result, shard, files, "full-selection-fallback")
+        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
+        assert "contained=us-fl/statutes/local.test.yaml:" in result["scope-diagnostics"], result
+        assert_full_leg(result, "us-fl", files)
 
 
 def test_import_selection_federal_fanout() -> None:
@@ -1599,13 +1607,12 @@ def test_import_selection_base_head_union_and_deleted_provider() -> None:
     assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
     assert_full_leg(result, "us-fl", companion_files)
     assert_full_leg(result, "us-sc", companion_files)
-    # An unmodelled base dependency must also fail closed after it is repaired
-    # at head. This directly kills the head-tree-only mutation for modules.
+    # An unmodelled base dependency stays contained after repair at head.
+    # This directly kills the head-tree-only mutation for module opacity.
     invalid_base = {**selection_files(), "us-sc/statutes/local.yaml": "imports: [{target: unmodelled}]\n"}
     result = run_import_aware_selection({"us-sc/statutes/local.yaml": selection_module()}, files=invalid_base)
-    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
-    for shard in result["matrix"]:
-        assert_full_leg(result, shard, invalid_base, "full-selection-fallback")
+    assert_selection(result, ["us-sc"], revalidate=["us-sc"])
+    assert_full_leg(result, "us-sc", invalid_base)
     # Renaming a provider and updating its direct importer still revalidates
     # the unchanged transitive importer using the union of both module graphs.
     result = run_import_aware_selection({
@@ -1618,7 +1625,7 @@ def test_import_selection_base_head_union_and_deleted_provider() -> None:
     assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl"])
     assert_full_leg(result, "us-fl", files)
     files["us-fl/statutes/local.yaml"] = selection_module()
-    # A dangling import at head is an analysis failure, so all legs use full targets.
+    # Deleting a module alone leaves an orphan companion: ownership is unresolved.
     result = run_import_aware_selection({"us-ma/statutes/local.yaml": None}, files=files)
     assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
     remaining = {path: text for path, text in files.items() if path != "us-ma/statutes/local.yaml"}
@@ -1947,9 +1954,9 @@ def test_import_selection_contradictory_manifest_deletion() -> None:
 def test_import_selection_graph_parse_and_read_failures() -> None:
     for content in ("broken: [", "[]", "imports: not-a-list\n", "imports:\n  - 7\n", "imports:\n  - 'us-xx:statutes/missing#fixture'\n", "imports: []\nimports: []\n"):
         result = run_import_aware_selection({"us-fl/statutes/local.yaml": content})
-        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
-        for shard in result["matrix"]:
-            assert_full_leg(result, shard, selection_files(), "full-selection-fallback")
+        assert_selection(result, ["us-fl"], revalidate=["us-fl"])
+        assert "contained=us-fl/statutes/local.yaml:" in result["scope-diagnostics"], result
+        assert_full_leg(result, "us-fl", selection_files())
     # Fail both the tree and blob readers; no partial graph may escape.
     for command in ("ls-tree", "cat-file", "diff"):
         result = run_import_aware_selection({"us-fl/statutes/local.yaml": selection_module() + "# changed\n"}, fail_git=command)
@@ -1958,10 +1965,11 @@ def test_import_selection_graph_parse_and_read_failures() -> None:
             assert_full_leg(result, shard, selection_files(), "full-selection-fallback")
     result = run_import_aware_selection({"us-fl/statutes/local.yml": selection_module()})
     assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
-    # Unchanged malformed modules in either tree must prevent partial analysis.
+    # Unchanged malformed modules with unique owners are contained in either tree.
     files = {**selection_files(), "us-ma/statutes/local.yaml": "broken: ["}
     result = run_import_aware_selection({"us-fl/statutes/local.yaml": selection_module() + "# changed\n"}, files=files)
-    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-ma"])
+    assert_full_leg(result, "us-ma", files)
     # A companion without its module has no modeled importer identity, even
     # when its own YAML is valid and the changed provider is well formed.
     files = {**selection_files(), "us-fl/statutes/orphan.test.yaml": "tests: []\n"}
@@ -2339,12 +2347,12 @@ def test_import_selection_shared_paths_and_toolchains() -> None:
     }, dependency_pins_changed=True)
     for shard in result["matrix"]:
         assert_full_leg(result, shard, selection_files(), "full-toolchain-bump")
-    # Full-toolchain priority also wins over graph-failure full-target mode.
+    # Full-toolchain priority also wins over module containment.
     result = run_import_aware_selection({
         ".axiom/workflow-toolchain.toml": SELECTOR_WORKFLOW_TOOLCHAIN.replace("a" * 40, "d" * 40),
         "us-fl/statutes/local.yaml": "imports: broken\n",
     }, dependency_pins_changed=True)
-    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=["us-fl"])
     for shard in result["matrix"]:
         assert_full_leg(result, shard, selection_files(), "full-toolchain-bump")
 
@@ -2390,6 +2398,245 @@ def test_import_selection_events_refs_index_and_opt_in_default() -> None:
     assert result["matrix"] == ["__all__"]
     assert result["roots"] == "us-fl"
     assert result["targets"]["__all__"] == ("changed", ["us-fl/statutes/local.yaml"], ["us-fl/statutes/local.test.yaml"])
+
+
+def test_import_selection_oregon_descriptive_float_keys() -> None:
+    # Exact descriptive input lines from the Oregon composition, including
+    # the unquoted commas that SafeLoader turns into null-valued float keys.
+    inputs = textwrap.dedent("""\
+      - {name: or_pit_2026_federal_bonus_depreciation_deduction_december_1_2017_law, entity: TaxUnit, dtype: Money, period: Year, unit: USD, description: Section 168(k) deduction for the same property under the Internal Revenue Code as in effect December 1, 2017.}
+      - {name: or_pit_2026_has_held_nol_basis_or_fiduciary_modification, entity: TaxUnit, dtype: Judgment, period: Year, description: Whether ORS 316.028-.031, .047, .159, .697, or .707-.749 requires a held NOL, basis, transition, retirement-basis, or fiduciary adjustment.}
+      - {name: or_pit_2026_has_held_savings_pension_or_indexed_modification, entity: TaxUnit, dtype: Judgment, period: Year, description: Whether ORS 316.680's unencoded federal-pension, Roth-conversion, memorial-fund, or cross-title withdrawal branches, or ORS 316.681-.683, .690, .699, .778, or .797-.801, requires a held pension, savings, foreign-tax, or indexed modification.}
+      - {name: or_pit_2026_has_held_cross_title_or_other_oregon_modification, entity: TaxUnit, dtype: Judgment, period: Year, description: Whether any other Chapter 314/315 or unencoded ORS 316.680, .687, .693, .695(6), .836, .838, .844, .850, .856, .866, or .867 transaction is present. ORS 316.698 film labor rebates are encoded directly and do not trigger this hold.}
+    """)
+    jurisdictions = ["us-ca", "us-fl", "us-ma", "us-or", "us-sc", "us"]
+    oregon = "us-or/policies/income_tax/resident_core_liability_pipeline.yaml"
+    source = selection_module() + "module: {kind: composition, deferred_outputs: []}\ninputs:\n" + inputs
+    files = {**selection_files(jurisdictions), oregon: source}
+    result = run_import_aware_selection({"us-fl/statutes/local.yaml": files["us-fl/statutes/local.yaml"] + "# changed\n"}, files=files)
+    assert_selection(result, ["us-fl"], jurisdictions=jurisdictions, revalidate=[])
+    assert "contained=" not in result["scope-diagnostics"], result
+    result = run_import_aware_selection({oregon: source + "# changed\n"}, files=files)
+    assert_selection(result, ["us-or"], jurisdictions=jurisdictions, revalidate=[])
+
+
+def test_import_selection_descriptive_float_keys_preserve_dependencies() -> None:
+    import yaml
+
+    # Ignoring a descriptive null key must not skip the rest of the mapping,
+    # its nested evidence, or a companion containing the same input shape.
+    evidence = {"inputs": [{0.687: None, "metadata": {"imports": ["us-ma:statutes/local#fixture"]}}]}
+    for path in ("us-sc/statutes/local.yaml", "us-sc/statutes/local.test.yaml"):
+        files = {**selection_files(), path: yaml.safe_dump(evidence),
+                 "us-fl/statutes/local.yaml": selection_module("us-sc:statutes/local#fixture")}
+        result = run_import_aware_selection({"us-ma/statutes/local.yaml": files["us-ma/statutes/local.yaml"] + "# changed\n"}, files=files)
+        assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+        assert "contained=" not in result["scope-diagnostics"], result
+        for shard in ("us-fl", "us-sc"):
+            assert_full_leg(result, shard, files)
+
+
+def selection_opaque_module(*known_imports: str, hidden_imports: tuple[str, ...] = ()) -> str:
+    import yaml
+
+    document = yaml.safe_load(selection_module(*known_imports))
+    # A simulated future dependency form. The independent property oracle
+    # knows its true providers, while today's selector must treat it as opaque.
+    document["metadata"] = {"imports": {"future_providers": list(hidden_imports)}}
+    return yaml.safe_dump(document, sort_keys=False)
+
+
+def test_import_selection_opaque_module_unrelated_change() -> None:
+    opaque = "us-fl/statutes/local.yaml"
+    changed = "us-ma/statutes/local.yaml"
+    files = {**selection_files(), opaque: selection_opaque_module()}
+    result = run_import_aware_selection({changed: files[changed] + "# changed\n"}, files=files)
+    assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl"])
+    assert_full_leg(result, "us-fl", files)
+    assert f"contained={opaque}: imports is not a list" in result["scope-diagnostics"], result
+    assert "scope=full" not in result["scope-diagnostics"], result
+
+
+def test_import_selection_opaque_module_change_and_known_dependents() -> None:
+    opaque = "us-fl/statutes/local.yaml"
+    files = {
+        **selection_files(),
+        opaque: selection_opaque_module(),
+        "us-sc/statutes/local.yaml": selection_module("us-fl:statutes/local#fixture"),
+        "us-ca/statutes/local.yaml": selection_module("us-sc:statutes/local#fixture"),
+    }
+    result = run_import_aware_selection({opaque: files[opaque] + "# changed\n"}, files=files)
+    assert_selection(result, ["us-ca", "us-fl", "us-sc"], revalidate=["us-ca", "us-fl", "us-sc"])
+    for shard in ("us-ca", "us-fl", "us-sc"):
+        assert_full_leg(result, shard, files)
+
+
+def test_import_selection_opaque_module_seeds_known_dependents() -> None:
+    # Merely adding the opaque owner's leg after closure misses both us-sc
+    # and us-ca. The opaque identity must seed reverse traversal itself.
+    opaque = "us-fl/statutes/local.yaml"
+    changed = "us/statutes/local.yaml"
+    files = {
+        **selection_files(),
+        opaque: selection_opaque_module(hidden_imports=("us:statutes/local#fixture",)),
+        "us-sc/statutes/local.yaml": selection_module("us-fl:statutes/local#fixture"),
+        "us-ca/statutes/local.yaml": selection_module("us-sc:statutes/local#fixture"),
+    }
+    result = run_import_aware_selection({changed: files[changed] + "# changed\n"}, files=files)
+    assert_selection(result, ["us-ca", "us-fl", "us-sc", "us"], revalidate=["us-ca", "us-fl", "us-sc"])
+    for shard in ("us-ca", "us-fl", "us-sc"):
+        assert_full_leg(result, shard, files)
+
+
+def test_import_selection_two_opaque_modules_and_shared_change() -> None:
+    files = selection_files()
+    for shard in ("us-fl", "us-sc"):
+        files[f"{shard}/statutes/local.yaml"] = selection_opaque_module()
+    changed = "us-ma/statutes/local.yaml"
+    result = run_import_aware_selection({changed: files[changed] + "# changed\n"}, files=files)
+    assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+    for shard in ("us-fl", "us-sc"):
+        assert_full_leg(result, shard, files)
+        assert f"contained={shard}/statutes/local.yaml:" in result["scope-diagnostics"], result
+    result = run_import_aware_selection({"README.md": "changed\n"}, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=["us-fl", "us-sc"])
+    assert "scope=full (shared/root path: README.md)" in result["scope-diagnostics"], result
+    for shard in ("us-fl", "us-sc"):
+        assert_full_leg(result, shard, files)
+
+
+def test_import_selection_opaque_base_head_and_companion_union() -> None:
+    opaque = "us-fl/statutes/local.yaml"
+    companion = "us-fl/statutes/local.test.yaml"
+    changed = "us-ma/statutes/local.yaml"
+    baseline = {
+        **selection_files(),
+        "us-sc/statutes/local.yaml": selection_module("us-fl:statutes/local#fixture"),
+    }
+    # Both module and companion opacity are unioned over protected trees.
+    # A repaired base-only companion is especially useful: its changed path
+    # does not independently seed a module, so head-only opacity loses us-sc.
+    for path, clean in ((opaque, selection_module()), (companion, "tests: []\n")):
+        for base_opaque in (False, True):
+            files = {**baseline, path: selection_opaque_module() if base_opaque else clean}
+            replacement = clean if base_opaque else selection_opaque_module()
+            result = run_import_aware_selection({
+                changed: files[changed] + "# changed\n", path: replacement,
+            }, files=files)
+            assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-fl", "us-sc"])
+            head_files = {**files, path: replacement}
+            for shard in ("us-fl", "us-sc"):
+                assert_full_leg(result, shard, head_files)
+            assert f"contained={path}:" in result["scope-diagnostics"], result
+
+
+def test_import_selection_generated_opaque_graph_property(cases: range = range(24)) -> None:
+    for case in cases:
+        rng = random.Random(20261016 + case)
+        files = selection_files()
+        modules = [
+            f"{shard}/statutes/{name}.yaml"
+            for shard in SELECTION_JURISDICTIONS for name in ("local", "generated")
+        ]
+        owners = {node: node.split("/", 1)[0] for node in modules}
+        density = 0.035 if case % 2 == 0 else 0.20
+        true_base = {
+            node: {provider for provider in modules if rng.random() < density}
+            for node in modules
+        }
+        changed = set(rng.sample(modules, rng.randint(1, 3)))
+        opaque_base = set(rng.sample(modules, rng.randrange(len(modules) + 1)))
+        opaque_head = (opaque_base - changed) | {node for node in sorted(changed) if rng.random() < 0.5}
+        true_head = {
+            node: ({provider for provider in modules if rng.random() < density}
+                   if node in changed else set(providers))
+            for node, providers in true_base.items()
+        }
+        if case == 0:
+            # Deterministic sparse witness. The changed us provider reaches
+            # us-fl only through its hidden edge; two known reverse edges
+            # then require us-sc and us-ca, while us-ma must stay unselected.
+            true_base = {node: set() for node in modules}
+            true_base["us-fl/statutes/local.yaml"] = {"us/statutes/local.yaml"}
+            true_base["us-sc/statutes/local.yaml"] = {"us-fl/statutes/local.yaml"}
+            true_base["us-ca/statutes/local.yaml"] = {"us-sc/statutes/local.yaml"}
+            true_head = {node: set(providers) for node, providers in true_base.items()}
+            changed = {"us/statutes/local.yaml"}
+            opaque_base = opaque_head = {"us-fl/statutes/local.yaml"}
+
+        def target(node: str) -> str:
+            return owners[node] + ":" + node.split("/", 1)[1].removesuffix(".yaml") + "#fixture"
+
+        known_base = {}
+        known_head = {}
+        hidden_base = {}
+        hidden_head = {}
+        for node in modules:
+            # Opaque modules can hide any subset of their true dependencies.
+            # All visible imports remain before metadata in the document so
+            # the selector can retain them when the unknown shape is met.
+            hidden_base[node] = (
+                {provider for provider in sorted(true_base[node]) if rng.random() < 0.7}
+                if node in opaque_base else set()
+            )
+            if case == 0 and node == "us-fl/statutes/local.yaml":
+                hidden_base[node] = set(true_base[node])
+            known_base[node] = true_base[node] - hidden_base[node]
+            if node not in changed:
+                hidden_head[node] = set(hidden_base[node])
+            else:
+                hidden_head[node] = (
+                    {provider for provider in sorted(true_head[node]) if rng.random() < 0.7}
+                    if node in opaque_head else set()
+                )
+            known_head[node] = true_head[node] - hidden_head[node]
+
+        def render(node: str, known: dict, hidden: dict, opaque: set) -> str:
+            providers = [target(provider) for provider in sorted(known[node])]
+            if node in opaque:
+                return selection_opaque_module(
+                    *providers, hidden_imports=tuple(target(provider) for provider in sorted(hidden[node])),
+                )
+            return selection_module(*providers)
+
+        for node in modules:
+            files[node] = render(node, known_base, hidden_base, opaque_base)
+        changes = {
+            node: render(node, known_head, hidden_head, opaque_head) + f"# changed {case}\n"
+            for node in sorted(changed)
+        }
+
+        def closure(seeds: set, base_edges: dict, head_edges: dict) -> set:
+            affected = set(seeds)
+            while True:
+                expanded = affected | {
+                    node for node in modules if (base_edges[node] | head_edges[node]) & affected
+                }
+                if expanded == affected:
+                    return affected
+                affected = expanded
+
+        opaque = opaque_base | opaque_head
+        true_affected = closure(changed, true_base, true_head)
+        required = {owners[node] for node in true_affected | opaque}
+        # The independent conservative oracle preserves every visible reverse
+        # edge and treats each opaque module as dependent on every change.
+        conservative = closure(changed | opaque, known_base, known_head)
+        expected = [shard for shard in SELECTION_JURISDICTIONS if any(owners[node] == shard for node in conservative)]
+        revalidate = [
+            shard for shard in SELECTION_JURISDICTIONS
+            if any(owners[node] == shard for node in (conservative - changed) | opaque)
+        ]
+        result = run_import_aware_selection(changes, files=files)
+        assert required <= set(result["matrix"]), (case, true_base, true_head, opaque, changed, result)
+        assert_selection(result, expected, revalidate=revalidate)
+        head_files = {**files, **changes}
+        for shard in revalidate:
+            assert_full_leg(result, shard, head_files)
+        for node in opaque:
+            assert owners[node] in result["matrix"], (case, node, result)
+            assert owners[node] in result["revalidate"], (case, node, result)
+            assert f"contained={node}:" in result["scope-diagnostics"], (case, node, result)
 
 
 def test_import_selection_generated_graph_property(cases: range = range(20)) -> None:
@@ -2603,6 +2850,14 @@ def run_selector_tests() -> None:
         test_import_selection_documents_cached_by_blob_across_trees,
         test_import_selection_shared_paths_and_toolchains,
         test_import_selection_events_refs_index_and_opt_in_default,
+        test_import_selection_oregon_descriptive_float_keys,
+        test_import_selection_descriptive_float_keys_preserve_dependencies,
+        test_import_selection_opaque_module_unrelated_change,
+        test_import_selection_opaque_module_change_and_known_dependents,
+        test_import_selection_opaque_module_seeds_known_dependents,
+        test_import_selection_two_opaque_modules_and_shared_change,
+        test_import_selection_opaque_base_head_and_companion_union,
+        test_import_selection_generated_opaque_graph_property,
         test_import_selection_generated_graph_property,
         test_import_selection_generated_suffix_ambiguity_property,
         test_import_selection_preserves_enforcement_wiring,
@@ -2610,7 +2865,7 @@ def run_selector_tests() -> None:
     for test in tests:
         test()
         print(f"{test.__name__}: passed", flush=True)
-    print("actual workflow selectors: passed (20 generated module/program graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
+    print("actual workflow selectors: passed (24 generated opaque graph cases; 20 generated module/program graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
 
 
 def literal_pin_caller(pins: dict[str, str]) -> str:
