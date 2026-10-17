@@ -1059,6 +1059,9 @@ def run_import_aware_selection(
     fail_git: str = "",
     shape_programs: tuple[str, ...] = (),
     dependency_pins_changed: bool = False,
+    base_symlinks: dict[str, str] | None = None,
+    symlink_changes: dict[str, str] | None = None,
+    git_only_changes: dict[str, str] | None = None,
 ) -> dict:
     """Run real compute, root-resolution and target shell against protected Git trees."""
     workflow = selection_workflow(WORKFLOW.read_text())
@@ -1075,12 +1078,23 @@ def run_import_aware_selection(
         def write(path: str, content: str) -> None:
             target = root / path
             target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                target.unlink()
             target.write_text(content)
+
+        def symlink(path: str, destination: str) -> None:
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            target.symlink_to(destination)
 
         baseline = selection_files() if files is None else files
         for path, content in baseline.items():
             if path not in shape_programs:
                 write(path, content)
+        for path, destination in (base_symlinks or {}).items():
+            symlink(path, destination)
         if shape_programs:
             shape_base = commit(root, "before program specs")
             for path in shape_programs:
@@ -1104,7 +1118,17 @@ def run_import_aware_selection(
                 (root / path).unlink()
             else:
                 write(path, content)
+        for path, destination in (symlink_changes or {}).items():
+            symlink(path, destination)
         git(root, "add", "-A")
+        for path, content in (git_only_changes or {}).items():
+            # Some host filesystems cannot materialize non-UTF-8 Git names.
+            # Construct the real head tree directly; ordinary unchanged files
+            # still exercise the actual target-selection shell below.
+            blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=root,
+                                  input=content.encode(), capture_output=True, check=True).stdout.strip()
+            subprocess.run(["git", "update-index", "-z", "--index-info"], cwd=root,
+                           input=b"100644 " + blob + b"\t" + os.fsencode(path) + b"\0", check=True)
         git(root, "commit", "--allow-empty", "-qm", "selection head")
         head = git(root, "rev-parse", "HEAD")
         base = base if base_override is None else base_override
@@ -1152,6 +1176,7 @@ def run_import_aware_selection(
                 env={**env, **(extra_env or {}), "GITHUB_OUTPUT": str(output)},
                 capture_output=True,
                 text=True,
+                errors="surrogateescape",
                 timeout=60,
             )
             assert result.returncode == 0, f"{name}: {result.stdout}{result.stderr}"
@@ -1182,8 +1207,8 @@ def run_import_aware_selection(
             })
             selected_targets[shard] = (
                 target_outputs["mode"],
-                (runner_temp / "rulespec-files.txt").read_text().splitlines(),
-                (runner_temp / "rulespec-test-files.txt").read_text().splitlines(),
+                (runner_temp / "rulespec-files.txt").read_text(errors="surrogateescape").splitlines(),
+                (runner_temp / "rulespec-test-files.txt").read_text(errors="surrogateescape").splitlines(),
             )
             for filename in ("rulespec-files.txt", "rulespec-test-files.txt"):
                 raw_outputs[f"targets-{shard}/{filename}"] = (runner_temp / filename).read_bytes()
@@ -1524,11 +1549,18 @@ def test_import_selection_parameter_evidence_full_selection_reasons() -> None:
     ]
     for changes, reason in cases:
         result = run_import_aware_selection(changes)
-        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[])
+        shared_input_changed = any(not path.startswith(".axiom/index/") for path in changes)
+        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=shared_input_changed)
+        if shared_input_changed:
+            for shard in SELECTION_JURISDICTIONS:
+                assert_full_leg(result, shard, selection_files(), "full-selection-fallback")
         assert f"scope=full ({reason})" in result["scope-diagnostics"], result
     combined = run_import_aware_selection({
         "README.md": "changed\n", "known-missing-money-atoms.yaml": "changed\n",
     })
+    assert_selection(combined, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(combined, shard, selection_files(), "full-selection-fallback")
     assert "ledger change: known-missing-money-atoms.yaml" in combined["scope-diagnostics"], combined
     assert "shared/root path: README.md" in combined["scope-diagnostics"], combined
     # A shared validation input is a sufficient global witness and also
@@ -1800,21 +1832,24 @@ def test_import_selection_program_scopes_and_proof_provenance() -> None:
         result = run_import_aware_selection(
             {program: files[program] + "# changed\n"}, files=files, shape_programs=(program,),
         )
-        assert_selection(result, ["us-fl"], revalidate=[])
-        assert result["targets"]["us-fl"] == ("changed", [], [])
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
         manifest = ".axiom/encoding-manifests/programs/wrong-name.json"
         result = run_import_aware_selection({manifest: selection_manifest(program)}, files=files)
         assert_selection(result, ["us-fl"], revalidate=[])
         assert result["targets"]["us-fl"] == ("changed", [], [])
-        for provider, owner in (("us/statutes/local.yaml", "us"), ("us-fl/regulations/independent.yaml", "us-fl"), ("us-ma/statutes/local.yaml", "us-ma")):
+        for provider in ("us/statutes/local.yaml", "us-fl/regulations/independent.yaml", "us-ma/statutes/local.yaml"):
             result = run_import_aware_selection({provider: files[provider] + "# changed\n"}, files=files)
-            expected = [s for s in SELECTION_JURISDICTIONS if s in {owner, "us-fl"}]
-            assert_selection(result, expected, revalidate=["us-fl"])
-            assert_full_leg(result, "us-fl", files)
+            assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+            for shard in SELECTION_JURISDICTIONS:
+                assert_full_leg(result, shard, files, "full-selection-fallback")
         # Explicit prefix takes precedence over the federal alias.
         files[program] = selection_program("us-fl", {"federal": ["us-ma:statutes/local"]})
         result = run_import_aware_selection({"us-ma/statutes/local.yaml": files["us-ma/statutes/local.yaml"] + "# changed\n"}, files=files)
-        assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl"])
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
     files = selection_files()
     files["us-sc/statutes/local.yaml"] = selection_module(proof="us-ma:regulations/independent#fixture")
     result = run_import_aware_selection({"us-ma/regulations/independent.yml": files["us-ma/regulations/independent.yml"] + "# changed\n"}, files=files)
@@ -1839,8 +1874,9 @@ def test_import_selection_program_paths_provider_only(program_paths: tuple[str, 
             {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"},
             files=files, shape_programs=(program,),
         )
-        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
-        assert_full_leg(result, "us-fl", files)
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
 
 
 def assert_program_suffix_provider_selection(suffix: str, *, ambiguous: bool) -> None:
@@ -1865,8 +1901,9 @@ def assert_program_suffix_provider_selection(suffix: str, *, ambiguous: bool) ->
         for shard in result["matrix"]:
             assert_full_leg(result, shard, files, "full-selection-fallback")
     else:
-        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
-        assert_full_leg(result, "us-fl", files)
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
 
 
 def test_import_selection_program_yaml_suffix_provider_ambiguity() -> None:
@@ -1922,20 +1959,24 @@ def test_import_selection_program_paths_base_head_and_manifests(program_paths: t
             )
         files[program] = selection_program("us-fl", {"federal": ["statutes/local"]})
         provider_change = {"us/statutes/local.yaml": files["us/statutes/local.yaml"] + "# changed\n"}
-        # The base edge survives removal at head, including deletion of the spec.
+        # A scope edit or deletion can change ownership of any composition.
         for replacement in (selection_program("us-fl", {"state": ["regulations/independent"]}), None):
             result = run_import_aware_selection({**provider_change, program: replacement}, files=files)
-            assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
-            assert_full_leg(result, "us-fl", files)
-        # Head-only specs and state aliases use the declared owner.
+            assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+            for shard in SELECTION_JURISDICTIONS:
+                assert_full_leg(result, shard, files, "full-selection-fallback")
+        # A head-only spec can add a second owner for an unchanged composition.
         result = run_import_aware_selection({**provider_change, program: files[program]}, files=selection_files())
-        assert_selection(result, ["us-fl", "us"], revalidate=["us-fl"])
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, selection_files(), "full-selection-fallback")
         state_files = {**files, program: selection_program("us-fl", {"state": ["statutes/local"]})}
         result = run_import_aware_selection(
             {"us-fl/statutes/local.yaml": state_files["us-fl/statutes/local.yaml"] + "# changed\n"}, files=state_files,
         )
-        assert_selection(result, ["us-fl"], revalidate=["us-fl"])
-        assert_full_leg(result, "us-fl", state_files)
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, state_files, "full-selection-fallback")
         # A manifest-only program edit must use the same declared ownership.
         manifest = ".axiom/encoding-manifests/programs/fixture.json"
         result = run_import_aware_selection({manifest: selection_manifest(program)}, files=files)
@@ -1943,7 +1984,169 @@ def test_import_selection_program_paths_base_head_and_manifests(program_paths: t
         deletion = json.loads(selection_manifest(program))
         deletion["applied_files"][0] = {"path": program, "deleted": True}
         result = run_import_aware_selection({program: None, manifest: json.dumps(deletion)}, files=files)
-        assert_selection(result, ["us-fl"], revalidate=[])
+        assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def program_composition_ownership_fixture() -> tuple[dict[str, str], str, str, str]:
+    # The encoder scans top-level ProgramSpecs across all jurisdictions before
+    # requiring exactly one owner for this unchanged composition. Directory or
+    # declared-program ownership does not bound the scopes that scan can read.
+    composition = "us-ma/policies/snap/composition.yaml"
+    first = "programs/us-ma/base.yaml"
+    second = "programs/us-fl/second.yaml"
+    files = {
+        **selection_files(),
+        composition: "format: rulespec/v1\nmodule: {kind: composition}\nrules: []\n",
+        composition.replace(".yaml", ".test.yaml"): "tests: []\n",
+        first: selection_program("us-ma", {"state": ["policies/snap/composition"]}),
+        "us-sc/policies/consumer.yaml": selection_module("us-ma:policies/snap/composition#fixture"),
+    }
+    return files, composition, first, second
+
+
+def assert_program_change_full_selection(changes: dict[str, str | None], files: dict[str, str]) -> None:
+    result = run_import_aware_selection(changes, files=files)
+    head_files = {path: content for path, content in {**files, **changes}.items() if content is not None}
+    assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(result, shard, head_files, "full-selection-fallback")
+
+
+def test_import_selection_program_added_competing_composition_owner() -> None:
+    files, _, _, second = program_composition_ownership_fixture()
+    assert_program_change_full_selection({
+        second: selection_program("us-fl", {"us-ma": ["policies/snap/composition"]}),
+    }, files)
+
+
+def test_import_selection_program_edited_cross_jurisdiction_scope() -> None:
+    files, _, _, second = program_composition_ownership_fixture()
+    files[second] = selection_program("us-fl", {"state": ["statutes/local"]})
+    assert_program_change_full_selection({
+        second: selection_program("us-fl", {"us-ma": ["policies/snap/composition"]}),
+    }, files)
+
+
+def test_import_selection_program_deleted_composition_owner() -> None:
+    files, _, first, _ = program_composition_ownership_fixture()
+    assert_program_change_full_selection({first: None}, files)
+
+
+def test_import_selection_program_renamed_composition_owner() -> None:
+    files, _, first, second = program_composition_ownership_fixture()
+    # The diff expands this rename to delete/add. Both old and new declarations
+    # still matter even though no RuleSpec module or companion changed.
+    assert_program_change_full_selection({first: None, second: files[first]}, files)
+
+
+def test_import_selection_program_scope_provider_recomposes_other_jurisdiction() -> None:
+    files, _, first, _ = program_composition_ownership_fixture()
+    files[first] = selection_program("us-fl", {
+        "federal": ["statutes/local"],
+        "us-ma": ["policies/snap/composition"],
+    })
+    # Validating the unchanged us-ma composition composes its whole owning
+    # ProgramSpec, so changing another scoped input can alter its result.
+    # The ProgramSpec itself and the composition are unchanged in this diff.
+    provider = "us/statutes/local.yaml"
+    assert_program_change_full_selection({provider: files[provider] + "# changed composition input\n"}, files)
+
+
+def test_import_selection_composition_reads_unrelated_corpus_module() -> None:
+    files, _, _, _ = program_composition_ownership_fixture()
+    # Composer fabe0b3b loads every YAML file in its configured country roots
+    # before scope closure. This unrelated non-list imports field raises at
+    # core.py:321-323 while loading the unchanged us-ma composition's corpus.
+    unrelated = "us-fl/statutes/local.yaml"
+    assert_program_change_full_selection({
+        unrelated: "format: rulespec/v1\nimports: not-a-list\nrules: []\n",
+    }, files)
+
+
+def selection_scalar_import_module(*targets: str, form: str = "sequence", location: str = "summary") -> str:
+    # Pinned encoder 5ddb5ea4 raw import extractors scan the original text,
+    # including block scalars; YAML loading alone loses these effective reads.
+    if location == "summary":
+        prefix = "format: rulespec/v1\nmodule:\n  summary: |\n"
+        indent = "    "
+        suffix = "rules: []\n"
+    else:
+        assert location == "proof"
+        prefix = "format: rulespec/v1\nrules:\n  - name: fixture\n    metadata:\n      proof:\n        evidence: |\n"
+        indent = "          "
+        suffix = ""
+    lines = [prefix, indent + "Multiply gross income by the income rate.\n", indent + "imports:\n"]
+    for index, target in enumerate(targets):
+        if form == "mapping":
+            lines.append(indent + f"  imported_{index}: '{target}'\n")
+        else:
+            assert form in {"sequence", "indentless"}
+            lines.append(indent + ("" if form == "indentless" else "  ") + f"- '{target}'\n")
+    return "".join(lines) + suffix
+
+
+def assert_scalar_import_provider_selection(*, form: str = "sequence", location: str = "summary") -> None:
+    provider = "us/statutes/local.yaml"
+    files = {
+        **selection_files(),
+        "us-ma/statutes/local.yaml": selection_scalar_import_module("us:statutes/local#income_rate", form=form, location=location),
+        "us-sc/statutes/local.yaml": selection_module("us-ma:statutes/local#fixture"),
+    }
+    result = run_import_aware_selection({provider: files[provider] + "# changed provider threshold\n"}, files=files)
+    assert_selection(result, ["us-ma", "us-sc", "us"], revalidate=["us-ma", "us-sc"])
+    for shard in ("us-ma", "us-sc"):
+        assert_full_leg(result, shard, files)
+
+
+def test_import_selection_scalar_summary_sequence_imports() -> None:
+    assert_scalar_import_provider_selection()
+
+
+def test_import_selection_scalar_summary_mapping_imports() -> None:
+    assert_scalar_import_provider_selection(form="mapping")
+
+
+def test_import_selection_scalar_summary_indentless_imports() -> None:
+    assert_scalar_import_provider_selection(form="indentless")
+
+
+def test_import_selection_scalar_proof_evidence_imports() -> None:
+    assert_scalar_import_provider_selection(location="proof")
+
+
+def test_import_selection_scalar_imports_base_head_union() -> None:
+    provider = "us/statutes/local.yaml"
+    consumer = "us-ma/statutes/local.yaml"
+    raw = selection_scalar_import_module("us:statutes/local#income_rate")
+    for old, new in ((raw, selection_module()), (selection_module(), raw)):
+        files = {**selection_files(), consumer: old,
+                 "us-sc/statutes/local.yaml": selection_module("us-ma:statutes/local#fixture")}
+        result = run_import_aware_selection({provider: files[provider] + "# changed\n", consumer: new}, files=files)
+        assert_selection(result, ["us-ma", "us-sc", "us"], revalidate=["us-sc"])
+        assert_full_leg(result, "us-sc", files)
+    # Deleting a provider keeps the raw base-tree edge and contains the now
+    # unresolved head-tree reference to its module and transitive consumers.
+    files = {**selection_files(), consumer: raw,
+             "us-sc/statutes/local.yaml": selection_module("us-ma:statutes/local#fixture")}
+    result = run_import_aware_selection({provider: None, "us/statutes/local.test.yaml": None}, files=files)
+    assert_selection(result, ["us-ma", "us-sc", "us"], revalidate=["us-ma", "us-sc"])
+    for shard in ("us-ma", "us-sc"):
+        assert_full_leg(result, shard, files)
+
+
+def test_import_selection_scalar_unresolved_imports_contained() -> None:
+    files = {
+        **selection_files(),
+        "us-ma/statutes/local.yaml": selection_scalar_import_module("us:statutes/missing#income_rate"),
+        "us-sc/statutes/local.yaml": selection_module("us-ma:statutes/local#fixture"),
+    }
+    result = run_import_aware_selection({"us-fl/statutes/local.yaml": files["us-fl/statutes/local.yaml"] + "# unrelated\n"}, files=files)
+    assert_selection(result, ["us-fl", "us-ma", "us-sc"], revalidate=["us-ma", "us-sc"])
+    assert "contained=us-ma/statutes/local.yaml:" in result["scope-diagnostics"], result
+    for shard in ("us-ma", "us-sc"):
+        assert_full_leg(result, shard, files)
 
 
 def test_import_selection_unresolved_program_ownership_falls_back() -> None:
@@ -2344,43 +2547,43 @@ def test_import_selection_shared_paths_and_toolchains() -> None:
     ]
     for path in paths:
         result = run_import_aware_selection({path: "changed\n"})
-        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[])
-        assert all(target == ("changed", [], []) for target in result["targets"].values()), (path, result)
+        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, selection_files(), "full-selection-fallback")
     # Shared validation records now require full targets as well as all legs.
     result = run_import_aware_selection({
         "known-validation-gaps.yaml": selection_validation_ledger("us-ma/statutes/local.yaml"),
     })
     assert_global_validation_selection(result, selection_files())
-    # A shared change keeps the matrix full while a changed provider still
-    # expands targets in its unchanged importer's leg.
+    # Shared inputs require full targets across the matrix even when a changed
+    # provider has a narrower modeled consumer closure.
     files = selection_files()
     files["us-sc/statutes/local.yaml"] = selection_module("us-ma:statutes/local#fixture")
     result = run_import_aware_selection({
         "tests/test_shared.py": "changed\n",
         "us-ma/statutes/local.yaml": selection_module() + "# changed\n",
     }, files=files)
-    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=["us-sc"])
-    assert_full_leg(result, "us-sc", files)
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
     for path, content, mode in (
-        (".github/workflows/shared.yml", "changed\n", "changed"),
-        (".github/workflows/shared.yaml", "changed\n", "changed"),
+        (".github/workflows/shared.yml", "changed\n", "full-selection-fallback"),
+        (".github/workflows/shared.yaml", "changed\n", "full-selection-fallback"),
         (".axiom/workflow-toolchain.toml", SELECTOR_WORKFLOW_TOOLCHAIN.replace("a" * 40, "d" * 40), "full-toolchain-bump"),
         (".axiom/toolchain.toml", SELECTOR_TOOLCHAIN.replace("b" * 64, "c" * 64), "full-toolchain-bump"),
-        (".axiom/toolchain.toml", SELECTOR_TOOLCHAIN.replace('"before"', '"after"'), "changed-corpus-toolchain-bump"),
+        (".axiom/toolchain.toml", SELECTOR_TOOLCHAIN.replace('"before"', '"after"'), "full-selection-fallback"),
     ):
         result = run_import_aware_selection(
             {path: content}, dependency_pins_changed=path == ".axiom/workflow-toolchain.toml",
         )
-        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[])
+        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
         for shard in result["matrix"]:
-            if mode == "full-toolchain-bump":
-                assert_full_leg(result, shard, selection_files(), mode)
-            else:
-                assert result["targets"][shard] == (mode, [], [])
+            assert_full_leg(result, shard, selection_files(), mode)
     result = run_import_aware_selection({
         ".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace('"before"', '"after"'),
         ".axiom/workflow-toolchain.toml": SELECTOR_WORKFLOW_TOOLCHAIN.replace("a" * 40, "d" * 40),
     }, dependency_pins_changed=True)
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
     for shard in result["matrix"]:
         assert_full_leg(result, shard, selection_files(), "full-toolchain-bump")
     # Full-toolchain priority also wins over module containment.
@@ -2388,9 +2591,155 @@ def test_import_selection_shared_paths_and_toolchains() -> None:
         ".axiom/workflow-toolchain.toml": SELECTOR_WORKFLOW_TOOLCHAIN.replace("a" * 40, "d" * 40),
         "us-fl/statutes/local.yaml": "imports: broken\n",
     }, dependency_pins_changed=True)
-    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=["us-fl"])
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
     for shard in result["matrix"]:
         assert_full_leg(result, shard, selection_files(), "full-toolchain-bump")
+
+
+def test_import_selection_corpus_only_toolchain_change_revalidates_all_modules() -> None:
+    files = selection_files()
+    # The release pin controls corpus proof/source grounding for unchanged
+    # modules in every jurisdiction. A full matrix with empty targets omits
+    # those live checks even though no module blob changed in this diff.
+    result = run_import_aware_selection({
+        ".axiom/toolchain.toml": SELECTOR_TOOLCHAIN.replace('"before"', '"after"'),
+    }, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+    assert "scope=full (toolchain change: .axiom/toolchain.toml)" in result["scope-diagnostics"], result
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def nested_toolchain_fixture() -> dict[str, str]:
+    return {
+        **selection_files(),
+        "us-ma/policies/snap/benefit.yaml": selection_module(),
+        "us-ma/policies/snap/benefit.test.yaml": "tests: []\n",
+    }
+
+
+def nested_toolchain_paths() -> tuple[str, ...]:
+    return (
+        "us-ma/.axiom/toolchain.toml", "us-ma/policies/.axiom/toolchain.toml",
+        "us-ma/.axiom/workflow-toolchain.toml", "us-ma/policies/.axiom/workflow-toolchain.toml",
+    )
+
+
+def assert_nested_toolchain_full_selection(path: str, replacement: str | None, files: dict[str, str]) -> None:
+    result = run_import_aware_selection({path: replacement}, files=files)
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+    assert f"scope=full (toolchain change: {path})" in result["scope-diagnostics"], result
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def test_import_selection_nested_toolchain_added_revalidates_all_modules() -> None:
+    # toolchain._canonical_rulespec_root scans a validated module's ancestors.
+    # A nested toolchain can therefore change or invalidate the context of an
+    # unchanged module even when the checkout-root toolchain is unchanged.
+    for path in nested_toolchain_paths():
+        payload = SELECTOR_WORKFLOW_TOOLCHAIN if path.endswith("workflow-toolchain.toml") else SELECTOR_TOOLCHAIN
+        assert_nested_toolchain_full_selection(path, payload, nested_toolchain_fixture())
+
+
+def test_import_selection_nested_toolchain_edited_revalidates_all_modules() -> None:
+    for path in nested_toolchain_paths():
+        payload = SELECTOR_WORKFLOW_TOOLCHAIN if path.endswith("workflow-toolchain.toml") else SELECTOR_TOOLCHAIN
+        files = {**nested_toolchain_fixture(), path: payload}
+        assert_nested_toolchain_full_selection(path, payload + "# changed nested context\n", files)
+
+
+def test_import_selection_nested_toolchain_deleted_revalidates_all_modules() -> None:
+    for path in nested_toolchain_paths():
+        payload = SELECTOR_WORKFLOW_TOOLCHAIN if path.endswith("workflow-toolchain.toml") else SELECTOR_TOOLCHAIN
+        files = {**nested_toolchain_fixture(), path: payload}
+        assert_nested_toolchain_full_selection(path, None, files)
+
+
+def outside_graph_symlinks() -> tuple[tuple[str, str], ...]:
+    return (
+        (".axiom/index/reference.yaml", "../../us/statutes/local.yaml"),
+        ("sources/reference.yaml", "../us/statutes/local.yaml"),
+    )
+
+
+def assert_nonregular_full_selection(result: dict, files: dict[str, str]) -> None:
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+    assert "scope=full (non-regular checkout input:" in result["scope-diagnostics"], result
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def test_import_selection_symlink_outside_graph_added() -> None:
+    files = selection_files()
+    for path, destination in outside_graph_symlinks():
+        result = run_import_aware_selection({}, files=files, symlink_changes={path: destination})
+        assert_nonregular_full_selection(result, files)
+
+
+def test_import_selection_unchanged_symlink_outside_graph_revalidates_all() -> None:
+    files = selection_files()
+    changed = "us-fl/statutes/local.yaml"
+    for path, destination in outside_graph_symlinks():
+        # Checkout admission walks every path, including unchanged sources and
+        # index paths that have no module dependency identity in the graph.
+        result = run_import_aware_selection({changed: files[changed] + "# changed\n"}, files=files,
+                                            base_symlinks={path: destination})
+        assert_nonregular_full_selection(result, files)
+
+
+def test_import_selection_symlink_outside_graph_base_head_union() -> None:
+    files = selection_files()
+    for path, destination in outside_graph_symlinks():
+        for replacement in (None, "source: repaired regular file\n"):
+            # A head repair or deletion must retain the protected base's
+            # nonregular checkout admission dependency.
+            result = run_import_aware_selection({path: replacement}, files=files,
+                                                base_symlinks={path: destination})
+            assert_nonregular_full_selection(result, files)
+
+
+def test_import_selection_shared_admission_paths_revalidate_all_modules() -> None:
+    files = selection_files()
+    for path, content in (
+        ("US-ZZ/policies/fixture.yaml", selection_module()),
+        ("us-ma/Policies/fixture.yaml", selection_module()),
+        ("sources/context.yaml", "source: updated context\n"),
+    ):
+        # Shared paths can affect checkout admission or source grounding for
+        # unchanged modules. Selecting all legs with no targets skips them.
+        result = run_import_aware_selection({path: content}, files=files)
+        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+        assert f"scope=full (shared/root path: {path})" in result["scope-diagnostics"], result
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
+
+
+def test_import_selection_mixed_country_admission_revalidates_all_modules() -> None:
+    files = selection_files()
+    changes = {
+        "ca/statutes/foreign.yaml": selection_module(),
+        "ca/statutes/foreign.test.yaml": "tests: []\n",
+    }
+    # Atomic paths still participate in the engine's country-root admission.
+    # Adding a second country can invalidate unchanged modules in every leg.
+    result = run_import_aware_selection(changes, files=files)
+    jurisdictions = ["ca", *SELECTION_JURISDICTIONS]
+    assert_selection(result, jurisdictions, jurisdictions=jurisdictions, revalidate=[], full_targets=True)
+    for shard in jurisdictions:
+        assert_full_leg(result, shard, {**files, **changes}, "full-selection-fallback")
+
+
+def test_import_selection_non_utf8_checkout_admission_revalidates_all_modules() -> None:
+    files = selection_files()
+    # Engine content-tree admission rejects invalid UTF-8 names. The selector
+    # conservatively extends that rule even to otherwise exempt index paths.
+    for path in ("us-ma/statutes/bad-\udcff.yaml", ".axiom/index/bad-\udcff.txt"):
+        result = run_import_aware_selection({}, files=files, git_only_changes={path: selection_module()})
+        assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
+        assert "non-UTF-8 checkout input" in result["scope-diagnostics"], result
+        for shard in SELECTION_JURISDICTIONS:
+            assert_full_leg(result, shard, files, "full-selection-fallback")
 
 
 def test_import_selection_events_refs_index_and_opt_in_default() -> None:
@@ -2450,7 +2799,8 @@ def test_import_selection_oregon_descriptive_float_keys() -> None:
     source = selection_module() + "module: {kind: composition, deferred_outputs: []}\ninputs:\n" + inputs
     files = {**selection_files(jurisdictions), oregon: source}
     result = run_import_aware_selection({"us-fl/statutes/local.yaml": files["us-fl/statutes/local.yaml"] + "# changed\n"}, files=files)
-    assert_selection(result, ["us-fl"], jurisdictions=jurisdictions, revalidate=[])
+    assert_selection(result, ["us-fl", "us-or"], jurisdictions=jurisdictions, revalidate=["us-or"])
+    assert_full_leg(result, "us-or", files)
     assert "contained=" not in result["scope-diagnostics"], result
     result = run_import_aware_selection({oregon: source + "# changed\n"}, files=files)
     assert_selection(result, ["us-or"], jurisdictions=jurisdictions, revalidate=[])
@@ -2489,7 +2839,10 @@ def test_import_selection_opaque_module_unrelated_change() -> None:
     result = run_import_aware_selection({changed: files[changed] + "# changed\n"}, files=files)
     assert_selection(result, ["us-fl", "us-ma"], revalidate=["us-fl"])
     assert_full_leg(result, "us-fl", files)
-    assert f"contained={opaque}: imports is not a list" in result["scope-diagnostics"], result
+    # The raw extractor also sees this future mapping form. Either parser
+    # rejects it before publishing the same contained dependency closure.
+    assert any(f"contained={opaque}: {reason}" in result["scope-diagnostics"]
+               for reason in ("imports is not a list", "invalid import: []")), result
     assert "scope=full" not in result["scope-diagnostics"], result
 
 
@@ -2535,10 +2888,10 @@ def test_import_selection_two_opaque_modules_and_shared_change() -> None:
         assert_full_leg(result, shard, files)
         assert f"contained={shard}/statutes/local.yaml:" in result["scope-diagnostics"], result
     result = run_import_aware_selection({"README.md": "changed\n"}, files=files)
-    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=["us-fl", "us-sc"])
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=[], full_targets=True)
     assert "scope=full (shared/root path: README.md)" in result["scope-diagnostics"], result
-    for shard in ("us-fl", "us-sc"):
-        assert_full_leg(result, shard, files)
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(result, shard, files, "full-selection-fallback")
 
 
 def test_import_selection_opaque_base_head_and_companion_union() -> None:
@@ -3338,6 +3691,16 @@ def test_import_selection_generated_global_validation_graph_property(cases: rang
                   if node in globals_ or node in head_exists else None
             for node in changed_modules | changed_globals
         }
+        composition_nodes = set()
+        for tree in (files, {**files, **changes}):
+            for node in modules:
+                content = tree.get(node)
+                if content is None:
+                    continue
+                payload = yaml.safe_load(content)
+                module = payload.get("module") if isinstance(payload, dict) else None
+                if isinstance(module, dict) and module.get("kind") == "composition":
+                    composition_nodes.add(node)
         # Global checks are independent sink nodes: changing their shared file
         # or reaching any of their base/head providers requires all leg owners.
         def closure(seeds: set[str], base: dict, head: dict) -> set[str]:
@@ -3356,10 +3719,12 @@ def test_import_selection_generated_global_validation_graph_property(cases: rang
                 affected = expanded
 
         changed = changed_modules | changed_globals
-        true_affected = closure(changed, base_edges, head_edges)
+        # The composer indexes every YAML module before narrowing to scopes.
+        # Its base/head composition consumers must run for every nonempty diff.
+        true_affected = closure(changed | composition_nodes, base_edges, head_edges)
         # Every opaque node is conservatively dependent on every change. Keep
         # its known reverse consumers, including global sink nodes, reachable.
-        affected = closure(changed | opaque, modeled_base, modeled_head)
+        affected = closure(changed | opaque | composition_nodes, modeled_base, modeled_head)
         true_required = (
             set(SELECTION_JURISDICTIONS) if set(globals_) & true_affected
             else {owners[node] for node in true_affected | opaque}
@@ -3404,15 +3769,28 @@ def test_import_selection_generated_graph_property(cases: range = range(20)) -> 
         dependencies = {node: {other for other in modules if rng.random() < 0.17} for node in modules}
         for program in program_owners:
             dependencies[program] = {other for other in modules if rng.random() < 0.17} or {rng.choice(modules)}
-        if case == 0:
-            # A sparse provider-only graph guarantees that the declaration-owned
-            # importer cannot be selected accidentally through another module.
+        if case in {0, 2, 3}:
+            # Sparse cases keep the raw scalar and composition-input obligations
+            # independent of incidental paths in the generated dense graphs.
             dependencies = {node: set() for node in modules}
             dependencies.update({
-                program: {f"{owner}/statutes/generated.yaml"}
+                program: {"us-ca/statutes/generated.yaml"}
                 for program, owner in program_owners.items()
             })
-            dependencies["programs/federal/fixture.yaml"] = {"us/statutes/local.yaml"}
+            # This dependency is rendered only inside module.summary below;
+            # the parsed YAML has no imports container for the selector walk.
+            if case != 3:
+                dependencies["us-ma/statutes/generated.yaml"] = {"us/statutes/local.yaml"}
+            if case == 2:
+                # The unchanged us-ma composition and the changed us provider
+                # are both scoped inputs of the us-fl-owned ProgramSpec.
+                dependencies["programs/federal/fixture.yaml"] = {
+                    "us/statutes/local.yaml", "us-ma/statutes/generated.yaml",
+                }
+            elif case == 3:
+                # The changed provider lies outside all program scopes. The
+                # composer still reads it during the whole-country YAML load.
+                dependencies["programs/federal/fixture.yaml"] = {"us-ma/statutes/generated.yaml"}
             changed_modules = {"us/statutes/local.yaml"}
         else:
             changed_modules = set(rng.sample(modules, rng.randint(1, 3)))
@@ -3420,10 +3798,28 @@ def test_import_selection_generated_graph_property(cases: range = range(20)) -> 
         def target(node: str) -> str:
             return f"{owners[node]}:{node.split('/', 1)[1].removesuffix('.yaml')}#fixture"
 
+        scalar_modules = {
+            node for index, node in enumerate(modules)
+            if (index + case) % 3 == 0
+        } | ({"us-ma/statutes/generated.yaml"} if case == 0 else set())
+        composition_modules = {"us-ma/statutes/generated.yaml"} if case in {2, 3} else set()
+
+        def render_module(node: str, providers: set[str]) -> str:
+            references = [target(provider) for provider in sorted(providers)]
+            if node in scalar_modules and references:
+                content = selection_scalar_import_module(
+                    *references, form=("sequence", "mapping", "indentless")[case % 3],
+                )
+            else:
+                content = selection_module(*references)
+            if node in composition_modules:
+                content = (content.replace("module:\n", "module:\n  kind: composition\n", 1)
+                           if "module:\n" in content else content.replace(
+                               "format: rulespec/v1\n", "format: rulespec/v1\nmodule: {kind: composition}\n", 1))
+            return content
+
         for node in modules:
-            files[node] = selection_module(*[
-                target(provider) for provider in sorted(dependencies[node])
-            ])
+            files[node] = render_module(node, dependencies[node])
         for program, owner in program_owners.items():
             files[program] = selection_program(owner, {
                 "federal": [target(provider).removesuffix("#fixture") for provider in sorted(dependencies[program])],
@@ -3437,9 +3833,12 @@ def test_import_selection_generated_graph_property(cases: range = range(20)) -> 
         for program in changed_programs:
             head_dependencies[program] = head_dependencies[program] or {rng.choice(modules)}
         # Compute the reverse closure independently over both complete trees.
-        # Changed programs are owned directly; only changed atomic providers
-        # seed imports, and programs are sink nodes rather than atomic targets.
-        affected = set(changed_modules)
+        # Unchanged ProgramSpecs are sink nodes whose scopes read providers.
+        # Any changed ProgramSpec, or a changed input reaching one, can alter
+        # composition results outside its declared owner's jurisdiction.
+        # Composer builds its corpus index before narrowing to scoped inputs;
+        # every changed module can affect every unchanged composition.
+        affected = set(changed_modules) | composition_modules
         while True:
             expanded = affected | {
                 node for node in nodes
@@ -3450,11 +3849,11 @@ def test_import_selection_generated_graph_property(cases: range = range(20)) -> 
             if expanded == affected:
                 break
             affected = expanded
-        required = {owners[node] for node in affected | changed_programs}
+        program_affected = bool(changed_programs or set(program_owners) & affected)
+        required = (set(SELECTION_JURISDICTIONS) if program_affected
+                    else {owners[node] for node in affected})
         changes = {
-            node: selection_module(*[
-                target(provider) for provider in sorted(head_dependencies[node])
-            ]) + f"# change {case}\n"
+            node: render_module(node, head_dependencies[node]) + f"# change {case}\n"
             for node in changed_modules
         }
         changes.update({
@@ -3471,11 +3870,17 @@ def test_import_selection_generated_graph_property(cases: range = range(20)) -> 
         for node in affected | changed_programs:
             assert owners[node] in result["matrix"] or full_fallback, (case, node, dependencies, changed, result)
         assert required <= set(result["matrix"]), (case, dependencies, changed, result)
+        head_files = {**files, **changes}
+        if program_affected:
+            assert_selection(result, SELECTION_JURISDICTIONS, full_targets=True)
+            for shard in SELECTION_JURISDICTIONS:
+                assert_full_leg(result, shard, head_files, "full-selection-fallback")
+            continue
         expected = [shard for shard in SELECTION_JURISDICTIONS if shard in required]
         revalidate = [shard for shard in SELECTION_JURISDICTIONS if any(owners[node] == shard for node in affected - changed_modules)]
         assert_selection(result, expected, revalidate=revalidate)
         for shard in revalidate:
-            assert_full_leg(result, shard, files)
+            assert_full_leg(result, shard, head_files)
         for shard in set(expected) - set(revalidate):
             targets = sorted(node for node in changed_modules if owners[node] == shard)
             companions = sorted(node.removesuffix(".yaml") + ".test.yaml" for node in targets if node.removesuffix(".yaml") + ".test.yaml" in files)
@@ -3583,6 +3988,18 @@ def run_selector_tests() -> None:
         test_import_selection_program_candidate_location_ambiguity,
         test_import_selection_program_requires_canonical_yaml_provider,
         test_import_selection_program_paths_base_head_and_manifests,
+        test_import_selection_program_added_competing_composition_owner,
+        test_import_selection_program_edited_cross_jurisdiction_scope,
+        test_import_selection_program_deleted_composition_owner,
+        test_import_selection_program_renamed_composition_owner,
+        test_import_selection_program_scope_provider_recomposes_other_jurisdiction,
+        test_import_selection_composition_reads_unrelated_corpus_module,
+        test_import_selection_scalar_summary_sequence_imports,
+        test_import_selection_scalar_summary_mapping_imports,
+        test_import_selection_scalar_summary_indentless_imports,
+        test_import_selection_scalar_proof_evidence_imports,
+        test_import_selection_scalar_imports_base_head_union,
+        test_import_selection_scalar_unresolved_imports_contained,
         test_import_selection_unresolved_program_ownership_falls_back,
         test_import_selection_graph_parse_and_read_failures,
         test_import_selection_c_and_python_loader_safety_parity,
@@ -3596,6 +4013,16 @@ def run_selector_tests() -> None:
         test_import_selection_yaml_merge_ny_companion_unrelated_leg,
         test_import_selection_documents_cached_by_blob_across_trees,
         test_import_selection_shared_paths_and_toolchains,
+        test_import_selection_corpus_only_toolchain_change_revalidates_all_modules,
+        test_import_selection_nested_toolchain_added_revalidates_all_modules,
+        test_import_selection_nested_toolchain_edited_revalidates_all_modules,
+        test_import_selection_nested_toolchain_deleted_revalidates_all_modules,
+        test_import_selection_symlink_outside_graph_added,
+        test_import_selection_unchanged_symlink_outside_graph_revalidates_all,
+        test_import_selection_symlink_outside_graph_base_head_union,
+        test_import_selection_shared_admission_paths_revalidate_all_modules,
+        test_import_selection_mixed_country_admission_revalidates_all_modules,
+        test_import_selection_non_utf8_checkout_admission_revalidates_all_modules,
         test_import_selection_events_refs_index_and_opt_in_default,
         test_import_selection_oregon_descriptive_float_keys,
         test_import_selection_descriptive_float_keys_preserve_dependencies,
@@ -3636,7 +4063,7 @@ def run_selector_tests() -> None:
     for test in tests:
         test()
         print(f"{test.__name__}: passed", flush=True)
-    print("actual workflow selectors: passed (24 generated opaque graph cases; 24 generated global-validation graph cases; 20 generated module/program graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
+    print("actual workflow selectors: passed (24 generated opaque graph cases; 24 generated global-validation graph cases; 20 generated module/program/scalar-import graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
 
 
 def literal_pin_caller(pins: dict[str, str]) -> str:

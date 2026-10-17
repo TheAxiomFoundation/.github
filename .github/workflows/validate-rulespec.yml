@@ -1504,6 +1504,30 @@ jobs:
                           return parts[0]
                       return None
 
+                  # Composition validation scans every ProgramSpec to require
+                  # exactly one owner (:35790/:35920 in encoder 5ddb5ea4).
+                  # A new scope can invalidate an unchanged composition in any
+                  # jurisdiction, independent of the declared program owner.
+                  # Include additions/deletions and both sides of a rename.
+                  changed_programs = sorted(path for path in changed if program_spec_path(path))
+                  if changed_programs:
+                      full("ProgramSpec changed: " + ", ".join(changed_programs), full_targets=True)
+
+                  # Corpus-only toolchain bumps deliberately retain changed-file
+                  # target mode in the default path. With import-aware selection
+                  # the new release can change source/proof grounding for every
+                  # unchanged module, so expand atomic targets as well as legs.
+                  changed_toolchains = sorted(path for path in changed if path in {
+                      ".axiom/toolchain.toml", ".axiom/workflow-toolchain.toml",
+                  } or path.endswith(("/.axiom/toolchain.toml", "/.axiom/workflow-toolchain.toml")))
+                  if changed_toolchains:
+                      full("; ".join("toolchain change: " + path for path in changed_toolchains), full_targets=True)
+
+                  # Engine admission checks every jurisdiction against the
+                  # country of its canonical checkout, before loading imports.
+                  if len({shard.split("-", 1)[0] for shard in all_shards}) != 1:
+                      full("mixed-country checkout admission", full_targets=True)
+
                   def tree(ref):
                       result = subprocess.run(["git", "ls-tree", "-r", "-z", ref],
                                               check=True, stdout=subprocess.PIPE)
@@ -1516,6 +1540,21 @@ jobs:
                       return entries
 
                   trees = [tree(base), tree(head)]
+                  if any(0xD800 <= ord(char) <= 0xDFFF
+                         for entries in trees for path in entries for char in path):
+                      # os.fsdecode retains invalid Git filename bytes through
+                      # surrogateescape. Engine root admission rejects non-UTF-8
+                      # entries; conservatively cover every such Git path,
+                      # including otherwise exempt derived index paths.
+                      full("non-UTF-8 checkout input", full_targets=True)
+                  # The encoder and engine reject checkout-wide indirection,
+                  # including paths outside module inputs and derived indexes.
+                  # Name/extension layout gates do not enforce this predicate.
+                  nonregular_paths = sorted({path for entries in trees
+                                             for path, (mode, kind, _oid) in entries.items()
+                                             if kind != "blob" or mode not in {"100644", "100755"}})
+                  if nonregular_paths:
+                      full("non-regular checkout input: " + ", ".join(nonregular_paths), full_targets=True)
                   # These checks consume modules across jurisdiction boundaries.
                   # Pending fingerprints were historically checked in every leg;
                   # a local source edit can therefore invalidate the whole matrix.
@@ -1656,6 +1695,7 @@ jobs:
                   node_owners = {}
                   program_owners = {}
                   opaque_modules = set()
+                  composition_modules = set()
                   opaque_exports = set()
                   executable_modules = {}
                   contained_reasons = set()
@@ -1927,6 +1967,37 @@ jobs:
                                       edge(resolve(imported["target"]), importer)
                               pending.extend(value.values())
 
+                      def raw_import_edges(content, importer):
+                          # The two raw import extractors in encoder 5ddb5ea4
+                          # (:31118/:37817) have identical matching semantics.
+                          # Run on original text: YAML parsing alone loses live
+                          # imports in block scalars, comments and mapping forms.
+                          item_pattern = re.compile(r"^\s*-\s*(['\"]?)([^'\"]+?)\1\s*$")
+                          mapping_pattern = re.compile(r"^\s*[A-Za-z_]\w*:\s*(['\"]?)([^'\"]+?)\1\s*$")
+                          in_imports = False
+                          imports_indent = 0
+                          for line in content.splitlines():
+                              match = re.match(r"^(\s*)imports:\s*$", line)
+                              if match:
+                                  in_imports = True
+                                  imports_indent = len(match.group(1))
+                                  continue
+                              if not in_imports or not line.strip():
+                                  continue
+                              indent = len(line) - len(line.lstrip())
+                              sequence_item = indent == imports_indent and item_pattern.match(line)
+                              if indent <= imports_indent and not sequence_item:
+                                  in_imports = False
+                                  continue
+                              match = item_pattern.match(line) or mapping_pattern.match(line)
+                              if match:
+                                  target = match.group(2).strip().strip("\"'")
+                                  if target:
+                                      # Noncanonical/local spellings that the
+                                      # encoder can resolve contain this importer
+                                      # through the normal opacity fallback.
+                                      edge(resolve(target), importer)
+
                       # Read small inputs first, preferring watched modules
                       # at equal size. A global opacity witness can avoid
                       # parsing unrelated, large documents.
@@ -1946,8 +2017,17 @@ jobs:
                           try:
                               payload = document(entries, path)
                               if not is_companion(path):
+                                  module = payload.get("module")
+                                  if isinstance(module, dict) and module.get("kind") == "composition":
+                                      # The pinned composer loads every YAML
+                                      # module in its roots before scope closure
+                                      # (axiom-compose fabe0b3b core.py:368).
+                                      # Even an unrelated edit can break loading
+                                      # or export indexing for this composition.
+                                      composition_modules.add(key)
                                   executable_edges(payload, key)
                                   exports_known = True
+                                  raw_import_edges(blobs[entries[path][2]].decode("utf-8"), key)
                               dependency_edges(payload, key, companion=is_companion(path))
                           except Exception as error:
                               # Ownership is established before parsing. Unknown
@@ -2090,13 +2170,20 @@ jobs:
                           )
                           full_reasons.append(f"{category}: {path}")
 
-                  affected = seeds | opaque_modules
+                  affected = seeds | opaque_modules | composition_modules
                   pending = list(affected)
                   while pending:
                       for importer in reverse.get(pending.pop(), ()):
                           if importer not in affected:
                               affected.add(importer)
                               pending.append(importer)
+                  affected_programs = sorted(node for node in affected if node.startswith("program:"))
+                  if affected_programs:
+                      # Ownership follows forward imports from scopes, and a
+                      # composition check executes the whole owning ProgramSpec
+                      # (:35811/:35956). A changed input may therefore affect a
+                      # different, unchanged composition reached by that scope.
+                      full("ProgramSpec input dependency: " + ", ".join(affected_programs), full_targets=True)
                   global_affected = affected & global_validation_modules
                   if global_affected:
                       full("global validation dependency: closure " + ", ".join(sorted(global_affected)),
@@ -2105,10 +2192,14 @@ jobs:
                   revalidate = {node_owners[node] for node in affected
                                 if node in node_owners
                                 and (node not in changed_modules or node in opaque_modules)}
-                  if full_reasons or not selected:
+                  if full_reasons:
+                      # A full matrix alone can leave every atomic target list
+                      # empty. Shared inputs may change checkout admission or
+                      # validation setup for unchanged modules in any leg.
+                      full("; ".join(sorted(full_reasons)), full_targets=True)
+                  if not selected:
                       selected = shard_set
-                      reason = "; ".join(sorted(full_reasons)) or "no affected jurisdiction (index-only diff)"
-                      print(f"scope=full ({reason})", file=sys.stderr)
+                      print("scope=full (no affected jurisdiction (index-only diff))", file=sys.stderr)
                   elif selected == shard_set:
                       print("scope=full (modeled import closure covers all jurisdictions)", file=sys.stderr)
                   else:

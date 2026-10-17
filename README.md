@@ -111,6 +111,25 @@ may coexist with import evidence. Null-valued floating-point mapping keys from
 unquoted commas in descriptive flow mappings name no dependency and are ignored;
 all mapping values are still scanned for import evidence.
 
+The selector also runs the pinned encoder's raw import matching logic on each
+original module blob. This preserves effective imports embedded in YAML scalar
+text, including summaries and proof evidence, sequence and mapping forms, and
+indentless sequences. Noncanonical references use the owning module's opacity
+fallback and retain its reverse consumers.
+
+Every ProgramSpec addition, edit, deletion or rename selects all legs with full
+atomic and companion targets. A dependency closure reaching an unchanged
+ProgramSpec does the same: validating a composition executes the whole owning
+program, including other scoped inputs reached through imports. The pinned
+composer loads all YAML modules in its configured roots before narrowing scope,
+so known composition modules are always seeded on nonempty diffs, together with
+their reverse consumers. Strictly unreadable modules already receive the same
+containment. These conservative rules cover ownership conflicts and unrelated
+corpus-load failures. Opted-in toolchain changes also select full targets,
+including corpus-only release changes that can alter source and proof grounding
+without an atomic module edit. Nested toolchain paths also require full targets:
+an added configuration can make unchanged modules fail ancestor admission.
+
 Source-relation targets also create edges, including `restates` records without
 imports, and every `basis.delegation` reference. All five relation types
 (`amends`, `delegates`, `implements`, `restates`, `sets`) retain their targets.
@@ -124,9 +143,10 @@ A bare proof-import symbol such as `reciprocal_japan_duty_rate` names no file;
 the encoder skips it in its hash check, so it creates no edge or opacity. The
 tariff overlay's active waiver continues to have its existing global effect
 when a change reaches that overlay.
-The minimal bare-overlay regression selects just `us` for an unrelated federal
-tariff edit. A real-tree changed-path probe at the revision below for the
-federal `china-301/list-1-9903-88-03` overlay still selects 52 legs with full
+At selector ref `37eaac2af`, the builder-reported minimal bare-overlay regression
+selects just `us` for an unrelated federal tariff edit. Its real-tree changed-path
+probe at rulespec-us `d8511cca76b060e40fba90ae8af7f7643e6edf11` for the
+federal `china-301/list-1-9903-88-03` overlay selects 52 legs with full
 targets: another module, `us/regulations/42-cfr/457/344.yaml`, has the unresolved
 target `us:regulation/42/457/344` and is named by shared validation evidence.
 Its required containment causes global selection; the tariff overlay is no
@@ -171,9 +191,9 @@ attributed safely to one jurisdiction. These rules preserve historical
 whole-ledger checks and the compatibility audit for older encoders, even when
 the shared file itself is unchanged.
 
-This round keeps that whole-ledger rule unchanged. At rulespec-us `origin/main`
-`d8511cca76b060e40fba90ae8af7f7643e6edf11`, 3,607 of 4,879 atomic modules
-(73.9%) are directly named by the union of shared validation records. A change
+The round-5 builder-reported census at selector ref `37eaac2af` and rulespec-us
+`d8511cca76b060e40fba90ae8af7f7643e6edf11` found 3,607 of 4,879 atomic modules
+(73.9%) directly named by the union of shared validation records. A change
 to any of them therefore requires all 52 legs with full targets; transitive
 dependencies can increase that cost. Per-leg partitioning is separate work.
 
@@ -202,16 +222,23 @@ selection expands to all legs with full targets.
 Ownership ambiguity, orphan companions, shared/root paths, toolchain and
 workflow changes, and failures that cannot be attributed to a single module
 retain global full selection. Graph-read and program-ownership failures still
-use full targets globally. Revalidated importer legs also run the
+use full targets globally. Every shared/root fallback now expands atomic and
+companion targets as well as the matrix. Any nonregular tracked entry in either
+tree also requires full targets, including symlinks under derived index paths:
+the encoder's checkout admission reads beyond the module graph. Regular
+index-only metadata retains its existing target behavior.
+Mixed-country roots and non-UTF-8 tracked names also use full targets, covering
+the engine's country/name admission checks. The invalid-name fallback
+conservatively includes derived index paths.
+Revalidated importer legs also run the
 stricter changed-file oracle-coverage check over every atomic module in the
 leg.
 
 Full-matrix selections report specific reasons. The import-aware classifier logs
 `scope=full (...)` for uncontained graph failures, shared/root paths, toolchain or ledger
 changes, index-only diffs, and a modeled dependency closure covering every
-jurisdiction. Other shared paths keep their existing target behavior;
-ledger/digest and audit-manifest changes can still require all legs. This input remains
-disabled unless a caller opts in.
+jurisdiction. Shared paths, ledger/digest and audit-manifest changes require all
+legs with full targets. This input remains disabled unless a caller opts in.
 The default selector remains unchanged; [TheAxiomFoundation/.github#140](https://github.com/TheAxiomFoundation/.github/issues/140)
 tracks the corresponding dependency gap in that path.
 
@@ -228,11 +255,50 @@ before opt-in. Compare selected and full validation on the same base/head
 revisions and pinned inputs; require that selection misses no deterministic
 validation failure and preserves global gates and exhaustive waiver coverage.
 Keep the input disabled until both the audit prerequisite and replay are met.
-Rounds 4 and 5 each replayed all 53 historical exact pairs with no omitted
-recorded failures. Every pair selected all 52 legs with full targets: shared
+Historical replays at round-4 ref `bcae0f3` and round-5 ref `37eaac2af` each
+executed all 53 exact pairs with no omitted recorded failures. These are
+builder-reported executions whose retained workflow hashes match those refs.
+Every pair selected all 52 legs with full targets: shared
 validation records and required containment cause global selection on this
 sample. It demonstrates no matrix reduction. Caller runtime and audit
 prerequisites remain necessary before opt-in.
+
+The round-5 scanner's conclusion that remaining summary references were always
+prose was refuted by the independent review at `37eaac2af`: the pinned encoder
+recognizes raw `imports:` blocks inside YAML scalars, including `module.summary`.
+That review also demonstrated a ProgramSpec ownership dependency omitted by
+the selector. Historical replay and scanner counts do not establish completeness
+over those accepted input shapes.
+
+The round-6 source audit uses encoder `5ddb5ea4`, engine `89571cc2` and the
+encoder's pinned composer (its exact ref is retained in the audit), with selector
+candidate workflow SHA-256
+`28dc0e91f5666abdc3354a3a1b32181e16e35ca846ad73199a33c7f1ac2d1cb3`
+(parent `37eaac2af`). It enumerates 207 distinct source locations in 84 reader
+rows: 61 modeled edges, 17 containment, 55 global handling and 74 explicit scope
+exclusions, with no unhandled entry. Another 49 in-memory YAML parsing sites
+are listed separately. The audited command is deterministic
+`validate --skip-reviewers` without an oracle, together with the workflow's
+shared ledger gates and the actual composer/engine readers. Fixed protected
+runtime inputs and inactive command branches have explicit scope reasons.
+The newly covered classes are raw scalar imports, program ownership and
+composition inputs, eager composer corpus loading, corpus/toolchain changes,
+and checkout admission. This source audit does not establish hosted timing.
+
+At that round-6 candidate, all eight workflow suites pass: 97 selector functions,
+44 other validation guards, terminal assertions, 13 lane tests and the seven
+remaining CI entrypoints. All 22 new fixtures and the extended 20-case generated
+property pass, with assertion-guarded red results at `37eaac2af`. The same 53
+historical exact pairs each select all 52 legs with full atomic targets, with
+zero misses in every class and no compute errors or missing-object skips.
+The emitted reasons are 13 direct shared-record dependencies, 17 shared-record
+closures, 20 toolchain changes and three ProgramSpec changes. This sample
+demonstrates no matrix reduction. Default-off passes 34/34 comparisons against
+`9282a7f69cbc82e6e2b8e8c923a00ff513e29969`: 522 raw byte comparisons,
+13,002 bytes and zero differences. Changed-workflow and repository-wide
+actionlint pass with zero diagnostics. These are local fixture and selection
+measurements; selected-versus-full hosted validation and runtime adoption
+checks remain necessary.
 
 Measure the real `Compute validation shards` step during that replay, including
 both git trees, with the timing harness (Python with PyYAML and Bash 4+ required):
