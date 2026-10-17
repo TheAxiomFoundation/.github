@@ -5,7 +5,7 @@
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-15 — Merge pull request #133 from TheAxiomFoundation/nzhub/wep-s75-land | 0 | nz-rulespec-2026-07-25 | e0ce1ca9befd45022287675c919db31e83d61850 | success |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-15 — Merge pull request #1772 from TheAxiomFoundation/hub/retire-key-reader | 96 | us-rulespec-2026-10-13-snap-fy2026-memo-source-corrected | ${{ | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-15 — Merge pull request #1772 from TheAxiomFoundation/hub/retire-key-reader | 96 | us-rulespec-2026-10-13-snap-fy2026-memo-source-corrected | ${{ | queued |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-15 — Merge pull request #466 from TheAxiomFoundation/hub/retire-key-reader | 37 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | failure |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
