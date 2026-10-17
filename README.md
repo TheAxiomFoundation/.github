@@ -104,14 +104,143 @@ evidence to retain at the exact adopted validator SHA.
 
 The `import-aware-selection` input defaults to `false`. With automatic roots,
 opted-in pull requests select changed jurisdictions and transitive importers
-from both base and head trees. Unchanged affected importers receive full atomic
-validation in their selected legs. An unresolved graph selects the full matrix
-and full targets. In particular, an import whose jurisdiction is not a
-discovered shard, anywhere in either tree, forces every PR to use the full
-matrix and full targets. Such out-of-repository imports can make opt-in more
-expensive than default selection. Revalidated importer legs also run the
+from both base and head trees. Import evidence on any encoder-supported proof
+kind (including `parameter`) creates the same dependency edge as `kind: import`.
+This includes self imports, companion tests and nested metadata; source evidence
+may coexist with import evidence. Null-valued floating-point mapping keys from
+unquoted commas in descriptive flow mappings name no dependency and are ignored;
+all mapping values are still scanned for import evidence.
+
+The selector also runs the pinned encoder's raw import matching logic on each
+original module blob. This preserves effective imports embedded in YAML scalar
+text, including summaries and proof evidence, sequence and mapping forms, and
+indentless sequences. Noncanonical references use the owning module's opacity
+fallback and retain its reverse consumers.
+
+Every ProgramSpec addition, edit, deletion or rename selects all legs with full
+atomic and companion targets. A dependency closure reaching an unchanged
+ProgramSpec does the same: validating a composition executes the whole owning
+program, including other scoped inputs reached through imports. The pinned
+composer loads all YAML modules in its configured roots before narrowing scope,
+so known composition modules are always seeded on nonempty diffs, together with
+their reverse consumers. Strictly unreadable modules already receive the same
+containment. These conservative rules cover ownership conflicts and unrelated
+corpus-load failures. Opted-in toolchain changes also select full targets,
+including corpus-only release changes that can alter source and proof grounding
+without an atomic module edit. Nested toolchain paths also require full targets:
+an added configuration can make unchanged modules fail ancestor admission.
+
+Source-relation targets also create edges, including `restates` records without
+imports, and every `basis.delegation` reference. All five relation types
+(`amends`, `delegates`, `implements`, `restates`, `sets`) retain their targets.
+Resolution follows the pinned encoder's canonical jurisdiction and atomic-root
+parser: trim outer whitespace/quotes and append `.yaml` unless already present.
+Unresolved or unsupported references are contained to their owning module.
+Scalar `derived_relation.source_relation` references also create direct edges.
+Absolute references in companion input/output/table keys and deferred-output
+`blocked_by` references also create edges. These compose transitively with imports.
+A bare proof-import symbol such as `reciprocal_japan_duty_rate` names no file;
+the encoder skips it in its hash check, so it creates no edge or opacity. The
+tariff overlay's active waiver continues to have its existing global effect
+when a change reaches that overlay.
+At selector ref `37eaac2af`, the builder-reported minimal bare-overlay regression
+selects just `us` for an unrelated federal tariff edit. Its real-tree changed-path
+probe at rulespec-us `d8511cca76b060e40fba90ae8af7f7643e6edf11` for the
+federal `china-301/list-1-9903-88-03` overlay selects 52 legs with full
+targets: another module, `us/regulations/42-cfr/457/344.yaml`, has the unresolved
+target `us:regulation/42/457/344` and is named by shared validation evidence.
+Its required containment causes global selection; the tariff overlay is no
+longer opaque. This probe substitutes a changed path against identical trees;
+it is separate from the exact-pair historical replay.
+
+Sibling dependencies cover additions, removals, renames and content edits.
+The encoder's section is wider than the immediate directory: statutes use
+title/section, CFR regulations use CFR-title/part/section, and other regulations
+use title/section, including all descendants and the section-root module.
+Immediate siblings also share exported-name checks, and child modules feed
+ancestor-module checks under every atomic root. Synthetic group nodes preserve
+these dependencies without building a quadratic graph. Statute membership
+changes additionally revalidate every local numeric-title statutory module:
+cross-section definition and placeholder checks can infer references from text
+and depend on the existence of a previously absent section. Executable rules
+with matching names create conservative upstream edges within a jurisdiction
+and from its ancestor jurisdictions, covering the encoder's duplicate-rule
+signature check.
+If strict parsing hides a provider's exported names, its containment also
+reaches every possible executable-name consumer in its jurisdiction and
+descendant jurisdictions. This covers duplicate-key documents that the
+encoder's permissive name index can still read.
+
+These rules mirror axiom-encode `5ddb5ea4`,
+`src/axiom_encode/harness/validator_pipeline.py`: source targets at 33645/33705,
+companion references at 34636, blockers at 35272, same-section boundaries at
+30164, sibling names at 30322, child checks at 30689/32399, descendant terms at
+38538, inferred section existence at 37909/38085/39805, executable-name
+indexing at 21087/21192, and bare proof imports at 26564. Delegation resolution
+uses the same target parser through `src/axiom_encode/cli.py:37548/37634`.
+
+Shared validation records also create dependencies. The keys under
+`known-validation-gaps.yaml:validate_failures` and the `modules` keys in
+`.axiom/pending-validation-fingerprints.json` and
+`.axiom/target-validation-passes.json` refer to atomic modules. References are
+unioned across base and head. A change to a referenced module, or a transitive
+provider of that module, requires every leg with full atomic targets. Changes
+to these shared files also require full targets. Missing, malformed or ambiguous
+shared references use the global fallback because their consumers cannot be
+attributed safely to one jurisdiction. These rules preserve historical
+whole-ledger checks and the compatibility audit for older encoders, even when
+the shared file itself is unchanged.
+
+The round-5 builder-reported census at selector ref `37eaac2af` and rulespec-us
+`d8511cca76b060e40fba90ae8af7f7643e6edf11` found 3,607 of 4,879 atomic modules
+(73.9%) directly named by the union of shared validation records. A change
+to any of them therefore requires all 52 legs with full targets; transitive
+dependencies can increase that cost. Per-leg partitioning is separate work.
+
+Repository tests and other first-leg gates run on the first selected leg; their
+coverage moves with that leg. Omitting their historical hosting leg does not
+omit those checks.
+
+Unchanged affected importers receive full atomic validation in their selected
+legs. Unknown proof kinds, unsupported dependency shapes, malformed YAML,
+duplicate keys, and unresolved imports inside a uniquely owned atomic module
+or its companion are contained to that module. The module is treated as
+depending on everything: every nonempty change selects its jurisdiction leg
+with full atomic targets, even when the opaque module itself changed. Its known
+reverse dependents are also selected transitively. Opacity and known edges are
+unioned across both trees, so a head-only repair cannot erase base-tree risk.
+Each distinct file/reason emits `contained=path: reason` once per selection.
+Once an opaque module is known to reach a shared validation consumer, analysis
+can stop with every leg and full targets. Contained diagnostics describe the
+inputs visited before that sufficient global witness was found.
+
+For module-owned import evidence, an unsupported shape hides dependencies of
+that importer. Selecting it on every change covers those dependencies. Seeding
+it into reverse traversal also preserves every known consumer; other opaque
+consumers are always seeded too. If closure reaches a shared validation record,
+selection expands to all legs with full targets.
+Ownership ambiguity, orphan companions, shared/root paths, toolchain and
+workflow changes, and failures that cannot be attributed to a single module
+retain global full selection. Graph-read and program-ownership failures still
+use full targets globally. Every shared/root fallback now expands atomic and
+companion targets as well as the matrix. Any nonregular tracked entry in either
+tree also requires full targets, including symlinks under derived index paths:
+the encoder's checkout admission reads beyond the module graph. Regular
+index-only metadata retains its existing target behavior.
+Mixed-country roots and non-UTF-8 tracked names also use full targets, covering
+the engine's country/name admission checks. The invalid-name fallback
+conservatively includes derived index paths.
+Revalidated importer legs also run the
 stricter changed-file oracle-coverage check over every atomic module in the
 leg.
+
+Full-matrix selections report specific reasons. The import-aware classifier logs
+`scope=full (...)` for uncontained graph failures, shared/root paths, toolchain or ledger
+changes, index-only diffs, and a modeled dependency closure covering every
+jurisdiction. Shared paths, ledger/digest and audit-manifest changes require all
+legs with full targets. This input remains disabled unless a caller opts in.
+The default selector remains unchanged; [TheAxiomFoundation/.github#140](https://github.com/TheAxiomFoundation/.github/issues/140)
+tracks the corresponding dependency gap in that path.
 
 Before a caller opts in, its waiver audit must not land wholesale on the
 selected validation legs. Incremental, change-scoped waiver audit work is tracked
@@ -126,6 +255,50 @@ before opt-in. Compare selected and full validation on the same base/head
 revisions and pinned inputs; require that selection misses no deterministic
 validation failure and preserves global gates and exhaustive waiver coverage.
 Keep the input disabled until both the audit prerequisite and replay are met.
+Historical replays at round-4 ref `bcae0f3` and round-5 ref `37eaac2af` each
+executed all 53 exact pairs with no omitted recorded failures. These are
+builder-reported executions whose retained workflow hashes match those refs.
+Every pair selected all 52 legs with full targets: shared
+validation records and required containment cause global selection on this
+sample. It demonstrates no matrix reduction. Caller runtime and audit
+prerequisites remain necessary before opt-in.
+
+The round-5 scanner's conclusion that remaining summary references were always
+prose was refuted by the independent review at `37eaac2af`: the pinned encoder
+recognizes raw `imports:` blocks inside YAML scalars, including `module.summary`.
+That review also demonstrated a ProgramSpec ownership dependency omitted by
+the selector. Historical replay and scanner counts do not establish completeness
+over those accepted input shapes.
+
+The round-6 source audit uses encoder `5ddb5ea4`, engine `89571cc2` and the
+encoder's pinned composer (its exact ref is retained in the audit), with selector
+candidate workflow SHA-256
+`28dc0e91f5666abdc3354a3a1b32181e16e35ca846ad73199a33c7f1ac2d1cb3`
+(parent `37eaac2af`). It enumerates 207 distinct source locations in 84 reader
+rows: 61 modeled edges, 17 containment, 55 global handling and 74 explicit scope
+exclusions, with no unhandled entry. Another 49 in-memory YAML parsing sites
+are listed separately. The audited command is deterministic
+`validate --skip-reviewers` without an oracle, together with the workflow's
+shared ledger gates and the actual composer/engine readers. Fixed protected
+runtime inputs and inactive command branches have explicit scope reasons.
+The newly covered classes are raw scalar imports, program ownership and
+composition inputs, eager composer corpus loading, corpus/toolchain changes,
+and checkout admission. This source audit does not establish hosted timing.
+
+At that round-6 candidate, all eight workflow suites pass: 97 selector functions,
+44 other validation guards, terminal assertions, 13 lane tests and the seven
+remaining CI entrypoints. All 22 new fixtures and the extended 20-case generated
+property pass, with assertion-guarded red results at `37eaac2af`. The same 53
+historical exact pairs each select all 52 legs with full atomic targets, with
+zero misses in every class and no compute errors or missing-object skips.
+The emitted reasons are 13 direct shared-record dependencies, 17 shared-record
+closures, 20 toolchain changes and three ProgramSpec changes. This sample
+demonstrates no matrix reduction. Default-off passes 34/34 comparisons against
+`9282a7f69cbc82e6e2b8e8c923a00ff513e29969`: 522 raw byte comparisons,
+13,002 bytes and zero differences. Changed-workflow and repository-wide
+actionlint pass with zero diagnostics. These are local fixture and selection
+measurements; selected-versus-full hosted validation and runtime adoption
+checks remain necessary.
 
 Measure the real `Compute validation shards` step during that replay, including
 both git trees, with the timing harness (Python with PyYAML and Bash 4+ required):

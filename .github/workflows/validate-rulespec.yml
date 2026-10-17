@@ -1440,9 +1440,17 @@ jobs:
           if import_aware:
               try:
                   import yaml
+                  from pathlib import PurePosixPath
 
                   atomic_roots = {"statutes", "regulations", "policies", "legislation"}
                   jurisdiction = re.compile(r"[a-z]{2}(?:-[a-z0-9-]+)*")
+                  # Encoder proof kinds describe the claim being proved;
+                  # source/import evidence is independent of that kind.
+                  proof_atom_kinds = {
+                      "amount", "condition", "definition", "default", "effective_period",
+                      "exception", "formula", "import", "ordering", "parameter",
+                      "parameter_table", "predicate", "table_cell", "unit",
+                  }
 
                   def clean_path(path):
                       if not isinstance(path, str) or not path or path.startswith("/"):
@@ -1496,6 +1504,30 @@ jobs:
                           return parts[0]
                       return None
 
+                  # Composition validation scans every ProgramSpec to require
+                  # exactly one owner (:35790/:35920 in encoder 5ddb5ea4).
+                  # A new scope can invalidate an unchanged composition in any
+                  # jurisdiction, independent of the declared program owner.
+                  # Include additions/deletions and both sides of a rename.
+                  changed_programs = sorted(path for path in changed if program_spec_path(path))
+                  if changed_programs:
+                      full("ProgramSpec changed: " + ", ".join(changed_programs), full_targets=True)
+
+                  # Corpus-only toolchain bumps deliberately retain changed-file
+                  # target mode in the default path. With import-aware selection
+                  # the new release can change source/proof grounding for every
+                  # unchanged module, so expand atomic targets as well as legs.
+                  changed_toolchains = sorted(path for path in changed if path in {
+                      ".axiom/toolchain.toml", ".axiom/workflow-toolchain.toml",
+                  } or path.endswith(("/.axiom/toolchain.toml", "/.axiom/workflow-toolchain.toml")))
+                  if changed_toolchains:
+                      full("; ".join("toolchain change: " + path for path in changed_toolchains), full_targets=True)
+
+                  # Engine admission checks every jurisdiction against the
+                  # country of its canonical checkout, before loading imports.
+                  if len({shard.split("-", 1)[0] for shard in all_shards}) != 1:
+                      full("mixed-country checkout admission", full_targets=True)
+
                   def tree(ref):
                       result = subprocess.run(["git", "ls-tree", "-r", "-z", ref],
                                               check=True, stdout=subprocess.PIPE)
@@ -1508,13 +1540,37 @@ jobs:
                       return entries
 
                   trees = [tree(base), tree(head)]
+                  if any(0xD800 <= ord(char) <= 0xDFFF
+                         for entries in trees for path in entries for char in path):
+                      # os.fsdecode retains invalid Git filename bytes through
+                      # surrogateescape. Engine root admission rejects non-UTF-8
+                      # entries; conservatively cover every such Git path,
+                      # including otherwise exempt derived index paths.
+                      full("non-UTF-8 checkout input", full_targets=True)
+                  # The encoder and engine reject checkout-wide indirection,
+                  # including paths outside module inputs and derived indexes.
+                  # Name/extension layout gates do not enforce this predicate.
+                  nonregular_paths = sorted({path for entries in trees
+                                             for path, (mode, kind, _oid) in entries.items()
+                                             if kind != "blob" or mode not in {"100644", "100755"}})
+                  if nonregular_paths:
+                      full("non-regular checkout input: " + ", ".join(nonregular_paths), full_targets=True)
+                  # These checks consume modules across jurisdiction boundaries.
+                  # Pending fingerprints were historically checked in every leg;
+                  # a local source edit can therefore invalidate the whole matrix.
+                  global_validation_inputs = {
+                      "known-validation-gaps.yaml": "validate_failures",
+                      ".axiom/pending-validation-fingerprints.json": "modules",
+                      ".axiom/target-validation-passes.json": "modules",
+                  }
                   # Batch object reads: graph construction does not spawn one
                   # Git process per module and never reads the checkout in place
                   # of a protected base or exact head tree.
                   needed = set()
                   for entries in trees:
                       for path, (mode, kind, oid) in entries.items():
-                          if (atomic_owner(path)
+                          if (path in global_validation_inputs
+                                  or atomic_owner(path)
                                   or program_spec_path(path)
                                   or (path in changed and manifest_prefix(path) is not None)):
                               if kind != "blob" or mode not in {"100644", "100755"}:
@@ -1535,17 +1591,37 @@ jobs:
                       blobs[oid] = payload
 
                   class UniqueLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
-                      pass
+                      def __init__(self, *args, **kwargs):
+                          super().__init__(*args, **kwargs)
+                          self.checked_mappings = set()
+
+                      def flatten_mapping(self, node):
+                          # Check original explicit keys before PyYAML expands
+                          # merges in place, including every merge source. An
+                          # alias may revisit an already flattened mapping.
+                          if node not in self.checked_mappings:
+                              keys = set()
+                              for key_node, _ in node.value:
+                                  if key_node.tag == "tag:yaml.org,2002:merge":
+                                      continue
+                                  if key_node.tag == "tag:yaml.org,2002:value":
+                                      key_node.tag = "tag:yaml.org,2002:str"
+                                  key = self.construct_object(key_node)
+                                  if key in keys:
+                                      raise ValueError("duplicate YAML key")
+                                  keys.add(key)
+                              self.checked_mappings.add(node)
+                          return super().flatten_mapping(node)
 
                   def unique_mapping(loader, node, deep=False):
-                      loader.flatten_mapping(node)
                       mapping = {}
+                      # SafeLoader publishes the mapping before filling it so
+                      # recursive aliases retain their normal object identity.
+                      yield mapping
+                      loader.flatten_mapping(node)
                       for key_node, value_node in node.value:
                           key = loader.construct_object(key_node, deep=deep)
-                          if key in mapping:
-                              raise ValueError("duplicate YAML key")
                           mapping[key] = loader.construct_object(value_node, deep=deep)
-                      return mapping
 
                   UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 
@@ -1566,12 +1642,112 @@ jobs:
                           raise ValueError(f"not a module/program mapping: {path}")
                       return payload
 
+                  def unique_json(pairs):
+                      mapping = {}
+                      for key, value in pairs:
+                          if key in mapping:
+                              raise ValueError("duplicate JSON key")
+                          mapping[key] = value
+                      return mapping
+
+                  # Union both protected trees, including references that head
+                  # deletes or repairs. A shared record has no single module
+                  # owner: malformed or unresolved references stay global.
+                  global_validation_modules = set()
+                  for entries in trees:
+                      for path, field in global_validation_inputs.items():
+                          if path not in entries:
+                              continue
+                          payload = (json.loads(blobs[entries[path][2]], object_pairs_hook=unique_json)
+                                     if path.endswith(".json") else document(entries, path))
+                          if not isinstance(payload, dict):
+                              raise ValueError(f"invalid global validation input: {path}")
+                          if path.endswith(".json") and field not in payload:
+                              raise ValueError(f"missing global validation references: {path}")
+                          records = payload.get(field, {})
+                          if not isinstance(records, dict):
+                              raise ValueError(f"invalid global validation references: {path}")
+                          for target, record in records.items():
+                              if (not isinstance(record, dict) or not atomic_owner(target)
+                                      or is_companion(target)
+                                      or not any(target in other for other in trees)):
+                                  raise ValueError(f"unresolved global validation reference: {path}: {target}")
+                              # Both suffixes would give the same graph identity.
+                              # Do not let a fast global path hide that ambiguity.
+                              key = identity(target)
+                              stem = target.rsplit(".", 1)[0]
+                              if any(all(stem + suffix in other for suffix in (".yaml", ".yml"))
+                                     for other in trees):
+                                  raise ValueError(f"ambiguous global validation reference: {target}")
+                              global_validation_modules.add(key)
+
+                  changed_global_inputs = sorted(set(changed) & global_validation_inputs.keys())
+                  if changed_global_inputs:
+                      full("global validation input changed: " + ", ".join(changed_global_inputs), full_targets=True)
+
+                  direct_global = sorted(path for path in changed
+                                         if atomic_owner(path) and not is_companion(path)
+                                         and identity(path) in global_validation_modules)
+                  if direct_global:
+                      full("global validation dependency: " + ", ".join(direct_global), full_targets=True)
+
                   reverse = {}
                   node_owners = {}
                   program_owners = {}
+                  opaque_modules = set()
+                  composition_modules = set()
+                  opaque_exports = set()
+                  executable_modules = {}
+                  contained_reasons = set()
+                  section_modules = {}
+                  statute_existence_modules = {}
+
+                  def sections(path):
+                      # validator_pipeline.py:30164 (encoder 5ddb5ea4) uses
+                      # Path.stem on every component, then groups statutes by
+                      # title/section, CFR by title/part/section, and other
+                      # regulations by title/section. Descendants count too:
+                      # :30207 tests both a .yaml file and a child directory.
+                      parts = path.split("/")
+                      normalized = [PurePosixPath(part).stem for part in parts[1:]]
+                      root = normalized[0]
+                      count = 4 if (root == "regulations" and len(normalized) >= 4
+                                    and normalized[1].endswith("-cfr")) else 3
+                      groups = {tuple(parts[:-1])}
+                      if root in {"statutes", "regulations"} and len(normalized) >= count:
+                          groups.add((parts[0], *normalized[:count]))
+                      return groups
+
+                  # The --no-renames diff exposes renames as removal/addition.
+                  # A uniquely owned companion shares its module's directory,
+                  # so companion-only changes cannot alter directory existence.
+                  changed_sections = set()
+                  statute_topology_owners = set()
+                  for path in changed:
+                      if (atomic_owner(path) and not is_companion(path)
+                              and ((path in trees[0]) != (path in trees[1]))):
+                          changed_sections.update(sections(path))
+                          if path.split("/")[1] == "statutes":
+                              statute_topology_owners.add(atomic_owner(path))
 
                   def edge(provider, importer):
                       reverse.setdefault(provider, set()).add(importer)
+
+                  def opaque_global_dependency():
+                      if not global_validation_modules or not opaque_modules:
+                          return
+                      pending = list(opaque_modules)
+                      reached = set(pending)
+                      while pending:
+                          node = pending.pop()
+                          if node in global_validation_modules:
+                              # A partial graph is enough to prove all legs
+                              # are required; later inputs cannot enlarge it.
+                              full("global validation dependency: closure " + node, full_targets=True)
+                          for importer in reverse.get(node, ()):
+                              if importer not in reached:
+                                  reached.add(importer)
+                                  pending.append(importer)
 
                   for entries in trees:
                       modules = {}
@@ -1582,6 +1758,36 @@ jobs:
                                   raise ValueError(f"ambiguous module identity: {key}")
                               modules[key] = path
                               node_owners[key] = atomic_owner(path)
+                              parts = path.split("/")
+                              # Cross-statute definition/placeholder checks
+                              # infer references from source text/formulas and
+                              # test file/directory existence (:37880/:38085).
+                              # A membership change revalidates the entire
+                              # finite local domain admitted by :39805, even
+                              # when no explicit import names the new section.
+                              if (parts[1] == "statutes" and re.fullmatch(r"[0-9A-Za-z.-]+", parts[2])
+                                      and any(c.isdigit() for c in parts[2])):
+                                  statute_existence_modules.setdefault(parts[0], set()).add(key)
+                              for section in sections(path):
+                                  section_modules.setdefault(section, set()).add(key)
+                                  # Other encoder checks read sibling exported
+                                  # names (:30322), descendant definitions
+                                  # (:38538), and child exceptions (:32399).
+                                  # A group node models their mutual dependence
+                                  # without materializing a quadratic clique.
+                                  node = "section:" + json.dumps(section)
+                                  edge(key, node)
+                                  edge(node, key)
+
+                      # Child-fragment checks are not restricted to statutes
+                      # and regulations (:30689/:32399). A parent.yaml module
+                      # reads its parent/ descendants in every atomic root.
+                      for key, path in modules.items():
+                          parts = path.split("/")
+                          for length in range(3, len(parts)):
+                              ancestor = parts[0] + ":" + "/".join(parts[1:length])
+                              if ancestor in modules:
+                                  edge(key, ancestor)
 
                       def resolve(target, program=False):
                           if not isinstance(target, str):
@@ -1621,10 +1827,61 @@ jobs:
                               raise ValueError(f"unresolved program import: {target}")
                           return key
 
-                      def dependency_edges(payload, importer):
+                      def resolve_source(target):
+                          # Mirror _parse_rulespec_target (:33705) and canonical
+                          # _resolve_rulespec_target_file (:33968), also used by
+                          # the delegation resolver in cli.py:37548/37634.
+                          # Source refs append .yaml even to a .yml spelling.
+                          if not isinstance(target, str):
+                              raise ValueError("non-string source/delegation target")
+                          match = re.fullmatch(
+                              r"([a-z]{2}(?:-[a-z0-9]+)*):([^#]+)(?:#([^#]+))?",
+                              target.strip().strip("'\""),
+                          )
+                          if match is None:
+                              raise ValueError(f"invalid source/delegation target: {target}")
+                          prefix, relative, _symbol = match.groups()
+                          clean_path(relative)
+                          if relative != relative.strip() or relative.split("/", 1)[0] not in atomic_roots:
+                              raise ValueError(f"invalid source/delegation target: {target}")
+                          path = prefix + "/" + relative + ("" if relative.endswith(".yaml") else ".yaml")
+                          key = identity(path)
+                          if modules.get(key) != path or prefix not in shard_set:
+                              raise ValueError(f"unresolved source/delegation target: {target}")
+                          return key
+
+                      def executable_edges(payload, importer):
+                          if payload.get("format") == "rulespec/v1":
+                              rules = payload.get("rules")
+                              for rule in rules if isinstance(rules, list) else []:
+                                  if (not isinstance(rule, dict) or str(rule.get("kind") or "").strip().lower()
+                                          not in {"parameter", "derived", "derived_relation"}):
+                                      continue
+                                  # Upstream duplicate validation (:21087)
+                                  # indexes executable names in this jurisdiction
+                                  # and its ancestors (:21192). Matching names
+                                  # conservatively covers any signature change.
+                                  executable_modules.setdefault(node_owners[importer], set()).add(importer)
+                                  name = str(rule.get("name") or "<unknown>").strip() or "<unknown>"
+                                  owner_parts = node_owners[importer].split("-")
+                                  own_symbol = "symbol:" + json.dumps([node_owners[importer], name])
+                                  edge(importer, own_symbol)
+                                  for length in range(1, len(owner_parts) + 1):
+                                      upstream = "-".join(owner_parts[:length])
+                                      edge("symbol:" + json.dumps([upstream, name]), importer)
+
+                      def dependency_edges(payload, importer, companion=False):
                           # RuleSpec metadata is open-ended, and companion test
                           # documents can be lists. Visit every mapping/list,
                           # including side channels outside metadata.proof.
+                          def companion_reference(value):
+                              # Absolute test keys resolve a target's exported
+                              # names and input slots (:34636/:34769). Include
+                              # nested keys/values, not just imports evidence.
+                              if (companion and isinstance(value, str)
+                                      and re.match(r"^[a-z]{2}(?:-[a-z0-9]+)*:", value)):
+                                  edge(resolve_source(value), importer)
+
                           pending = [payload]
                           seen = set()
                           while pending:
@@ -1635,6 +1892,7 @@ jobs:
                               if isinstance(value, (tuple, set)):
                                   raise ValueError("unsupported dependency container")
                               if not isinstance(value, (dict, list)):
+                                  companion_reference(value)
                                   continue
                               if id(value) in seen:
                                   continue
@@ -1642,10 +1900,17 @@ jobs:
                               if isinstance(value, list):
                                   pending.extend(value)
                                   continue
-                              # Integer keys occur in RuleSpec versions.values;
-                              # other non-string keys are outside this model.
-                              if any(type(key) not in (str, int) for key in value):
+                              # Integer keys occur in versions.values. Unquoted
+                              # commas in flow-map descriptions/citations can
+                              # also produce float keys with null values. Those
+                              # entries name no provider and hide no container;
+                              # still scan every value for dependency evidence.
+                              if any(type(key) not in (str, int)
+                                     and not (type(key) is float and item is None)
+                                     for key, item in value.items()):
                                   raise ValueError("unsupported dependency mapping key")
+                              for key in value:
+                                  companion_reference(key)
                               if "imports" in value:
                                   imports = value["imports"]
                                   if imports is None:
@@ -1654,10 +1919,40 @@ jobs:
                                       raise ValueError("imports is not a list")
                                   for target in imports:
                                       edge(resolve(target), importer)
-                              if value.get("kind") == "import":
+                              if "source_relation" in value:
+                                  relation = value["source_relation"]
+                                  if isinstance(relation, str):
+                                      # derived_relation.source_relation uses a
+                                      # canonical scalar relation reference.
+                                      target = relation
+                                  elif isinstance(relation, dict) and "target" in relation:
+                                      target = relation["target"]
+                                  else:
+                                      raise ValueError("malformed source relation")
+                                  # All relation types retain target edges; in
+                                  # particular restates verification loads target
+                                  # values at validator_pipeline.py:33645.
+                                  edge(resolve_source(target), importer)
+                              basis = value.get("basis")
+                              if isinstance(basis, dict) and "delegation" in basis:
+                                  edge(resolve_source(basis["delegation"]), importer)
+                              if "blocked_by" in value:
+                                  blockers = value["blocked_by"]
+                                  if blockers is None:
+                                      blockers = []
+                                  if not isinstance(blockers, list):
+                                      raise ValueError("blocked_by is not a list")
+                                  # Deferred-output authentication loads each
+                                  # blocker export (:35272/:35315).
+                                  for target in blockers:
+                                      edge(resolve_source(target), importer)
+                              if value.get("kind") == "import" or "import" in value:
+                                  kind = value.get("kind")
+                                  if not isinstance(kind, str) or kind not in proof_atom_kinds:
+                                      raise ValueError("unknown/missing import evidence proof kind")
                                   # Unknown keys could encode another provider;
                                   # fail closed instead of interpreting a subset.
-                                  if set(value) - {"kind", "path", "import"}:
+                                  if set(value) - {"kind", "path", "source", "import"}:
                                       raise ValueError("unknown import atom key")
                                   if "path" in value and not isinstance(value["path"], str):
                                       raise ValueError("invalid import atom path")
@@ -1666,24 +1961,87 @@ jobs:
                                           or set(imported) - {"target", "output", "hash"}
                                           or any(not isinstance(item, str) for item in imported.values())):
                                       raise ValueError("malformed/unknown import atom payload")
-                                  edge(resolve(imported["target"]), importer)
-                              elif "import" in value:
-                                  raise ValueError("import payload without kind: import")
+                                  # The encoder's proof hash check (:26564)
+                                  # skips bare symbols: they name no file.
+                                  if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", imported["target"]) is None:
+                                      edge(resolve(imported["target"]), importer)
                               pending.extend(value.values())
 
-                      for path in entries:
-                          if not atomic_owner(path):
-                              continue
+                      def raw_import_edges(content, importer):
+                          # The two raw import extractors in encoder 5ddb5ea4
+                          # (:31118/:37817) have identical matching semantics.
+                          # Run on original text: YAML parsing alone loses live
+                          # imports in block scalars, comments and mapping forms.
+                          item_pattern = re.compile(r"^\s*-\s*(['\"]?)([^'\"]+?)\1\s*$")
+                          mapping_pattern = re.compile(r"^\s*[A-Za-z_]\w*:\s*(['\"]?)([^'\"]+?)\1\s*$")
+                          in_imports = False
+                          imports_indent = 0
+                          for line in content.splitlines():
+                              match = re.match(r"^(\s*)imports:\s*$", line)
+                              if match:
+                                  in_imports = True
+                                  imports_indent = len(match.group(1))
+                                  continue
+                              if not in_imports or not line.strip():
+                                  continue
+                              indent = len(line) - len(line.lstrip())
+                              sequence_item = indent == imports_indent and item_pattern.match(line)
+                              if indent <= imports_indent and not sequence_item:
+                                  in_imports = False
+                                  continue
+                              match = item_pattern.match(line) or mapping_pattern.match(line)
+                              if match:
+                                  target = match.group(2).strip().strip("\"'")
+                                  if target:
+                                      # Noncanonical/local spellings that the
+                                      # encoder can resolve contain this importer
+                                      # through the normal opacity fallback.
+                                      edge(resolve(target), importer)
+
+                      # Read small inputs first, preferring watched modules
+                      # at equal size. A global opacity witness can avoid
+                      # parsing unrelated, large documents.
+                      graph_paths = [path for path in entries if atomic_owner(path)]
+                      graph_paths.sort(key=lambda path: (
+                          len(blobs[entries[path][2]]),
+                          identity(module_path(path)) not in global_validation_modules, path,
+                      ))
+                      for path in graph_paths:
                           module = module_path(path)
                           key = identity(module)
                           if modules.get(key) != module:
                               raise ValueError(f"companion has no unique module: {path}")
                           if node_owners[key] not in shard_set:
                               raise ValueError(f"undiscovered module owner: {path}")
+                          exports_known = is_companion(path)
                           try:
-                              dependency_edges(document(entries, path), key)
+                              payload = document(entries, path)
+                              if not is_companion(path):
+                                  module = payload.get("module")
+                                  if isinstance(module, dict) and module.get("kind") == "composition":
+                                      # The pinned composer loads every YAML
+                                      # module in its roots before scope closure
+                                      # (axiom-compose fabe0b3b core.py:368).
+                                      # Even an unrelated edit can break loading
+                                      # or export indexing for this composition.
+                                      composition_modules.add(key)
+                                  executable_edges(payload, key)
+                                  exports_known = True
+                                  raw_import_edges(blobs[entries[path][2]].decode("utf-8"), key)
+                              dependency_edges(payload, key, companion=is_companion(path))
                           except Exception as error:
-                              raise ValueError(f"{path}: {error}") from error
+                              # Ownership is established before parsing. Unknown
+                              # outgoing dependencies can only affect this
+                              # importer, so seed it on every change and retain
+                              # all known incoming edges from either tree.
+                              opaque_modules.add(key)
+                              if not exports_known:
+                                  opaque_exports.add(key)
+                              reason = f"{path}: {' '.join(str(error).split())}"
+                              if reason not in contained_reasons:
+                                  contained_reasons.add(reason)
+                                  print(f"contained={reason}", file=sys.stderr)
+                          opaque_global_dependency()
 
                       for path in entries:
                           if not program_spec_path(path):
@@ -1720,19 +2078,25 @@ jobs:
                           if not count:
                               raise ValueError(f"program scope resolves across entire checkout: {path}")
 
+                  # A strict parse failure can hide exported names which the
+                  # encoder's permissive loader still indexes (duplicate keys
+                  # are one example). Cover every possible implicit consumer
+                  # in the provider's jurisdiction and descendant jurisdictions.
+                  for provider in opaque_exports:
+                      owner = node_owners[provider]
+                      for consumer_owner, consumers in executable_modules.items():
+                          if consumer_owner == owner or consumer_owner.startswith(owner + "-"):
+                              for consumer in consumers:
+                                  edge(provider, consumer)
+
                   owners = set()
-                  seeds = set()
-                  force_full = False
+                  seeds = {key for section in changed_sections
+                           for key in section_modules.get(section, ())}
+                  seeds.update(key for owner in statute_topology_owners
+                               for key in statute_existence_modules.get(owner, ()))
+                  full_reasons = []
                   changed_modules = {identity(path) for path in changed
                                      if atomic_owner(path) and not is_companion(path)}
-
-                  def unique_json(pairs):
-                      mapping = {}
-                      for key, value in pairs:
-                          if key in mapping:
-                              raise ValueError("duplicate manifest key")
-                          mapping[key] = value
-                      return mapping
 
                   for path in changed:
                       owner = atomic_owner(path) or program_owners.get(path)
@@ -1797,21 +2161,49 @@ jobs:
                           if atomic_owner(path) and not is_companion(path):
                               seeds.add(identity(path))
                       elif not path.startswith(".axiom/index/"):
-                          force_full = True
+                          category = (
+                              "toolchain change" if path in {
+                                  ".axiom/toolchain.toml", ".axiom/workflow-toolchain.toml",
+                              } else "ledger change" if path in {
+                                  "known-validation-gaps.yaml", "known-missing-money-atoms.yaml",
+                              } else "shared/root path"
+                          )
+                          full_reasons.append(f"{category}: {path}")
 
-                  affected = set(seeds)
-                  pending = list(seeds)
+                  affected = seeds | opaque_modules | composition_modules
+                  pending = list(affected)
                   while pending:
                       for importer in reverse.get(pending.pop(), ()):
                           if importer not in affected:
                               affected.add(importer)
                               pending.append(importer)
+                  affected_programs = sorted(node for node in affected if node.startswith("program:"))
+                  if affected_programs:
+                      # Ownership follows forward imports from scopes, and a
+                      # composition check executes the whole owning ProgramSpec
+                      # (:35811/:35956). A changed input may therefore affect a
+                      # different, unchanged composition reached by that scope.
+                      full("ProgramSpec input dependency: " + ", ".join(affected_programs), full_targets=True)
+                  global_affected = affected & global_validation_modules
+                  if global_affected:
+                      full("global validation dependency: closure " + ", ".join(sorted(global_affected)),
+                           full_targets=True)
                   selected = owners | {node_owners[node] for node in affected if node in node_owners}
                   revalidate = {node_owners[node] for node in affected
-                                if node in node_owners and node not in changed_modules}
-                  if force_full or not selected:
+                                if node in node_owners
+                                and (node not in changed_modules or node in opaque_modules)}
+                  if full_reasons:
+                      # A full matrix alone can leave every atomic target list
+                      # empty. Shared inputs may change checkout admission or
+                      # validation setup for unchanged modules in any leg.
+                      full("; ".join(sorted(full_reasons)), full_targets=True)
+                  if not selected:
                       selected = shard_set
-                  print("scope=import-aware", file=sys.stderr)
+                      print("scope=full (no affected jurisdiction (index-only diff))", file=sys.stderr)
+                  elif selected == shard_set:
+                      print("scope=full (modeled import closure covers all jurisdictions)", file=sys.stderr)
+                  else:
+                      print("scope=import-aware", file=sys.stderr)
                   emit(selected, revalidate)
                   raise SystemExit
               except Exception as error:
