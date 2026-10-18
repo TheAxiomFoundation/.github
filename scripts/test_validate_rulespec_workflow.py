@@ -2227,8 +2227,10 @@ def selector_document_helpers(loader_base: type | None = None, *, c_available: b
                        and isinstance(node.value.func.value, ast.Name)
                        and node.value.func.value.id == "UniqueLoader"
                        and node.value.func.attr == "add_constructor")
-    cache = next(node for node in nodes if isinstance(node, ast.Assign)
-                 and any(isinstance(target, ast.Name) and target.id == "documents" for target in node.targets))
+    cache = [node for node in nodes if isinstance(node, ast.Assign)
+             and any(isinstance(target, ast.Name) and target.id in {"documents", "deep_documents"}
+                     for target in node.targets)]
+    depth = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "yaml_node_depth_exceeds")
     document = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "document")
     if loader_base is None:
         yaml_module = yaml
@@ -2236,11 +2238,12 @@ def selector_document_helpers(loader_base: type | None = None, *, c_available: b
         # Both names resolve to the requested implementation, exercising the
         # exact constructor with the C and Python SafeLoader code paths.
         yaml_module = types.SimpleNamespace(SafeLoader=loader_base, CSafeLoader=loader_base,
-                                            resolver=yaml.resolver, load=yaml.load)
+                                            resolver=yaml.resolver, load=yaml.load,
+                                            MappingNode=yaml.MappingNode, SequenceNode=yaml.SequenceNode)
         if not c_available:
             del yaml_module.CSafeLoader
     namespace = {"yaml": yaml_module, "is_companion": lambda path: path.endswith((".test.yaml", ".test.yml"))}
-    exec(compile(ast.Module(body=[loader, mapping, constructor, cache, document], type_ignores=[]),
+    exec(compile(ast.Module(body=[loader, mapping, constructor, depth, *cache, document], type_ignores=[]),
                  str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -2502,15 +2505,15 @@ def test_import_selection_yaml_merge_ny_companion_unrelated_leg() -> None:
 
 def test_import_selection_documents_cached_by_blob_across_trees() -> None:
     namespace = selector_document_helpers()
-    original_load = namespace["yaml"].load
     calls = []
 
-    def count_load(payload, **kwargs):
-        calls.append(payload)
-        return original_load(payload, **kwargs)
+    class CountingLoader(namespace["UniqueLoader"]):
+        # document() composes and constructs through one loader per parse.
+        def __init__(self, payload, *args, **kwargs):
+            calls.append(payload)
+            super().__init__(payload, *args, **kwargs)
 
-    import types
-    namespace["yaml"] = types.SimpleNamespace(load=count_load)
+    namespace["UniqueLoader"] = CountingLoader
     namespace["blobs"] = {"same": b"imports: []\nrules: []\n", "changed": b"imports: null\nrules: []\n"}
     base = {"us/statutes/base.yaml": ("100644", "blob", "same")}
     head = {"us/statutes/base.yaml": ("100644", "blob", "same"),
@@ -2535,6 +2538,13 @@ def test_import_selection_documents_cached_by_blob_across_trees() -> None:
     else:
         raise AssertionError("cached companion array accepted as an atomic module")
     assert calls.count(namespace["blobs"]["array"]) == 1, calls
+    # Node depth is measured before merge flattening drops the deep value.
+    namespace["blobs"]["deep"] = b"metadata: {<<: {k: " + b"[" * 70 + b"0" + b"]" * 70 + b"}, k: 1}\n"
+    deep = {"us/statutes/deep.yaml": ("100644", "blob", "deep"), "us-ma/statutes/copy.yaml": ("100644", "blob", "deep")}
+    assert document(deep, "us/statutes/deep.yaml") == {"metadata": {"k": 1}}
+    assert document(deep, "us-ma/statutes/copy.yaml") == {"metadata": {"k": 1}}
+    assert namespace["deep_documents"] == {"deep"}, namespace["deep_documents"]
+    assert calls.count(namespace["blobs"]["deep"]) == 1, calls
 
 
 def test_import_selection_shared_paths_and_toolchains() -> None:
@@ -2842,7 +2852,7 @@ def test_import_selection_opaque_module_unrelated_change() -> None:
     # The raw extractor also sees this future mapping form. Either parser
     # rejects it before publishing the same contained dependency closure.
     assert any(f"contained={opaque}: {reason}" in result["scope-diagnostics"]
-               for reason in ("imports is not a list", "invalid import: []")), result
+               for reason in ("imports is not a list", "invalid import: []", "unsupported local import: []")), result
     assert "scope=full" not in result["scope-diagnostics"], result
 
 
@@ -3357,6 +3367,374 @@ def test_import_selection_parent_child_fragment_dependency() -> None:
         assert_full_leg(result, owner, {**files, **changes})
 
 
+def selection_path_probe_module(summary: str, name: str, formula=1, *imports: str) -> str:
+    """Minimal data for the real encoder predicate counterexamples (pin 5ddb5ea4)."""
+    import yaml
+
+    return yaml.safe_dump({
+        "format": "rulespec/v1", "module": {"summary": summary},
+        "imports": list(imports), "rules": [{
+            "name": name, "kind": "parameter" if isinstance(formula, int) else "derived",
+            "entity": "TaxUnit", "dtype": "money",
+            "versions": [{"effective_from": "2024-01-01", "formula": formula}],
+        }],
+    }, sort_keys=False)
+
+
+def selection_local_read_fixture(kind: str, prefix: str = "us:") -> tuple[dict, dict, str]:
+    make = selection_path_probe_module
+    provider = "us-ca/statutes/26/1.yaml"
+    parent = "us-ca/statutes/17/24.yaml"
+    child = "us-ca/statutes/17/24/a.yaml"
+    reference = prefix + "statutes/26/1#foo"
+    files = {
+        "us/statutes/26/1.yaml": make("Federal provider.", "foo", 100),
+        provider: make("Local provider.", "shared_input", 5),
+        parent: make("Parent provision.", "m_out", "foo + shared_input", reference),
+        child: make("Child provision.", "c_out", "shared_input * 2"),
+    }
+    changes = {provider: make("Local provider.", "unrelated_rate", 5)}
+    if kind == "child-import":
+        files[parent] = make("Parent provision.", "m_out", "shared_input + 1")
+        files[child] = make("Child provision.", "c_out", "shared_input * 2 + foo", reference)
+    elif kind == "transitive":
+        del files[parent]
+        parent = "us-ca/statutes/17/24/b.yaml"
+        files[parent] = make("Except as provided in subsection (c), the amount is the federal amount.",
+                             "b_out", "foo", reference)
+        files["us-ca/statutes/17/24/c.yaml"] = make("Subsection c.", "c_out", 3)
+        files[provider] = make("Local provider.", "x_out", 1, "us-ca:statutes/17/24/c#c_out")
+        changes[provider] = make("Local provider.", "x_out", 1)
+    return files, changes, parent
+
+
+def assert_path_probe_target(files: dict, changes: dict, consumer: str) -> None:
+    result = run_import_aware_selection(changes, files=files)
+    owner = consumer.split("/", 1)[0]
+    assert owner in result["matrix"], (consumer, result)
+    assert consumer in result["targets"][owner][1], (consumer, result)
+
+
+def test_import_selection_prefix_stripped_child_fragment_provider() -> None:
+    assert_path_probe_target(*selection_local_read_fixture("parent-import"))
+
+
+def test_import_selection_prefix_stripped_child_import_provider() -> None:
+    assert_path_probe_target(*selection_local_read_fixture("child-import"))
+
+
+def test_import_selection_prefix_stripped_transitive_provider() -> None:
+    assert_path_probe_target(*selection_local_read_fixture("transitive"))
+
+
+def selection_dotted_read_fixture(section="3.606.1", *, directory=True) -> tuple[dict, dict, str]:
+    make = selection_path_probe_module
+    consumer = f"us-co/regulations/9-ccr-2503-6/{section}/E.yaml"
+    normalized = Path(section).stem
+    provider = f"us-co/regulations/9-ccr-2503-6/{normalized}/2" + ("/A.yaml" if directory else ".yaml")
+    return ({consumer: make("Except as provided in paragraph (2), the allowance is one.", "e_out")},
+            {provider: make("Paragraph 2.", "p2_out", 2)}, consumer)
+
+
+def test_import_selection_multidot_directory_existence() -> None:
+    files, changes, consumer = selection_dotted_read_fixture()
+    assert_path_probe_target(files, changes, consumer)
+    # First-descendant addition and last-descendant deletion both change is_dir.
+    assert_path_probe_target({**files, **changes}, dict.fromkeys(changes), consumer)
+
+
+def test_import_selection_path_control_same_jurisdiction() -> None:
+    assert_path_probe_target(*selection_local_read_fixture("parent-import", "us-ca:"))
+
+
+def test_import_selection_path_control_no_dot() -> None:
+    for directory in (False, True):
+        assert_path_probe_target(*selection_dotted_read_fixture("3606", directory=directory))
+
+
+def test_import_selection_path_control_direct_file() -> None:
+    assert_path_probe_target(*selection_dotted_read_fixture(directory=False))
+
+
+def test_import_selection_local_resolution_parent_fallback_and_suffix() -> None:
+    for reference in ("statutes/26/1", "us:statutes/26/1", "us:statutes/26/1.yml"):
+        files, changes, consumer = selection_local_read_fixture("parent-import")
+        old_provider = "us-ca/statutes/26/1.yaml"
+        normalized = reference.partition(":")[-1]
+        provider = f"us-ca/statutes/17/{normalized}.yaml"
+        files[provider] = files.pop(old_provider)
+        # Prefix-preserving target remains valid, independently of the local read.
+        files["us/" + normalized + ".yaml"] = files["us/statutes/26/1.yaml"]
+        files[consumer] = files[consumer].replace("us:statutes/26/1#foo", reference + "#foo")
+        assert_path_probe_target(files, {provider: changes[old_provider]}, consumer)
+
+
+def test_import_selection_nested_statutes_fallback_containment() -> None:
+    consumer = "us-ca/policies/pilot/statutes/17/24/b.yaml"
+    files = {consumer: selection_path_probe_module("Except for eligible resources.", "allowance")}
+    changes = {"us-ca/statutes/17/24/c.yaml": selection_path_probe_module("Resource definition.", "eligible_resources")}
+    assert_path_probe_target(files, changes, consumer)
+
+
+def test_import_selection_directory_valued_import_candidate() -> None:
+    consumer = "us-ca/policies/consumer/out.yaml"
+    files = {consumer: selection_module("us:policies/provider#fixture"),
+             "us/policies/provider.yaml": selection_module()}
+    for directory in ("us-ca/policies/provider.yaml", "us-ca/policies/consumer/policies/provider.yaml"):
+        # Encoder Path.exists succeeds, then file admission raises. It cannot
+        # silently fall back to a different file when the candidate is a dir.
+        assert_path_probe_target(files, {directory + "/leaf.yaml": selection_module()}, consumer)
+
+
+def test_import_selection_literal_dotted_statutory_terms() -> None:
+    # _same_section_output_terms uses literal directory components, while the
+    # separate sibling-citation check stems each component once.
+    consumer = "us-ca/statutes/17/24.1/a/b.yaml"
+    provider = "us-ca/statutes/17/24.1/c/d.yaml"
+    files = {consumer: selection_module(), provider: selection_module()}
+    assert_path_probe_target(files, {provider: selection_module() + "# changed term\n"}, consumer)
+
+
+def test_import_selection_index_failure_contains_empty_rule_consumers() -> None:
+    # Pure SafeLoader and signature construction can recurse even after the
+    # selector's C loader succeeds. Index construction precedes the rule loop.
+    for hazard in (
+        "format: rulespec/v1\nrules: [{name: cyclic, kind: parameter, versions: [{values: &cycle {self: *cycle}}]}]\n",
+        "format: rulespec/v1\nrules: []\nmetadata: " + "[" * 150 + "0" + "]" * 150 + "\n",
+        "format: rulespec/v1\nrules: []\nrules: [{name: cyclic, kind: parameter, versions: [{values: &cycle {self: *cycle}}]}]\n",
+    ):
+        consumer = "us-ca/policies/empty.yaml"
+        files = {consumer: selection_module(), "us/statutes/provider.yaml": selection_module()}
+        assert_path_probe_target(files, {"us/statutes/provider.yaml": hazard}, consumer)
+
+
+def test_import_selection_index_failure_inside_yaml_wrappers() -> None:
+    # SafeConstructor builds tuples for !!omap/!!pairs entries and sets for
+    # !!set. At depth 500 inside either wrapper, the C loader succeeds while
+    # the encoder index's pure SafeLoader (:21255) raises an uncaught
+    # RecursionError for every consumer (encoder 5ddb5ea4). Keys and set
+    # members are str()-expanded by _canonical_yaml_value (:21973).
+    nest = "[" * 500 + "0" + "]" * 500
+    levels = ["&l0 [" + ", ".join(["x"] * 9) + "]"]
+    levels += [f"&l{i} [" + ", ".join([f"*l{i - 1}"] * 9) + "]" for i in range(1, 9)]
+    expansion = ", ".join(f"{{l{i}: {level}}}" for i, level in enumerate(levels))
+    long_key = "k" * 2000
+    for hazard in (
+        f"format: rulespec/v1\nrules: []\nmetadata: !!omap [{{wrapped: {nest}}}]\n",
+        f"format: rulespec/v1\nrules: []\nmetadata: !!pairs [{{wrapped: {nest}}}]\n",
+        "format: rulespec/v1\nrules: [{name: wrapped, kind: parameter, versions: "
+        f"[{{effective_from: '2024-01-01', values: {{a: !!omap [{expansion}]}}}}]}}]\n",
+        "format: rulespec/v1\nrules: []\nmetadata: [&k {? " + long_key + " : 1}" + ", *k" * 599 + "]\n",
+        "format: rulespec/v1\nrules: []\nmetadata: [&s !!set {? " + long_key + "}" + ", *s" * 599 + "]\n",
+    ):
+        consumer = "us-ca/policies/empty.yaml"
+        files = {consumer: selection_module(), "us/statutes/provider.yaml": selection_module()}
+        assert_path_probe_target(files, {"us/statutes/provider.yaml": hazard}, consumer)
+
+
+def test_import_selection_index_failure_hidden_by_merge_or_big_int() -> None:
+    # Construction drops an overridden or shadowed merge value, but the
+    # encoder index's pure composer still recursed through it. Non-decimal
+    # ints load past the 4300-digit limit, then str()/json.dumps raise
+    # ValueError in the index (:21950/:21956). Each fails every consumer.
+    nest = "[" * 500 + "0" + "]" * 500
+    executable = ("format: rulespec/v1\nrules: [{{name: big, kind: parameter, dtype: {dtype}, "
+                  "versions: [{{effective_from: '2024-01-01', values: {{2024: {value}}}}}]}}]\n")
+    for hazard in (
+        f"format: rulespec/v1\nrules: []\nmetadata: {{<<: {{a: {nest}}}, a: 1}}\n",
+        f"format: rulespec/v1\nrules: []\nmetadata: {{<<: [{{a: 1}}, {{a: {nest}}}]}}\n",
+        executable.format(dtype="money", value="0x" + "f" * 4000),
+        executable.format(dtype="0b" + "1" * 15000, value="12.5"),
+        executable.format(dtype="money", value="1" + ":0" * 2500),
+    ):
+        consumer = "us-ca/policies/empty.yaml"
+        files = {consumer: selection_module(), "us/statutes/provider.yaml": selection_module()}
+        assert_path_probe_target(files, {"us/statutes/provider.yaml": hazard}, consumer)
+
+
+def test_import_selection_index_failure_from_digit_free_formula() -> None:
+    # _formula_signature_is_substantive -> _numeric_rule_value (:21963,
+    # :10018): the pattern (:1393) matches a digit-free formula, then
+    # float("") raises ValueError in the index for every consumer.
+    for kind, formula in (("derived", "','"), ("parameter", "'-,,'"), ("derived_relation", "' , '")):
+        hazard = ("format: rulespec/v1\nrules: [{name: commas, kind: " + kind + ", versions: "
+                  "[{effective_from: '2024-01-01', values: {}, formula: " + formula + "}]}]\n")
+        consumer = "us-ca/policies/empty.yaml"
+        files = {consumer: selection_module(), "us/statutes/provider.yaml": selection_module()}
+        assert_path_probe_target(files, {"us/statutes/provider.yaml": hazard}, consumer)
+
+
+def generated_index_document(rng: random.Random) -> str:
+    """One provider mixing every SafeConstructor shape, merges and aliases."""
+    wrappers = ("[@]", "{k: @}", "!!omap [{k: @}]", "!!pairs [{k: @}]", "{<<: {k: @}, k: 1}",
+                "{<<: [{k: 1}, {k: @}]}", "{<<: {k: @}}", "[&w# @, *w#]")
+    leaves = (lambda: "0x" + "f" * rng.choice((8, 1000, 1024, 1025, 3600, 4000)),
+              lambda: "0b" + "1" * rng.choice((10, 4096, 4097, 15000)),
+              lambda: "0" + "7" * rng.choice((5, 1365, 1366, 5000)),
+              lambda: "1" + ":0" * rng.choice((3, 600, 693, 694, 2500)),
+              lambda: "!!set {? a, ? " + "s" * rng.choice((1, 900)) + "}",
+              lambda: "!!binary aGVsbG8=", lambda: "2024-01-0" + str(rng.randrange(1, 10)),
+              lambda: "'" + "s" * rng.choice((1, 900)) + "'", lambda: ".inf", lambda: "*top")
+    width, levels = rng.randrange(2, 7), rng.randrange(1, 9)
+    anchors = "{a0: &a0 [" + ", ".join(["x"] * width) + "]" + "".join(
+        f", a{i}: &a{i} [" + ", ".join([f"*a{i - 1}"] * width) + "]" for i in range(1, levels)
+    ) + f", top: &top [*a{levels - 1}]}}"
+    text = rng.choice(leaves)()
+    for level in range(rng.choice((0, 1, 3, 10, 21, 32, 40, 63, 64, 65, 70, 150, 300, 500))):
+        text = rng.choice(wrappers).replace("#", str(level)).replace("@", text)
+    field = rng.choice(("values", "dtype", "unit", "name", "kind", "effective_from", "metadata"))
+    rule = {"name": "generated", "kind": rng.choice(("parameter", "derived")), "dtype": "money", "unit": "USD",
+            "effective_from": "'2024-01-01'", "values": rng.choice(("{2024: 12.5}", "{}")), "metadata": "{}",
+            "formula": rng.choice(("'12.5'", "'a + 1'", "','", "'-,'", "' , '", "'1,'", "',.5'", "'-1,000.5'"))}
+    rule[field] = text if field != "values" else "{2024: " + text + "}"
+    return (f"format: rulespec/v1\nmetadata: {anchors}\nrules:\n- name: {rule['name']}\n"
+            f"  kind: {rule['kind']}\n  dtype: {rule['dtype']}\n  unit: {rule['unit']}\n"
+            f"  metadata: {rule['metadata']}\n  versions:\n  - effective_from: {rule['effective_from']}\n"
+            f"    values: {rule['values']}\n    formula: {rule['formula']}\n")
+
+
+def test_import_selection_index_scanner_covers_pinned_index_failures(cases: range = range(400)) -> None:
+    # Property: whenever the selector neither contains a provider nor flags
+    # it as an index hazard, the verbatim pinned index (encoder 5ddb5ea4
+    # :21235) loads and signs it with only 300 free Python frames, well
+    # inside CPython's default limit of 1000. Otherwise the selector's
+    # owner/descendant consumer closure covers the failure.
+    import ast
+    import datetime
+    import importlib.util
+    import yaml
+
+    spec = importlib.util.spec_from_file_location("pinned_index", ROOT / "tests/fixtures/selector_encoder_index.py")
+    pinned = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = pinned
+    spec.loader.exec_module(pinned)
+    compute = next(s for s in selection_workflow(WORKFLOW.read_text())["jobs"]["shards"]["steps"] if s.get("id") == "compute")["run"]
+    body = compute.split("python3 -I <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    tree = ast.parse(body)
+    names = {"UniqueLoader", "unique_mapping", "index_payload_is_opaque", "yaml_node_depth_exceeds",
+             "index_formula_is_opaque"}
+    definitions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+    registrations = [node for node in ast.walk(tree) if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                     and getattr(node.value.func, "attr", "") == "add_constructor"
+                     and getattr(node.value.func.value, "id", "") == "UniqueLoader"]
+    context = {"yaml": yaml, "datetime": datetime, "re": re}
+    exec(compile(ast.Module(body=definitions + registrations, type_ignores=[]), "<selector-index-scan>", "exec"), context)
+    # Earlier selectors lack some scanners; a missing one counts as "safe".
+    object_scan = context.get("index_payload_is_opaque", lambda payload: False)
+    node_scan = context.get("yaml_node_depth_exceeds", lambda node: False)
+    formula_scan = context.get("index_formula_is_opaque", lambda payload: False)
+
+    def selector_flags(text: str) -> bool:
+        loader = context["UniqueLoader"](text)
+        try:
+            node = loader.get_single_node()
+            deep = node is not None and node_scan(node)
+            payload = None if node is None else loader.construct_document(node)
+        except Exception:
+            return True  # document() fails: an opaque export, same closure
+        finally:
+            loader.dispose()
+        return not isinstance(payload, dict) or deep or object_scan(payload) or formula_scan(payload)
+
+    def frame_depth() -> int:
+        frame, depth = sys._getframe(), 0
+        while frame is not None:
+            frame, depth = frame.f_back, depth + 1
+        return depth
+
+    unflagged = flagged = 0
+    with tempfile.TemporaryDirectory(prefix="selector-index-property-") as temporary:
+        root = Path(temporary) / "us"
+        (root / "statutes").mkdir(parents=True)
+        provider = root / "statutes/provider.yaml"
+        for case in cases:
+            text = generated_index_document(random.Random(20261018 + case))
+            if selector_flags(text):
+                flagged += 1
+                continue
+            unflagged += 1
+            provider.write_text(text)
+            limit = sys.getrecursionlimit()
+            sys.setrecursionlimit(frame_depth() + 300)
+            try:
+                pinned._rulespec_executable_index_for_roots((str(root),))
+            except BaseException as error:
+                raise AssertionError((case, type(error).__name__, text[:400])) from None
+            finally:
+                sys.setrecursionlimit(limit)
+    if len(cases) >= 100:
+        # Both sides of the implication must be exercised.
+        assert flagged and unflagged, (flagged, unflagged)
+
+
+def test_import_selection_pinned_path_helpers_agree() -> None:
+    import ast
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pinned_paths", ROOT / "tests/fixtures/selector_encoder_paths.py")
+    pinned = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pinned)
+    compute = next(s for s in selection_workflow(WORKFLOW.read_text())["jobs"]["shards"]["steps"] if s.get("id") == "compute")["run"]
+    body = compute.split("python3 -I <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    functions = {node.name: node for node in ast.walk(ast.parse(body)) if isinstance(node, ast.FunctionDef)}
+    original = ast.parse((ROOT / "tests/fixtures/selector_encoder_paths.py").read_text())
+    original_normalizer = next(node for node in original.body if isinstance(node, ast.FunctionDef)
+                               and node.name == "_normalize_rulespec_import_path_static")
+    assert ast.dump(original_normalizer) == ast.dump(functions[original_normalizer.name])
+    context = {"PurePosixPath": __import__("pathlib").PurePosixPath}
+    for name in ("sections", "literal_directories", "_normalize_rulespec_import_path_static", "local_import_provider"):
+        exec(compile(ast.Module(body=[functions[name]], type_ignores=[]), "<selector-path-helper>", "exec"), context)
+    context.update(atomic_roots=pinned.RULESPEC_ATOMIC_MODULE_ROOTS, clean_path=lambda p: p,
+                   identity=lambda p: p.split("/", 1)[0] + ":" + p.split("/", 1)[1].removesuffix(".yaml"))
+    pinned.validate_rulespec_context_file = lambda candidate, _root: candidate
+    # Run the unmodified pinned filesystem resolver, then the Git-tree mirror.
+    with tempfile.TemporaryDirectory(prefix="selector-path-agreement-") as temporary:
+        checkout = Path(temporary)
+        policy = checkout / "us-ca"
+        importer = "us-ca:statutes/17/24"
+        module = "us-ca/statutes/17/24.yaml"
+        current = checkout / module
+        current.parent.mkdir(parents=True)
+        current.touch()
+        context.update(node_owners={importer: "us-ca"}, modules={importer: module})
+        for spelling in ("statutes/26/1", "statutes/26/1.yaml", "statutes/26/1.yml"):
+            for relative_parent in ("", "statutes/17/"):
+                candidate = "us-ca/" + relative_parent + spelling + ".yaml"
+                path = checkout / candidate
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+                key = context["identity"](candidate)
+                context["modules"][key] = candidate
+                context["entries"] = {candidate: None}
+                context["directories"] = set()
+                for prefix in ("", "us:", "us-ca:"):
+                    raw = " '" + prefix + spelling + "#fixture' "
+                    normalized = pinned._normalize_rulespec_import_path_static(raw)
+                    actual = pinned._resolve_rulespec_import_file_static(normalized, rules_file=current, policy_repo_path=policy)
+                    assert actual == path
+                    assert context["local_import_provider"](raw, importer) == key
+                path.unlink()
+        for relative in ("statutes/17/24/b.yaml", "regulations/42-cfr/435/1.2/A.yaml",
+                         "regulations/9-ccr-2503-6/3.606.1/E.yaml", "policies/test/a.yaml"):
+            result = pinned._same_section_path_parts_for_file(policy / relative, policy)
+            if result is not None:
+                root, section, _fragments = result
+                group = ("us-ca", root, *section)
+                assert group in context["sections"]("us-ca/" + relative)
+                # The encoder probes a literal directory below this exact group.
+                provider = "/".join((*group, "2", "A.yaml"))
+                assert group in context["literal_directories"](provider)
+                import_base = "/".join((root, *section, "2"))
+                assert not pinned._rulespec_path_or_child_exists_static(policy, import_base)
+                descendant = checkout / provider
+                descendant.parent.mkdir(parents=True, exist_ok=True)
+                descendant.touch()
+                assert pinned._rulespec_path_or_child_exists_static(policy, import_base)
+                descendant.unlink()
+                descendant.parent.rmdir()
+                assert not pinned._rulespec_path_or_child_exists_static(policy, import_base)
+
+
 def test_import_selection_bare_import_overlay_preserves_waiver() -> None:
     overlay = "us/policies/usitc/us-tariff-duty/overlays/ieepa/reciprocal-japan-9903-02-73.yaml"
     tariff = "us/policies/usitc/us-tariff-duty/base.yaml"
@@ -3519,11 +3897,15 @@ def test_import_selection_opaque_executable_provider_symbol_containment() -> Non
     # The encoder's SafeLoader accepts the last rules key and indexes its
     # exported name. The selector rejects the duplicate before learning that
     # name, so an opaque provider must retain the implicit consumer domain.
+    # The hidden payload could also fail the index itself (:21255), which
+    # precedes every consumer's rule loop: every module of the provider's
+    # jurisdiction and its descendants is a possible consumer, not only
+    # the same-name duplicate in us-ma.
     files = {**selection_files(), provider: "rules: []\n" + module, duplicate: module}
     changes = {provider: files[provider] + "# changed opaque provider\n"}
     result = run_import_aware_selection(changes, files=files)
-    assert_selection(result, ["us-ma", "us"], revalidate=["us-ma", "us"])
-    for owner in ("us-ma", "us"):
+    assert_selection(result, SELECTION_JURISDICTIONS, revalidate=SELECTION_JURISDICTIONS)
+    for owner in SELECTION_JURISDICTIONS:
         assert_full_leg(result, owner, {**files, **changes})
     assert f"contained={provider}:" in result["scope-diagnostics"], result
 
@@ -3752,6 +4134,42 @@ def test_import_selection_generated_global_validation_graph_property(cases: rang
 def test_import_selection_generated_graph_property(cases: range = range(20)) -> None:
     for case in cases:
         rng = random.Random(20261012 + case)
+        # Independently generated read obligations from the pinned local
+        # resolver and literal once-stemmed directory probes. Keep these
+        # sparse so unrelated program/opacity seeds cannot mask a missed edge.
+        relative = f"policies/provider-{rng.randrange(1000000)}/shared"
+        prefixed = "us-ca/policies/consumer/out.yaml"
+        local = "us-ma/policies/consumer/out.yaml"
+        transitive = "us-sc/policies/consumer/out.yaml"
+        parts = [str(rng.randrange(1, 1000)) for _ in range(3 + case % 3)]
+        dotted_section = ".".join(parts)
+        directory_section = ".".join(parts[:-1])
+        dotted_consumer = f"us-co/regulations/9-ccr-2503-6/{dotted_section}/E.yaml"
+        directory_provider = f"us-co/regulations/9-ccr-2503-6/{directory_section}/2/A.yaml"
+        path_files = {
+            "us/" + relative + ".yaml": selection_module(),
+            "us-ca/" + relative + ".yaml": selection_module(),
+            "us-ma/" + relative + ".yaml": selection_module(),
+            prefixed: selection_module("us:" + relative + "#fixture"),
+            local: selection_module(relative + "#fixture"),
+            transitive: selection_module("us-ca:policies/consumer/out#fixture"),
+            dotted_consumer: selection_path_probe_module("Except as provided in paragraph (2).", "e_out"),
+        }
+        path_changes = {
+            "us-ca/" + relative + ".yaml": selection_module() + "# changed local provider\n",
+            "us-ma/" + relative + ".yaml": selection_module() + "# changed unprefixed provider\n",
+            directory_provider: selection_module(),
+        }
+        path_result = run_import_aware_selection(path_changes, files=path_files)
+        for consumer in (prefixed, local, transitive, dotted_consumer):
+            owner = consumer.split("/", 1)[0]
+            assert owner in path_result["matrix"], (case, consumer, path_result)
+            assert consumer in path_result["targets"][owner][1], (case, consumer, path_result)
+        # Delete the last descendant as well; the base directory must survive
+        # graph union even though there is no head blob for that read.
+        if case % 2:
+            assert_path_probe_target({**path_files, directory_provider: selection_module()},
+                                     {directory_provider: None}, dotted_consumer)
         files = selection_files()
         modules = [f"{shard}/statutes/{name}.yaml" for shard in SELECTION_JURISDICTIONS for name in ("local", "generated")]
         program_owners = {
@@ -4046,6 +4464,23 @@ def run_selector_tests() -> None:
         test_import_selection_same_section_descendants_and_rename,
         test_import_selection_same_section_sibling_content_changed,
         test_import_selection_parent_child_fragment_dependency,
+        test_import_selection_prefix_stripped_child_fragment_provider,
+        test_import_selection_prefix_stripped_child_import_provider,
+        test_import_selection_prefix_stripped_transitive_provider,
+        test_import_selection_multidot_directory_existence,
+        test_import_selection_path_control_same_jurisdiction,
+        test_import_selection_path_control_no_dot,
+        test_import_selection_path_control_direct_file,
+        test_import_selection_local_resolution_parent_fallback_and_suffix,
+        test_import_selection_nested_statutes_fallback_containment,
+        test_import_selection_directory_valued_import_candidate,
+        test_import_selection_literal_dotted_statutory_terms,
+        test_import_selection_index_failure_contains_empty_rule_consumers,
+        test_import_selection_index_failure_inside_yaml_wrappers,
+        test_import_selection_index_failure_hidden_by_merge_or_big_int,
+        test_import_selection_index_failure_from_digit_free_formula,
+        test_import_selection_index_scanner_covers_pinned_index_failures,
+        test_import_selection_pinned_path_helpers_agree,
         test_import_selection_bare_import_overlay_preserves_waiver,
         test_import_selection_source_relation_unresolved_contained,
         test_import_selection_source_relation_types_and_exact_target_resolution,
@@ -4063,7 +4498,7 @@ def run_selector_tests() -> None:
     for test in tests:
         test()
         print(f"{test.__name__}: passed", flush=True)
-    print("actual workflow selectors: passed (24 generated opaque graph cases; 24 generated global-validation graph cases; 20 generated module/program/scalar-import graph property cases; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
+    print("actual workflow selectors: passed (24 generated opaque graph cases; 24 generated global-validation graph cases; 20 generated module/program/scalar-import/local-read/dotted-directory graph cases; 400 generated index-scanner cases against the pinned index; 8 generated suffix ambiguity cases; Bash 3 mapfile compatibility when needed)", flush=True)
 
 
 def literal_pin_caller(pins: dict[str, str]) -> str:

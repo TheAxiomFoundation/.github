@@ -1439,6 +1439,7 @@ jobs:
 
           if import_aware:
               try:
+                  import datetime
                   import yaml
                   from pathlib import PurePosixPath
 
@@ -1625,15 +1626,60 @@ jobs:
 
                   UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 
+                  def yaml_node_depth_exceeds(node, limit=64):
+                      # Python's composer (the encoder index's SafeLoader,
+                      # :21255) recurses once per composed node level, even
+                      # for nodes that construction drops: a merge value an
+                      # explicit key overrides, or a shadowed merge source.
+                      # Bound the longest path of the composed node graph;
+                      # a recursive alias is opaque.
+                      heights = {}
+                      active = set()
+                      pending = [(node, False)]
+                      while pending:
+                          current, leaving = pending.pop()
+                          if isinstance(current, yaml.MappingNode):
+                              children = [child for pair in current.value for child in pair]
+                          elif isinstance(current, yaml.SequenceNode):
+                              children = current.value
+                          else:
+                              children = ()
+                          if leaving:
+                              active.remove(id(current))
+                              heights[id(current)] = 1 + max(
+                                  (heights[id(child)] for child in children), default=-1)
+                              if heights[id(current)] > limit:
+                                  return True
+                              continue
+                          if id(current) in heights:
+                              continue
+                          if id(current) in active:
+                              return True
+                          active.add(id(current))
+                          pending.append((current, True))
+                          pending.extend((child, False) for child in children
+                                         if id(child) not in heights)
+                      return False
+
                   # Git object identity spans paths and both protected trees.
                   # Documents are read-only below, so unchanged content needs
                   # only one safe parse, including shared companion blobs.
                   documents = {}
+                  deep_documents = set()
 
                   def document(entries, path):
                       oid = entries[path][2]
                       if oid not in documents:
-                          documents[oid] = yaml.load(blobs[oid], Loader=UniqueLoader)
+                          # yaml.load, split so the composed graph is measured
+                          # before merge flattening rewrites it in place.
+                          loader = UniqueLoader(blobs[oid])
+                          try:
+                              node = loader.get_single_node()
+                              if node is not None and yaml_node_depth_exceeds(node):
+                                  deep_documents.add(oid)
+                              documents[oid] = None if node is None else loader.construct_document(node)
+                          finally:
+                              loader.dispose()
                       payload = documents[oid]
                       if not isinstance(payload, dict) and not (
                           is_companion(path) and isinstance(payload, list)
@@ -1701,6 +1747,104 @@ jobs:
                   contained_reasons = set()
                   section_modules = {}
                   statute_existence_modules = {}
+                  index_hazards = set()
+
+                  def index_payload_is_opaque(payload):
+                      # The index (:21255) uses Python SafeLoader, and its
+                      # executable signatures recursively expand YAML values.
+                      # C-loader success alone cannot prove either completes.
+                      # Bound depth/work and detect cycles without expanding
+                      # aliases indefinitely; uncertain providers reach every
+                      # possible index consumer, including rules: [].
+                      # SafeConstructor's 12 tags also build tuples (!!omap and
+                      # !!pairs entries) and sets (!!set). Python's composer
+                      # still recurses through them, and _canonical_yaml_value
+                      # (:21973) expands them, and every key, with str().
+                      # Walk them all; any other value type is opaque. Hex,
+                      # octal, binary and sexagesimal ints bypass Python's
+                      # 4300-digit limit when loaded, but the index's str()
+                      # and json.dumps (:21292/:21950/:21956) raise ValueError.
+                      pending = [(payload, 0, False)]
+                      active = set()
+                      work = 0
+                      scalar_bytes = 0
+                      while pending:
+                          value, depth, leaving = pending.pop()
+                          if leaving:
+                              active.remove(id(value))
+                              continue
+                          work += 1
+                          if depth > 64 or work > 10000 or id(value) in active:
+                              return True
+                          if isinstance(value, dict):
+                              children = list(value.values())
+                              scalars = value.keys()
+                          elif isinstance(value, (list, tuple, set, frozenset)):
+                              children = value
+                              scalars = ()
+                          else:
+                              children = ()
+                              scalars = (value,)
+                          for scalar in scalars:
+                              if isinstance(scalar, (str, bytes)):
+                                  scalar_bytes += len(scalar)
+                              elif isinstance(scalar, int):
+                                  if scalar.bit_length() > 4096:
+                                      return True
+                              elif not (scalar is None or isinstance(scalar, (float, datetime.date))):
+                                  return True
+                          if scalar_bytes > 1000000:
+                              return True
+                          if not children:
+                              continue
+                          active.add(id(value))
+                          pending.append((value, depth, True))
+                          pending.extend((child, depth + 1, False) for child in children)
+                      return False
+
+                  def index_formula_is_opaque(payload):
+                      # A formula-only version reaches _numeric_rule_value
+                      # (:10018) through _formula_signature_is_substantive
+                      # (:21963). Its pattern (:1393) also matches a digit-free
+                      # string such as ",", and float("") then raises outside
+                      # the index's load guard. Callers run the object scan
+                      # first, so str() on these values is bounded.
+                      rules = payload.get("rules")
+                      if payload.get("format") != "rulespec/v1" or not isinstance(rules, list):
+                          return False
+                      for rule in rules:
+                          if (not isinstance(rule, dict) or str(rule.get("kind") or "").strip().lower()
+                                  not in {"parameter", "derived", "derived_relation"}):
+                              continue
+                          versions = rule.get("versions")
+                          for version in versions if isinstance(versions, list) else []:
+                              if not isinstance(version, dict):
+                                  continue
+                              values = version.get("values")
+                              formula = version.get("formula")
+                              if isinstance(values, dict) and values:
+                                  continue
+                              if not isinstance(formula, str) or not formula.strip():
+                                  continue
+                              normalized = re.sub(r"\s+", " ", formula.strip())
+                              if (re.fullmatch(r"-?[\d,]+(?:\.\d+)?", normalized)
+                                      and normalized.replace(",", "") in {"", "-"}):
+                                  return True
+                      return False
+
+                  def _normalize_rulespec_import_path_static(import_path: str) -> str:
+                      normalized = import_path.split("#", 1)[0].strip().strip("\"'")
+                      if ":" in normalized:
+                          _, tail = normalized.split(":", 1)
+                          normalized = tail
+                      return normalized.strip("/")
+
+                  def literal_directories(path):
+                      # Git has no directory objects in the blob inventory.
+                      # Keep literal ancestors: stemming them a second time
+                      # changes e.g. 3.606 into 3 (encoder :30213/:38529).
+                      parts = path.split("/")
+                      return {tuple(parts[:length]) for length in range(4, len(parts))}
 
                   def sections(path):
                       # validator_pipeline.py:30164 (encoder 5ddb5ea4) uses
@@ -1716,6 +1860,11 @@ jobs:
                       groups = {tuple(parts[:-1])}
                       if root in {"statutes", "regulations"} and len(normalized) >= count:
                           groups.add((parts[0], *normalized[:count]))
+                      # _rulespec_relative_parts_and_root / _same_section_output_terms
+                      # (:38376/:38546) also read the literal statutory section,
+                      # without Path.stem on its directory components.
+                      if root == "statutes" and len(parts) >= 5:
+                          groups.add(tuple(parts[:4]))
                       return groups
 
                   # The --no-renames diff exposes renames as removal/addition.
@@ -1727,6 +1876,7 @@ jobs:
                       if (atomic_owner(path) and not is_companion(path)
                               and ((path in trees[0]) != (path in trees[1]))):
                           changed_sections.update(sections(path))
+                          changed_sections.update(literal_directories(path))
                           if path.split("/")[1] == "statutes":
                               statute_topology_owners.add(atomic_owner(path))
 
@@ -1750,6 +1900,11 @@ jobs:
                                   pending.append(importer)
 
                   for entries in trees:
+                      directories = set()
+                      for tracked_path in entries:
+                          parts = tracked_path.split("/")
+                          directories.update("/".join(parts[:length])
+                                             for length in range(1, len(parts)))
                       modules = {}
                       for path in entries:
                           if atomic_owner(path) and not is_companion(path):
@@ -1778,6 +1933,14 @@ jobs:
                                   node = "section:" + json.dumps(section)
                                   edge(key, node)
                                   edge(node, key)
+                              for directory in literal_directories(path):
+                                  edge(key, "section:" + json.dumps(directory))
+                              # _rulespec_relative_parts_and_root (:38509)
+                              # can discover a nested statutes component and
+                              # then read both that subtree and J/statutes.
+                              # Its fallback owner retains reverse closure.
+                              if "statutes" in parts[2:]:
+                                  opaque_modules.add(key)
 
                       # Child-fragment checks are not restricted to statutes
                       # and regulations (:30689/:32399). A parent.yaml module
@@ -1816,6 +1979,10 @@ jobs:
                               for suffix in (".yaml", ".yml")
                               if root + spelling + suffix in entries
                           }
+                          if any(root + spelling + suffix in directories
+                                 for root in ("", prefix + "/", "rulespec-" + prefix + "/")
+                                 for spelling in spellings for suffix in (".yaml", ".yml")):
+                              raise ValueError(f"import file is a directory: {target}")
                           if len(candidates) > 1:
                               raise ValueError(f"ambiguous import: {target}")
                           if not program and relative.endswith((".yaml", ".yml")):
@@ -1849,6 +2016,43 @@ jobs:
                           if modules.get(key) != path or prefix not in shard_set:
                               raise ValueError(f"unresolved source/delegation target: {target}")
                           return key
+
+                      def local_import_provider(target, importer):
+                          # _resolve_rulespec_import_file_static (:31285-31325)
+                          # after callers strip the prefix (:29818/:30712/:30755).
+                          # Both local and prefixed spellings use this lookup.
+                          normalized = _normalize_rulespec_import_path_static(target)
+                          clean_path(normalized)
+                          if normalized.split("/", 1)[0] not in atomic_roots:
+                              raise ValueError(f"unsupported local import: {target}")
+                          owner = node_owners[importer]
+                          parent = modules[importer].rsplit("/", 1)[0]
+                          for candidate in (f"{owner}/{normalized}.yaml",
+                                            f"{parent}/{normalized}.yaml"):
+                              if candidate in directories:
+                                  # Path.exists() succeeds for a directory;
+                                  # encoder file admission then raises, rather
+                                  # than trying the parent-relative fallback.
+                                  raise ValueError(f"local import file is a directory: {candidate}")
+                              if candidate in entries:
+                                  key = identity(candidate)
+                                  if modules.get(key) != candidate:
+                                      raise ValueError(f"non-module local provider: {candidate}")
+                                  return key
+                          return None
+
+                      def import_edges(target, importer):
+                          if not isinstance(target, str):
+                              raise ValueError("non-string import")
+                          # Prefix-preserving readers and prefix-stripping
+                          # readers are both active in this encoder pin.
+                          if ":" in target:
+                              edge(resolve(target), importer)
+                          provider = local_import_provider(target, importer)
+                          if provider is not None:
+                              edge(provider, importer)
+                          elif ":" not in target:
+                              raise ValueError(f"unresolved local import: {target}")
 
                       def executable_edges(payload, importer):
                           if payload.get("format") == "rulespec/v1":
@@ -1918,7 +2122,7 @@ jobs:
                                   if not isinstance(imports, list):
                                       raise ValueError("imports is not a list")
                                   for target in imports:
-                                      edge(resolve(target), importer)
+                                      import_edges(target, importer)
                               if "source_relation" in value:
                                   relation = value["source_relation"]
                                   if isinstance(relation, str):
@@ -1996,7 +2200,7 @@ jobs:
                                       # Noncanonical/local spellings that the
                                       # encoder can resolve contain this importer
                                       # through the normal opacity fallback.
-                                      edge(resolve(target), importer)
+                                      import_edges(target, importer)
 
                       # Read small inputs first, preferring watched modules
                       # at equal size. A global opacity witness can avoid
@@ -2017,6 +2221,10 @@ jobs:
                           try:
                               payload = document(entries, path)
                               if not is_companion(path):
+                                  if (entries[path][2] in deep_documents
+                                          or index_payload_is_opaque(payload)
+                                          or index_formula_is_opaque(payload)):
+                                      index_hazards.add(key)
                                   module = payload.get("module")
                                   if isinstance(module, dict) and module.get("kind") == "composition":
                                       # The pinned composer loads every YAML
@@ -2088,6 +2296,14 @@ jobs:
                           if consumer_owner == owner or consumer_owner.startswith(owner + "-"):
                               for consumer in consumers:
                                   edge(provider, consumer)
+
+                  # Index construction precedes the current module's rule
+                  # loop. A failure need not share an executable symbol name.
+                  for provider in index_hazards | opaque_exports:
+                      owner = node_owners[provider]
+                      for consumer, consumer_owner in node_owners.items():
+                          if consumer_owner == owner or consumer_owner.startswith(owner + "-"):
+                              edge(provider, consumer)
 
                   owners = set()
                   seeds = {key for section in changed_sections

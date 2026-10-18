@@ -276,7 +276,10 @@ candidate workflow SHA-256
 `28dc0e91f5666abdc3354a3a1b32181e16e35ca846ad73199a33c7f1ac2d1cb3`
 (parent `37eaac2af`). It enumerates 207 distinct source locations in 84 reader
 rows: 61 modeled edges, 17 containment, 55 global handling and 74 explicit scope
-exclusions, with no unhandled entry. Another 49 in-memory YAML parsing sites
+exclusions. Those historical buckets did not prove correct target attribution:
+the review of `912e51205` found differences in six rows covering 13 cited
+locations, plus an executable-index containment gap in one row covering two
+locations. The former “unhandled: 0” conclusion is withdrawn. Another 49 in-memory YAML parsing sites
 are listed separately. The audited command is deterministic
 `validate --skip-reviewers` without an oracle, together with the workflow's
 shared ledger gates and the actual composer/engine readers. Fixed protected
@@ -299,6 +302,32 @@ demonstrates no matrix reduction. Default-off passes 34/34 comparisons against
 actionlint pass with zero diagnostics. These are local fixture and selection
 measurements; selected-versus-full hosted validation and runtime adoption
 checks remain necessary.
+
+Round 7 attributes imports to both paths used by encoder `5ddb5ea4`: the
+declared jurisdiction for prefix-preserving readers, and the importing
+jurisdiction after `_normalize_rulespec_import_path_static` removes the prefix.
+The local lookup appends `.yaml` to the entire normalized reference, tries the
+jurisdiction root, then the importing file's parent. Both local and prefixed
+forms use this lookup; directory-valued file candidates contain the owner.
+Consumer section groups stem components once, while provider directory
+ancestors retain their literal spelling. Nested-statutes fallbacks contain
+their owner. The executable-index scanner walks tuples (`!!omap`, `!!pairs`),
+sets (`!!set`) and mapping keys, flags integers above 4,096 bits, and bounds
+the composed node graph before merge flattening; flagged providers reach every
+module of their jurisdiction and its descendants.
+
+At the final round-7 candidate based on `912e51205828b526b9976d0fb50795c2408ce044`
+(workflow SHA-256 `972d79dcd1a9d66d6045ed75af911d48213f86a2bf838db02c9aa1076c650d1a`), which also contains executable
+providers whose formula-only versions normalize to commas (the encoder's
+`_numeric_rule_value` then raises), the executed encoder probes show
+0 misses (9 at `912e51205`). The same 53 exact ordered pairs each select
+all 52 legs with full targets; misses are (a) 0, (b) 0, (c) 0 and unclassified
+0, with no compute errors or missing objects. Local selector time totals
+98.345 seconds. The reasons are 13 direct shared-record dependencies,
+17 shared-record closures, 20 toolchain changes and 3 ProgramSpec changes.
+Default-off passes 34/34 comparisons with 0 differences, and actionlint reports zero
+diagnostics. This selection replay demonstrates no matrix reduction and does
+not execute hosted validators or establish runtime adoption results.
 
 Measure the real `Compute validation shards` step during that replay, including
 both git trees, with the timing harness (Python with PyYAML and Bash 4+ required):
