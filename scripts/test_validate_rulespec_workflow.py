@@ -3096,8 +3096,13 @@ def test_rollback_rewind_keeps_restored_waiver_expiry_enforced() -> None:
         spec = importlib.util.find_spec("axiom_encode")
         package = Path(next(iter(spec.submodule_search_locations))) if spec and spec.submodule_search_locations else None
     if package is None:
-        print("rollback expiry: encoder unavailable locally; pinned supervised CI audit enforces head-ledger expiry")
-        return
+        # Reported as skipped, never passed: without a loader neither frozen-date
+        # assertion runs (the pinned supervised audit still enforces expiry).
+        import unittest
+        raise unittest.SkipTest(
+            "rollback expiry: no encoder loader (install axiom-encode or set AXIOM_ENCODE_SOURCE); "
+            "the pinned supervised CI audit enforces head-ledger expiry"
+        )
     for expires in ("2026-10-17", "2026-10-18"):
         with RollbackRewindFixture(expires=expires) as fixture:
             fixture.retire()
@@ -3251,9 +3256,16 @@ def run_rollback_rewind_tests() -> None:
         test_rollback_rewind_keeps_restored_waiver_expiry_enforced,
         test_rollback_rewind_static_trust_and_comparison_wiring,
     )
+    import unittest
+    skipped = []
     for test in tests:
-        test()
-    print(f"rollback rewind: {len(tests)} regression groups passed")
+        try:
+            test()
+        except unittest.SkipTest as reason:
+            skipped.append(f"{test.__name__}: {reason}")
+    print(f"rollback rewind: {len(tests) - len(skipped)} regression groups passed, {len(skipped)} skipped")
+    for line in skipped:
+        print(f"  skipped {line}")
 
 
 # Mirrors safe_ref in axiom-encode scripts/provision_verification_supervisor.py,
