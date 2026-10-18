@@ -3457,7 +3457,10 @@ def test_import_selection_path_control_direct_file() -> None:
 
 
 def test_import_selection_local_resolution_parent_fallback_and_suffix() -> None:
-    for reference in ("statutes/26/1", "us:statutes/26/1", "us:statutes/26/1.yml"):
+    # A non-statutes root ("policies/...") is not under a nested statutes path,
+    # so only the local-provider edge targets it (the nested cases are contained).
+    for reference in ("statutes/26/1", "us:statutes/26/1", "us:statutes/26/1.yml",
+                      "policies/26/1", "us:policies/26/1"):
         files, changes, consumer = selection_local_read_fixture("parent-import")
         old_provider = "us-ca/statutes/26/1.yaml"
         normalized = reference.partition(":")[-1]
@@ -3564,6 +3567,34 @@ def test_import_selection_index_failure_from_digit_free_formula() -> None:
         assert_path_probe_target(files, {"us/statutes/provider.yaml": hazard}, consumer)
 
 
+def test_import_selection_index_failure_hidden_by_a_line_start_bom() -> None:
+    # libyaml skips U+FEFF at the start of a line; the encoder index's
+    # pure-Python safe_load (:21255) keeps it, so there the BOM line becomes its
+    # own key and the version is formula-only: float("") raises (:21963,
+    # :10018) for every consumer, while the selector's parse sees values.
+    for kind in ("parameter", "derived", "derived_relation"):
+        for values in ("{a: 1}", "{2024: 12.5}"):
+            hazard = ("format: rulespec/v1\nrules:\n- name: x\n  kind: " + kind + "\n  versions:\n"
+                      "  - formula: ','\n\ufeff   values: " + values + "\n")
+            consumer = "us-ca/policies/empty.yaml"
+            files = {consumer: selection_module(), "us/statutes/provider.yaml": selection_module()}
+            assert_path_probe_target(files, {"us/statutes/provider.yaml": hazard}, consumer)
+
+
+def test_import_selection_bom_only_at_the_start_is_not_a_hazard() -> None:
+    # A byte-order mark that opens the file is read alike by both parsers.
+    import ast
+    compute = next(s for s in selection_workflow(WORKFLOW.read_text())["jobs"]["shards"]["steps"] if s.get("id") == "compute")["run"]
+    body = compute.split("python3 -I <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    scan = next(node for node in ast.walk(ast.parse(body)) if isinstance(node, ast.FunctionDef) and node.name == "yaml_text_diverges")
+    context = {}
+    exec(compile(ast.Module(body=[scan], type_ignores=[]), "<selector-bom-scan>", "exec"), context)
+    diverges = context["yaml_text_diverges"]
+    assert not diverges("\ufeffformat: rulespec/v1\n") and not diverges("\ufeffa: 1\n".encode())
+    assert diverges("a: 1\n\ufeffb: 2\n") and diverges("a: 1\n\ufeffb: 2\n".encode())
+    assert diverges("\ufeffa: 1\n\ufeffb: 2\n".encode()) and not diverges("a: 1\nb: 2\n")
+
+
 def generated_index_document(rng: random.Random) -> str:
     """One provider mixing every SafeConstructor shape, merges and aliases."""
     wrappers = ("[@]", "{k: @}", "!!omap [{k: @}]", "!!pairs [{k: @}]", "{<<: {k: @}, k: 1}",
@@ -3587,10 +3618,16 @@ def generated_index_document(rng: random.Random) -> str:
             "effective_from": "'2024-01-01'", "values": rng.choice(("{2024: 12.5}", "{}")), "metadata": "{}",
             "formula": rng.choice(("'12.5'", "'a + 1'", "','", "'-,'", "' , '", "'1,'", "',.5'", "'-1,000.5'"))}
     rule[field] = text if field != "values" else "{2024: " + text + "}"
-    return (f"format: rulespec/v1\nmetadata: {anchors}\nrules:\n- name: {rule['name']}\n"
-            f"  kind: {rule['kind']}\n  dtype: {rule['dtype']}\n  unit: {rule['unit']}\n"
-            f"  metadata: {rule['metadata']}\n  versions:\n  - effective_from: {rule['effective_from']}\n"
-            f"    values: {rule['values']}\n    formula: {rule['formula']}\n")
+    lines = [f"format: rulespec/v1", f"metadata: {anchors}", "rules:", f"- name: {rule['name']}",
+             f"  kind: {rule['kind']}", f"  dtype: {rule['dtype']}", f"  unit: {rule['unit']}",
+             f"  metadata: {rule['metadata']}", "  versions:", f"  - effective_from: {rule['effective_from']}",
+             f"    values: {rule['values']}", f"    formula: {rule['formula']}"]
+    # A byte-order mark at the start of a line: libyaml skips it, the pure-Python
+    # index keeps it (see test_import_selection_index_failure_hidden_by_a_line_start_bom).
+    if rng.random() < 0.15:
+        index = rng.randrange(len(lines))
+        lines[index] = "\ufeff" + lines[index]
+    return "\n".join(lines) + "\n"
 
 
 def test_import_selection_index_scanner_covers_pinned_index_failures(cases: range = range(400)) -> None:
@@ -3612,7 +3649,7 @@ def test_import_selection_index_scanner_covers_pinned_index_failures(cases: rang
     body = compute.split("python3 -I <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
     tree = ast.parse(body)
     names = {"UniqueLoader", "unique_mapping", "index_payload_is_opaque", "yaml_node_depth_exceeds",
-             "index_formula_is_opaque"}
+             "index_formula_is_opaque", "yaml_text_diverges"}
     definitions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
     registrations = [node for node in ast.walk(tree) if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
                      and getattr(node.value.func, "attr", "") == "add_constructor"
@@ -3623,8 +3660,11 @@ def test_import_selection_index_scanner_covers_pinned_index_failures(cases: rang
     object_scan = context.get("index_payload_is_opaque", lambda payload: False)
     node_scan = context.get("yaml_node_depth_exceeds", lambda node: False)
     formula_scan = context.get("index_formula_is_opaque", lambda payload: False)
+    text_scan = context.get("yaml_text_diverges", lambda text: False)
 
     def selector_flags(text: str) -> bool:
+        if text_scan(text.encode("utf-8")):
+            return True
         loader = context["UniqueLoader"](text)
         try:
             node = loader.get_single_node()
@@ -4479,6 +4519,8 @@ def run_selector_tests() -> None:
         test_import_selection_index_failure_inside_yaml_wrappers,
         test_import_selection_index_failure_hidden_by_merge_or_big_int,
         test_import_selection_index_failure_from_digit_free_formula,
+        test_import_selection_index_failure_hidden_by_a_line_start_bom,
+        test_import_selection_bom_only_at_the_start_is_not_a_hazard,
         test_import_selection_index_scanner_covers_pinned_index_failures,
         test_import_selection_pinned_path_helpers_agree,
         test_import_selection_bare_import_overlay_preserves_waiver,

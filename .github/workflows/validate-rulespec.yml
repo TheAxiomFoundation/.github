@@ -1661,6 +1661,15 @@ jobs:
                                          if id(child) not in heights)
                       return False
 
+                  def yaml_text_diverges(blob):
+                      # libyaml (CSafeLoader, used here) skips U+FEFF at the start
+                      # of any line; the encoder index's pure-Python safe_load
+                      # (:21255) keeps one after the first character as content, so
+                      # one file can load as two different payloads. Treat it as
+                      # opaque. A byte-order mark at the very start is read alike.
+                      marker = "\ufeff" if isinstance(blob, str) else b"\xef\xbb\xbf"
+                      return marker in blob[1:]
+
                   # Git object identity spans paths and both protected trees.
                   # Documents are read-only below, so unchanged content needs
                   # only one safe parse, including shared companion blobs.
@@ -1670,6 +1679,8 @@ jobs:
                   def document(entries, path):
                       oid = entries[path][2]
                       if oid not in documents:
+                          if yaml_text_diverges(blobs[oid]):
+                              deep_documents.add(oid)
                           # yaml.load, split so the composed graph is measured
                           # before merge flattening rewrites it in place.
                           loader = UniqueLoader(blobs[oid])
@@ -1861,7 +1872,7 @@ jobs:
                       if root in {"statutes", "regulations"} and len(normalized) >= count:
                           groups.add((parts[0], *normalized[:count]))
                       # _rulespec_relative_parts_and_root / _same_section_output_terms
-                      # (:38376/:38546) also read the literal statutory section,
+                      # (:38496/:38546) also read the literal statutory section,
                       # without Path.stem on its directory components.
                       if root == "statutes" and len(parts) >= 5:
                           groups.add(tuple(parts[:4]))
