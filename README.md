@@ -315,9 +315,12 @@ their owner. The executable-index scanner walks tuples (`!!omap`, `!!pairs`),
 sets (`!!set`) and mapping keys, flags integers above 4,096 bits, and bounds
 the composed node graph before merge flattening; flagged providers reach every
 module of their jurisdiction and its descendants. A file with a byte-order
-mark after its first character is flagged too: libyaml skips U+FEFF at the
-start of any line, while the encoder index's pure-Python parser keeps it, so
-the same bytes can load as two different payloads.
+mark after its first character is refused as unreadable: libyaml skips U+FEFF
+at the start of any line, while the encoder's pure-Python parser keeps it, so
+the same bytes can load as two different payloads. That can hide a hazard or a
+consumer's own import, companion key or waiver. A refused module gets the
+unreadable-module containment, and a refused ledger or ProgramSpec fails closed
+to a full selection.
 
 At the final round-7 candidate based on `912e51205828b526b9976d0fb50795c2408ce044`
 (workflow SHA-256 `972d79dcd1a9d66d6045ed75af911d48213f86a2bf838db02c9aa1076c650d1a`), which also contains executable
@@ -326,7 +329,7 @@ providers whose formula-only versions normalize to commas (the encoder's
 0 misses among the index-hazard probes (9 at `912e51205`). The same 53 exact ordered pairs each select
 all 52 legs with full targets; misses are (a) 0, (b) 0, (c) 0 and unclassified
 0, with no compute errors or missing objects. Local selector time totals
-98.345 seconds. Round 8 (workflow SHA-256 `4fb1de9aaa2daeee7a7d7852466719e381d0db5841b9d9f6d6a5cd5443a76aed`) adds only the byte-order-mark flag above; a fourth independent review measured the encoder's call depth at its index parse at about 20 frames, well inside the property's 300-frame budget. The reasons are 13 direct shared-record dependencies,
+98.345 seconds. Rounds 8 and 9 add only the byte-order-mark rule above (round 9: workflow SHA-256 `da7246aff925b0abeb092109ef42f8b595100135807992bd84abc8256a0927b4`); a fourth independent review measured the encoder's call depth at its index parse at about 20 frames, well inside the property's 300-frame budget. The reasons are 13 direct shared-record dependencies,
 17 shared-record closures, 20 toolchain changes and 3 ProgramSpec changes.
 Default-off passes 34/34 comparisons with 0 differences, and actionlint reports zero
 diagnostics. This selection replay demonstrates no matrix reduction and does

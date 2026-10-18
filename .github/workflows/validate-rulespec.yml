@@ -1665,8 +1665,12 @@ jobs:
                       # libyaml (CSafeLoader, used here) skips U+FEFF at the start
                       # of any line; the encoder index's pure-Python safe_load
                       # (:21255) keeps one after the first character as content, so
-                      # one file can load as two different payloads. Treat it as
-                      # opaque. A byte-order mark at the very start is read alike.
+                      # one file can load as two different payloads, in either
+                      # direction (a hidden hazard, or a hidden import, companion
+                      # key or waiver). document() refuses such a file, so it gets
+                      # the unreadable-module containment and a ledger or
+                      # ProgramSpec read fails closed to a full selection. A
+                      # byte-order mark at the very start is read alike.
                       marker = "\ufeff" if isinstance(blob, str) else b"\xef\xbb\xbf"
                       return marker in blob[1:]
 
@@ -1680,7 +1684,7 @@ jobs:
                       oid = entries[path][2]
                       if oid not in documents:
                           if yaml_text_diverges(blobs[oid]):
-                              deep_documents.add(oid)
+                              raise ValueError("libyaml and pure-Python YAML read different payloads")
                           # yaml.load, split so the composed graph is measured
                           # before merge flattening rewrites it in place.
                           loader = UniqueLoader(blobs[oid])

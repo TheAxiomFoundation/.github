@@ -2232,6 +2232,7 @@ def selector_document_helpers(loader_base: type | None = None, *, c_available: b
                      for target in node.targets)]
     depth = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "yaml_node_depth_exceeds")
     document = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "document")
+    text = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "yaml_text_diverges")
     if loader_base is None:
         yaml_module = yaml
     else:
@@ -2243,7 +2244,7 @@ def selector_document_helpers(loader_base: type | None = None, *, c_available: b
         if not c_available:
             del yaml_module.CSafeLoader
     namespace = {"yaml": yaml_module, "is_companion": lambda path: path.endswith((".test.yaml", ".test.yml"))}
-    exec(compile(ast.Module(body=[loader, mapping, constructor, depth, *cache, document], type_ignores=[]),
+    exec(compile(ast.Module(body=[loader, mapping, constructor, depth, text, *cache, document], type_ignores=[]),
                  str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -3581,6 +3582,29 @@ def test_import_selection_index_failure_hidden_by_a_line_start_bom() -> None:
             assert_path_probe_target(files, {"us/statutes/provider.yaml": hazard}, consumer)
 
 
+def test_import_selection_bom_hidden_consumer_import_is_contained() -> None:
+    # Inside a flow mapping, a line that starts with U+FEFF and then "#" is a
+    # comment to libyaml but live content to the encoder's pure-Python
+    # safe_load, so there the consumer imports us:statutes/26/1 and an added
+    # rule there changes its validation (find_current_year_final_amount_table_
+    # issues). The selector must not read the consumer as import-free.
+    consumer = "us-ca/policies/benefit.yaml"
+    files = {
+        "us/statutes/local.yaml": "format: rulespec/v1\nimports: []\nrules: []\n",
+        "us-ca/statutes/local.yaml": "format: rulespec/v1\nimports: []\nrules: []\n",
+        consumer: ("{format: rulespec/v1,\n\ufeff# note: 1, imports: ['us:statutes/26/1#ca_benefit_rate'],\n"
+                   "rules: [{name: ca_benefit_maximum, kind: derived, dtype: money, versions: "
+                   "[{effective_from: '2024-01-01', formula: ca_benefit_rate * ca_benefit_amount}]}]}\n"),
+        "us/statutes/26/1.yaml": ("format: rulespec/v1\nrules:\n- name: ca_benefit_rate\n  kind: parameter\n"
+                                  "  dtype: rate\n  versions:\n  - effective_from: '2024-01-01'\n"
+                                  "    values: {2024: 0.5}\n"),
+    }
+    changed = files["us/statutes/26/1.yaml"] + ("- name: ca_benefit_maximum_amounts\n  kind: parameter\n"
+                                                "  dtype: money\n  versions:\n  - effective_from: '2024-01-01'\n"
+                                                "    values: {2024: 1250}\n")
+    assert_path_probe_target(files, {"us/statutes/26/1.yaml": changed}, consumer)
+
+
 def test_import_selection_bom_only_at_the_start_is_not_a_hazard() -> None:
     # A byte-order mark that opens the file is read alike by both parsers.
     import ast
@@ -3624,9 +3648,17 @@ def generated_index_document(rng: random.Random) -> str:
              f"    values: {rule['values']}", f"    formula: {rule['formula']}"]
     # A byte-order mark at the start of a line: libyaml skips it, the pure-Python
     # index keeps it (see test_import_selection_index_failure_hidden_by_a_line_start_bom).
-    if rng.random() < 0.15:
-        index = rng.randrange(len(lines))
-        lines[index] = "\ufeff" + lines[index]
+    swapped = rng.random() < 0.5
+    if swapped:
+        # formula before values: a BOM on the values line then yields a
+        # formula-only version in the pure-Python index (the round-4 hazard).
+        lines[-2], lines[-1] = lines[-1], lines[-2]
+    if rng.random() < 0.25:
+        index = len(lines) - 1 if swapped and rng.random() < 0.7 else rng.randrange(len(lines))
+        # libyaml counts the skipped mark as a column, so it takes the place of
+        # one indent space: both parsers then succeed and read different payloads.
+        line = lines[index]
+        lines[index] = "\ufeff" + (line[1:] if line.startswith(" ") else line)
     return "\n".join(lines) + "\n"
 
 
@@ -4520,6 +4552,7 @@ def run_selector_tests() -> None:
         test_import_selection_index_failure_hidden_by_merge_or_big_int,
         test_import_selection_index_failure_from_digit_free_formula,
         test_import_selection_index_failure_hidden_by_a_line_start_bom,
+        test_import_selection_bom_hidden_consumer_import_is_contained,
         test_import_selection_bom_only_at_the_start_is_not_a_hazard,
         test_import_selection_index_scanner_covers_pinned_index_failures,
         test_import_selection_pinned_path_helpers_agree,
