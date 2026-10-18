@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -23,7 +24,11 @@ SCRATCH = ROOT / ".hub-scratch"
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference-ref", default="origin/main")
-    parser.add_argument("--bash", default="bash", help="Bash 4+ executable, matching Actions")
+    parser.add_argument("--bash", default="bash", help="Bash executable (normally Bash 4+, matching Actions)")
+    parser.add_argument(
+        "--allow-bash3", action="store_true",
+        help="Allow Bash 3 fixture shims (mapfile and unchanged Python heredoc via -c)",
+    )
     parser.add_argument("--start", type=int, default=0, help="First scenario index (inclusive)")
     parser.add_argument("--stop", type=int, default=17, help="Last scenario index (exclusive)")
     parser.add_argument("-o", "--output", type=Path, help="Write a JSON differential report")
@@ -36,8 +41,11 @@ def main() -> None:
         [bash, "-c", 'printf "%s" "$BASH_VERSINFO"'], check=True,
         capture_output=True, text=True, timeout=10,
     ).stdout
-    if not version.isdigit() or int(version) < 4:
+    if not version.isdigit() or int(version) < 3:
+        parser.error("Require Bash 3 or newer")
+    if int(version) < 4 and not args.allow_bash3:
         parser.error("Use --bash with Bash 4 or newer, matching the Actions runner")
+    execution_mode = "bash3-fixture-compatibility" if int(version) == 3 else "native-bash4-plus"
     os.umask(0o022)
     SCRATCH.mkdir(exist_ok=True)
     sys.dont_write_bytecode = True
@@ -92,7 +100,12 @@ def main() -> None:
                 wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
                 wrapper.chmod(0o755)
             bash_wrapper = bin_path / "bash"
-            bash_wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(bash) + ' "$@"\n')
+            # Bash 3 must disable brace expansion before parsing -c's source;
+            # a set +B inside that source is too late for process substitutions.
+            bash_wrapper.write_text(
+                "#!/bin/sh\nexec " + shlex.quote(bash)
+                + (" +B" if int(version) == 3 else "") + ' "$@"\n'
+            )
             bash_wrapper.chmod(0o755)
             os.environ["PATH"] = str(bin_path) + os.pathsep + original_path
             reference_path = temporary / "reference-workflow.yml"
@@ -105,9 +118,29 @@ def main() -> None:
                     actual = fixtures.run_import_aware_selection(changes, enabled=enabled, **options)
                     fields = ("matrix", "first", "roots", "allowed-extra", "targets")
                     differences = [field for field in fields if expected[field] != actual[field]]
+                    # Parsed equality can hide changed formatting, order, duplicate
+                    # outputs or trailing newlines. Compare the actual shell output
+                    # files and every shard's target-file snapshots as bytes too.
+                    raw_expected = dict(expected["raw-outputs"])
+                    raw_actual = dict(actual["raw-outputs"])
+                    raw_names = sorted(raw_expected.keys() | raw_actual.keys())
+                    raw_differences = [name for name in raw_names
+                                       if raw_expected.get(name) != raw_actual.get(name)]
+                    differences.extend(f"raw:{name}" for name in raw_differences)
                     assert actual.get("revalidate-shards", "[]") == "[]", actual
                     assert actual.get("full-targets", "false") == "false", actual
-                    comparison = {"scenario": name, "input": "false" if enabled is False else "absent", "differences": differences}
+                    comparison = {
+                        "scenario": name,
+                        "input": "false" if enabled is False else "absent",
+                        "differences": differences,
+                        "byte_comparisons": len(raw_names),
+                        "bytes_compared": sum(len(raw_expected[key]) for key in raw_names if key in raw_expected),
+                        "raw_differences": [{
+                            "file": key,
+                            "reference_sha256": hashlib.sha256(raw_expected[key]).hexdigest() if key in raw_expected else None,
+                            "current_sha256": hashlib.sha256(raw_actual[key]).hexdigest() if key in raw_actual else None,
+                        } for key in raw_differences],
+                    }
                     comparisons.append(comparison)
                     print(json.dumps(comparison), flush=True)
         finally:
@@ -116,10 +149,15 @@ def main() -> None:
             os.environ["PATH"] = original_path
     report = {
         "reference_ref": args.reference_ref,
+        "bash_major_version": int(version),
+        "execution_mode": execution_mode,
+        "shell_compatibility": ["mapfile", "unchanged Python heredoc via -I -c"] if int(version) == 3 else [],
         "scenario_range": [args.start, args.stop],
         "scenarios": len(scenarios),
         "comparisons": len(comparisons),
         "differences": sum(bool(item["differences"]) for item in comparisons),
+        "raw_byte_comparisons": sum(item["byte_comparisons"] for item in comparisons),
+        "bytes_compared": sum(item["bytes_compared"] for item in comparisons),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "results": comparisons,
     }
