@@ -576,13 +576,16 @@ def test_workflow_input_protection_precedes_dependency_checkout() -> None:
     assert step["env"]["EVENT_NAME"] == "${{ github.event_name }}"
     assert "python -I - <<'PYPINS'" in step["run"]
     parser = next(s for s in steps if s.get("name") == "Install the ProgramSpec shape-check parser")
-    rewind = next(s for s in steps if s.get("id") == "rollback_rewind")
-    assert steps.index(rewind) < steps.index(parser)
     assert steps.index(step) == steps.index(parser) + 1
     assert "python -I -m pip --isolated install" in parser["run"]
     assert parser["working-directory"] == "${{ runner.temp }}"
     assert workflow["jobs"]["validate"]["needs"] == ["shards", "rollback-proof"]
-    assert WORKFLOW.read_text().index("      - name: Validate immutable dependency inputs") < WORKFLOW.read_text().index("      - name: Checkout axiom-encode")
+    # Shards validates the pins before any validate leg can check them out.
+    # The cross-job dependency above supplies the ordering guarantee.
+    validate_steps = workflow["jobs"]["validate"]["steps"]
+    checkouts = [s for s in validate_steps if str(s.get("name", "")).startswith("Checkout axiom-")]
+    assert checkouts
+    assert all("needs.shards.outputs." in checkout["with"]["ref"] for checkout in checkouts)
 
 
 def test_protected_workflow_yaml_cannot_disguise_active_composer() -> None:
@@ -5201,7 +5204,8 @@ class RollbackRewindFixture:
     def run(self, *, event: str = "pull_request", base_ref: str = "main",
             head: str | None = None, ref: str = "refs/heads/main",
             token: str = "fixture-api-token", verified_base: str | None = None,
-            verified_default: str | None = None) -> tuple[str, str]:
+            verified_default: str | None = None,
+            disable_site_packages: bool = False) -> tuple[str, str]:
         output = self.directory / "output"
         summary = self.directory / "summary"
         output.write_text("")
@@ -5231,7 +5235,8 @@ class RollbackRewindFixture:
             env["ROLLBACK_VERIFIED_BASE"] = verified_base
         if verified_default is not None:
             env["ROLLBACK_VERIFIED_DEFAULT_BRANCH"] = verified_default
-        result = subprocess.run([sys.executable, "-I", "-c", rollback_rewind_source()],
+        isolation = ["-I", "-S"] if disable_site_packages else ["-I"]
+        result = subprocess.run([sys.executable, *isolation, "-c", rollback_rewind_source()],
                                 cwd=self.root, env=env, capture_output=True, text=True)
         assert result.returncode == 0, result.stdout + result.stderr
         outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
@@ -5415,6 +5420,78 @@ def test_rollback_rewind_refuses_ledger_only_revocations_in_window() -> None:
         fixture.assert_refused()
 
 
+def test_rollback_rewind_binds_each_ledger_change_to_its_own_module() -> None:
+    # The review's P1/P2 probe: P1 retires module 1's waiver; P2 revokes
+    # module 2's waiver while editing only module 1. An exact revert of both
+    # must not restore waiver 2 through the unrelated module edit. Added and
+    # changed records need the same per-transition ownership check.
+    for change in ("remove", "add", "change"):
+        for matching_module in (False, True):
+            with RollbackRewindFixture(count=2) as fixture:
+                second = "us/statutes/26/2.yaml"
+
+                def retire_second(f):
+                    if change == "add":
+                        f.entries.pop(second)
+                        f.write_ledger(f.entries)
+                        f.write(second, "module: synthetic scratch fixture\nvalue: retired with P1\n")
+
+                fixture.retire(number=1, extra=retire_second)
+                if change == "remove":
+                    fixture.entries.pop(second)
+                else:
+                    fixture.entries[second] = {"active": waiver_record("b")}
+                fixture.write_ledger(fixture.entries)
+                edited = second if matching_module else fixture.module
+                fixture.write(edited, "module: synthetic scratch fixture\nvalue: P2 edit\n")
+                fixture.base = commit(fixture.root, f"P2 {change} waiver 2")
+                fixture.retirements.append(fixture.base)
+                fixture.revert()
+                effective, summary = fixture.run()
+                if matching_module:
+                    assert effective == fixture.x, (change, summary)
+                    assert fixture.ratchet(effective).returncode == 0
+                else:
+                    assert effective == fixture.base, (change, summary)
+                    assert "waiver without changing its module" in summary, summary
+                    assert fixture.ratchet(effective).returncode != 0
+
+
+def test_rollback_rewind_accepts_yaml_ledger_with_matching_module_changes() -> None:
+    import yaml
+
+    with RollbackRewindFixture(count=2) as fixture:
+        # Real callers use block YAML. The proof must compare parsed records,
+        # allowing a format-only rewrite of the untouched module 2 record.
+        fixture.write(fixture.ledger, yaml.safe_dump({"validate_failures": fixture.entries}))
+        raw = (fixture.root / fixture.ledger).read_bytes()
+        toolchain = (fixture.root / fixture.toolchain).read_text()
+        fixture.write(fixture.toolchain, re.sub(
+            r'validation_waiver_set_sha256 = "[0-9a-f]{64}"',
+            f'validation_waiver_set_sha256 = "{hashlib.sha256(raw).hexdigest()}"', toolchain,
+        ))
+        fixture.x = commit(fixture.root, "land block-YAML ledger baseline")
+        fixture.base = fixture.head = fixture.x
+        response = json.loads(fixture.api_response.read_text())
+        response[0]["merge_commit_sha"] = fixture.x
+        fixture.api_response.write_text(json.dumps(response))
+        fixture.retire(number=1)
+        fixture.revert()
+        effective, summary = fixture.run()
+        assert effective == fixture.x, summary
+        assert fixture.ratchet(effective).returncode == 0
+
+
+def test_rollback_rewind_keeps_ordinary_base_when_yaml_parser_unavailable() -> None:
+    with RollbackRewindFixture() as fixture:
+        fixture.retire()
+        fixture.revert()
+        effective, summary = fixture.run(disable_site_packages=True)
+        assert effective == fixture.base, summary
+        assert "proof failed (ModuleNotFoundError)" in summary, summary
+        assert fixture.ratchet(effective).returncode != 0
+
+
 def test_rollback_rewind_refuses_ledger_only_revocation_on_merged_side_branch() -> None:
     with RollbackRewindFixture(count=2) as fixture:
         git(fixture.root, "switch", "-qc", "side")
@@ -5536,6 +5613,101 @@ def test_rollback_rewind_consumer_recomputes_proof_using_only_trusted_job_output
             assert not fixture.api_calls.exists(), "consumer proof must not retry API authorization"
 
 
+def _rollback_rewind_event_expression(expression: str, context: dict[str, str]) -> str:
+    """Evaluate the actual gate expression's literals, equality and Boolean operators."""
+    import ast
+
+    assert expression.startswith("${{ ") and expression.endswith(" }}"), expression
+    source = re.sub(r"\b(?:github|steps)\.[A-Za-z0-9_.]+",
+                    lambda match: repr(context[match.group()]), expression[4:-3])
+    source = source.replace("&&", " and ").replace("||", " or ")
+    parsed = ast.parse(source, mode="eval")
+    assert all(isinstance(node, (ast.Expression, ast.BoolOp, ast.And, ast.Or,
+                                ast.Compare, ast.Eq, ast.Constant))
+               for node in ast.walk(parsed)), source
+    return eval(compile(parsed, "<workflow event expression>", "eval"), {"__builtins__": {}})
+
+
+def _assert_rollback_rewind_preserves_unsupported_event_comparison_bases(event: str) -> None:
+    """Execute all three real resolvers, preserving even legacy literal ref spellings."""
+    import yaml
+
+    steps = {step.get("name"): step for step in yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]}
+    freeze = steps["Verify immutable retired-schema freeze"]
+    audit = steps["Enforce validation waiver ratchet"]
+    guard = steps["Reject manual RuleSpec changes"]
+    freeze_source = freeze["run"].split('head_ref = os.environ["GITHUB_SHA"]\n', 1)[1].split(
+        "\nhead_raw = ", 1
+    )[0]
+    audit_source = audit["run"][audit["run"].index('if [ "${{ github.event_name }}"'):].split(
+        '\nprotected_base=', 1
+    )[0]
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        (root / "file.txt").write_text("one\n")
+        parent = commit(root, "first")
+        (root / "file.txt").write_text("two\n")
+        head = commit(root, "second")
+        # A nonempty proof output must never replace an unsupported event's
+        # prior base, even when it differs from every ordinary base below.
+        for pr_base in ("", "1" * 40):
+            for before in ("", "0" * 40, "3" * 40):
+                context = {
+                    "github.event_name": event,
+                    "github.event.pull_request.base.sha": pr_base,
+                    "github.event.merge_group.base_sha": "2" * 40,
+                    "github.event.before": before,
+                    "steps.rollback_rewind.outputs.effective_base": "f" * 40,
+                }
+                freeze_base = _rollback_rewind_event_expression(freeze["env"]["BASE_SHA"], context)
+                ordinary_freeze = pr_base or before
+                if not ordinary_freeze or ordinary_freeze == "0" * 40:
+                    ordinary_freeze = head + "^"
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", "import os\nhead_ref = os.environ['GITHUB_SHA']\n" +
+                     freeze_source + '\nprint(base_ref, end="")'],
+                    cwd=root, env={**os.environ, "GITHUB_SHA": head, "BASE_SHA": freeze_base},
+                    capture_output=True, text=True,
+                )
+                assert result.returncode == 0, result.stderr
+                assert result.stdout == ordinary_freeze, (event, "freeze", result.stdout, ordinary_freeze)
+
+                for consumer, source, expected in (
+                    (audit, audit_source, before if before and before != "0" * 40 else "HEAD~1"),
+                    (guard, guard_base_ref_source(), "2" * 40 if event == "merge_group" else
+                     before if before and before != "0" * 40 else parent),
+                ):
+                    for key, value in context.items():
+                        source = source.replace("${{ " + key + " }}", value)
+                    assert "${{" not in source, source
+                    name = "comparison_base" if consumer is audit else "base_ref"
+                    effective = _rollback_rewind_event_expression(consumer["env"]["EFFECTIVE_BASE"], context)
+                    result = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail\n" + source + '\nprintf %s "$' + name + '"\n'],
+                        cwd=root, env={**os.environ, "EFFECTIVE_BASE": effective}, capture_output=True, text=True,
+                    )
+                    assert result.returncode == 0, (event, consumer["name"], result.stderr)
+                    assert result.stdout == expected, (event, consumer["name"], result.stdout, expected)
+
+
+def test_rollback_rewind_preserves_pull_request_target_comparison_bases() -> None:
+    _assert_rollback_rewind_preserves_unsupported_event_comparison_bases("pull_request_target")
+
+
+def test_rollback_rewind_preserves_merge_group_comparison_bases() -> None:
+    _assert_rollback_rewind_preserves_unsupported_event_comparison_bases("merge_group")
+
+
+def test_rollback_rewind_preserves_other_unsupported_event_comparison_bases() -> None:
+    # Include a future event: support is an allow-list, so newly introduced
+    # events must also retain their original gate-specific fallback behavior.
+    for event in ("workflow_run", "repository_dispatch", "unknown_future_event"):
+        _assert_rollback_rewind_preserves_unsupported_event_comparison_bases(event)
+
+
 def test_rollback_rewind_keeps_restored_waiver_expiry_enforced() -> None:
     """Use the encoder's real loader when installed or explicitly supplied.
 
@@ -5617,7 +5789,7 @@ def test_rollback_rewind_static_trust_and_comparison_wiring() -> None:
 
     jobs = workflow["jobs"]
     resolvers = []
-    for job_name in ("rollback-proof", "shards", "validate"):
+    for job_name in ("rollback-proof", "validate"):
         job = jobs[job_name]
         steps = job["steps"]
         resolver = next(step for step in steps if step.get("id") == "rollback_rewind")
@@ -5649,6 +5821,7 @@ def test_rollback_rewind_static_trust_and_comparison_wiring() -> None:
             assert job["outputs"]["default_branch"] == "${{ steps.rollback_rewind.outputs.default_branch }}"
             assert [step["name"] for step in steps] == [
                 "Checkout rules repository", "Set up Python for rollback proof",
+                "Install the rollback ledger parser",
                 "Prove exact protected-main rollback rewind",
             ]
             assert steps[0]["with"]["persist-credentials"] is False
@@ -5657,11 +5830,16 @@ def test_rollback_rewind_static_trust_and_comparison_wiring() -> None:
         checkout = next(step for step in steps if step.get("name") == "Checkout rules repository")
         assert checkout["with"]["fetch-depth"] == 0
         assert steps.index(checkout) < steps.index(resolver)
+        parser = next(step for step in steps if step.get("name") == "Install the rollback ledger parser")
+        assert parser["continue-on-error"] is True
+        assert parser["working-directory"] == "${{ runner.temp }}"
+        assert "python -I -m pip --isolated install" in parser["run"]
+        assert "--only-binary=:all: pyyaml==6.0.3" in parser["run"]
+        assert steps.index(checkout) < steps.index(parser) < steps.index(resolver)
         if job_name != "rollback-proof":
-            later = "Install the ProgramSpec shape-check parser" if job_name == "shards" else "Install Python dependencies"
-            assert steps.index(resolver) < next(index for index, step in enumerate(steps) if step.get("name") == later)
+            assert steps.index(resolver) < next(index for index, step in enumerate(steps)
+                                               if step.get("name") == "Install Python dependencies")
     assert all(resolver["run"] == resolvers[0]["run"] for resolver in resolvers)
-    assert resolvers[1]["env"] == resolvers[2]["env"]
     assert "permissions" not in workflow
 
     # I2: only outputs from the inline proof select comparison bases. No
@@ -5676,11 +5854,12 @@ def test_rollback_rewind_static_trust_and_comparison_wiring() -> None:
     }
     steps = {step.get("name"): step for step in jobs["validate"]["steps"]}
     freeze = steps["Verify immutable retired-schema freeze"]
-    assert freeze["env"]["BASE_SHA"] == expression
+    supported = "(github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')"
+    assert freeze["env"]["BASE_SHA"] == "${{ " + supported + " && steps.rollback_rewind.outputs.effective_base || (github.event.pull_request.base.sha || github.event.before) }}"
     audit = steps["Enforce validation waiver ratchet"]
-    assert audit["env"]["EFFECTIVE_BASE"] == expression
+    assert audit["env"]["EFFECTIVE_BASE"] == "${{ " + supported + " && steps.rollback_rewind.outputs.effective_base || '' }}"
     assert 'comparison_base="$EFFECTIVE_BASE"' in audit["run"]
-    assert 'if [[ ! "$comparison_base" =~ ^[0-9a-f]{40}$ ]]; then' in audit["run"]
+    assert 'comparison_base="$base_ref"' in audit["run"]
     assert 'git show "$comparison_base:known-validation-gaps.yaml"' in audit["run"]
     assert 'git show "$comparison_base:.axiom/toolchain.toml"' in audit["run"]
     assert '"$base_ref" "$GITHUB_SHA"' in audit["run"]
@@ -5690,13 +5869,24 @@ def test_rollback_rewind_static_trust_and_comparison_wiring() -> None:
     assert "--allow-expired" not in audit["run"]
     guard = steps["Reject manual RuleSpec changes"]
     assert output_reference in guard["env"]["EFFECTIVE_BASE"]
-    assert "merge_group" in guard["env"]["EFFECTIVE_BASE"]
+    assert guard["env"]["EFFECTIVE_BASE"] == audit["env"]["EFFECTIVE_BASE"]
     assert 'base_ref="$EFFECTIVE_BASE"' in guard["run"]
     assert '--base-ref "$base_ref"' in guard["run"]
     assert expression not in json.dumps(steps["Select RuleSpec validation targets"])
     assert expression not in json.dumps(steps["Resolve RuleSpec toolchain"])
     assert expression not in json.dumps(next(step for step in jobs["shards"]["steps"]
                                            if step.get("id") == "dependency_inputs"))
+
+
+def test_rollback_rewind_shards_has_no_unused_proof() -> None:
+    import yaml
+
+    shards = yaml.safe_load(WORKFLOW.read_text())["jobs"]["shards"]
+    assert not any(step.get("id") == "rollback_rewind" for step in shards["steps"])
+    assert "rollback-proof" not in json.dumps(shards)
+    assert "rollback_rewind.outputs" not in json.dumps(shards)
+    # Removing the unused proof must retain dependency-input protection.
+    test_workflow_input_protection_precedes_dependency_checkout()
 
 
 def run_rollback_rewind_tests() -> None:
@@ -5710,13 +5900,20 @@ def run_rollback_rewind_tests() -> None:
         test_rollback_rewind_rejects_transient_disallowed_window_changes,
         test_rollback_rewind_rejects_module_additions_deletions_and_key_rotation,
         test_rollback_rewind_refuses_ledger_only_revocations_in_window,
+        test_rollback_rewind_binds_each_ledger_change_to_its_own_module,
+        test_rollback_rewind_accepts_yaml_ledger_with_matching_module_changes,
+        test_rollback_rewind_keeps_ordinary_base_when_yaml_parser_unavailable,
         test_rollback_rewind_refuses_ledger_only_revocation_on_merged_side_branch,
         test_rollback_rewind_refuses_untrusted_history_and_event_context,
         test_rollback_rewind_later_descendant_uses_normal_ratchet,
         test_rollback_rewind_does_not_execute_candidate_python_or_read_authorization_files,
         test_rollback_rewind_consumer_recomputes_proof_using_only_trusted_job_outputs,
+        test_rollback_rewind_preserves_pull_request_target_comparison_bases,
+        test_rollback_rewind_preserves_merge_group_comparison_bases,
+        test_rollback_rewind_preserves_other_unsupported_event_comparison_bases,
         test_rollback_rewind_keeps_restored_waiver_expiry_enforced,
         test_rollback_rewind_static_trust_and_comparison_wiring,
+        test_rollback_rewind_shards_has_no_unused_proof,
     )
     import unittest
     skipped = []
