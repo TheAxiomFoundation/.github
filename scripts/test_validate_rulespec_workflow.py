@@ -5604,7 +5604,9 @@ def test_rollback_rewind_timeout_fails_closed_and_aggregate_reports_failure() ->
     assert proof["timeout-minutes"] == 15
     assert not proof.get("continue-on-error", False)
     assert "rollback-proof" in jobs["validate"]["needs"]
-    assert "always()" not in jobs["validate"].get("if", "")
+    # validate runs only when every job it needs succeeded: any condition (always(),
+    # !cancelled(), ...) could run it on the ordinary base after a timed-out proof.
+    assert "if" not in jobs["validate"], jobs["validate"].get("if")
     complete = jobs["validate-complete"]
     assert complete["needs"] == "validate"
     assert complete["if"] == "${{ always() }}"
