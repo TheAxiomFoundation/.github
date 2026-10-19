@@ -160,7 +160,10 @@ jobs:
     # code; the jobs that install dependencies or run tests remain contents-only.
     name: rollback proof
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Allow 15 minutes for the 20-first-parent window, including merge-side
+    # history: the reviewed 80-transition case took 111 s before blob caching.
+    # This leaves over 8x that measured runtime for slower runners and setup.
+    timeout-minutes: 15
     outputs:
       effective_base: ${{ steps.rollback_rewind.outputs.effective_base }}
       default_branch: ${{ steps.rollback_rewind.outputs.default_branch }}
@@ -175,6 +178,93 @@ jobs:
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.14"
+
+      - name: Look up protected-main rollback landing
+        id: rollback_metadata
+        shell: bash
+        env:
+          ROLLBACK_EVENT_NAME: ${{ github.event_name }}
+          ROLLBACK_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          ROLLBACK_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          # The authenticated process uses only the standard library; -S also
+          # disables installed packages and their startup hooks. The separate
+          # parser process below never receives this token.
+          # rollback-metadata-start
+          python -I -S - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          admitted = default = ""
+          git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+          git_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_NO_REPLACE_OBJECTS="1")
+
+          def git(*args):
+              return subprocess.run(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                  env=git_env, check=True, capture_output=True,
+              ).stdout.decode().strip()
+
+          def api(endpoint):
+              request = urllib.request.Request(
+                  "https://api.github.com/" + endpoint,
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28"},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          try:
+              event = os.environ["ROLLBACK_EVENT_NAME"]
+              if event not in {"pull_request", "push", "schedule", "workflow_dispatch"}:
+                  raise ValueError("unsupported event")
+              base = os.environ["ROLLBACK_BASE_SHA"]
+              if event in {"schedule", "workflow_dispatch"} or not base or base == "0" * 40:
+                  base = git("rev-parse", "--verify", "HEAD~1^{commit}")
+              if not re.fullmatch(r"[0-9a-f]{40}", base):
+                  raise ValueError("invalid base")
+              tree = git("rev-parse", "--verify", "HEAD^{tree}")
+              candidate = base
+              for _ in range(20):
+                  candidate = git("rev-parse", "--verify", candidate + "^1^{commit}")
+                  if not re.fullmatch(r"[0-9a-f]{40}", candidate):
+                      raise ValueError("invalid candidate")
+                  if git("rev-parse", "--verify", candidate + "^{tree}") == tree:
+                      break
+              else:
+                  raise ValueError("no matching tree")
+              repo = os.environ["ROLLBACK_REPOSITORY"]
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not os.environ.get("GH_TOKEN"):
+                  raise ValueError("repository or token unavailable")
+              default = api(f"repos/{repo}")["default_branch"]
+              if not isinstance(default, str) or not default or "\n" in default or "\r" in default:
+                  raise ValueError("invalid default branch")
+              pulls = api(f"repos/{repo}/commits/{candidate}/pulls?per_page=100")
+              if not isinstance(pulls, list) or not any(
+                  isinstance(pr, dict) and pr.get("merge_commit_sha") == candidate and pr.get("merged_at")
+                  and pr.get("base", {}).get("ref") == default
+                  and pr.get("base", {}).get("repo", {}).get("full_name") == repo
+                  for pr in pulls
+              ):
+                  raise ValueError("matching state is not a merged landing")
+              admitted = candidate
+          except Exception:
+              # Failed lookups supply no admission, and never echo API errors
+              # or authentication material into logs or workflow outputs.
+              admitted = default = ""
+              print("Rollback metadata unavailable; keeping the ordinary base.")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"admitted_base={admitted}", file=output)
+              print(f"default_branch={default}", file=output)
+          PY
+          # rollback-metadata-end
 
       - name: Install the rollback ledger parser
         # Parser unavailability must refuse rewind while retaining the ordinary
@@ -196,7 +286,8 @@ jobs:
           ROLLBACK_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
           ROLLBACK_REF: ${{ github.ref }}
           ROLLBACK_REPOSITORY: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
+          ROLLBACK_VERIFIED_BASE: ${{ steps.rollback_metadata.outputs.admitted_base }}
+          ROLLBACK_VERIFIED_DEFAULT_BRANCH: ${{ steps.rollback_metadata.outputs.default_branch }}
         run: &rollback-rewind-run |
           set -euo pipefail
           unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
@@ -273,12 +364,18 @@ jobs:
           def blob(ref, path):
               return git("show", ref + ":" + path)
 
+          ledger_cache = {}
+
           def ledger_entries(ref):
+              oid = git("rev-parse", "--verify", ref + ":" + LEDGER).decode().strip()
+              require(SHA.fullmatch(oid), "window ledger is not an exact blob")
+              if oid in ledger_cache:
+                  return ledger_cache[oid]
               # Installed independently of candidate dependencies. Import here
               # so a missing parser refuses the proof and keeps the real base.
               import yaml
 
-              raw = blob(ref, LEDGER)
+              raw = git("cat-file", "blob", oid)
               require(len(raw) <= 2_000_000, "window ledger exceeds the size limit")
               for event in yaml.parse(raw, Loader=yaml.SafeLoader):
                   require(not isinstance(event, yaml.events.AliasEvent)
@@ -308,8 +405,9 @@ jobs:
               # Canonical JSON keeps scalar types distinct while allowing YAML
               # formatting changes. The ordinary head audit still checks schema
               # and expiry; it never inherits this historical comparison base.
-              return {path: json.dumps(record, sort_keys=True, allow_nan=False)
-                      for path, record in entries.items()}
+              ledger_cache[oid] = {path: json.dumps(record, sort_keys=True, allow_nan=False)
+                                   for path, record in entries.items()}
+              return ledger_cache[oid]
 
           def masked_toolchain(ref):
               raw = blob(ref, TOOLCHAIN)
@@ -359,6 +457,12 @@ jobs:
               # commits of merges. Hidden configuration edits/cancellations and
               # unrelated-module edits cannot conceal deliberate revocations.
               paths = changes(candidate, base)
+              if LEDGER in paths:
+                  before_entries, after_entries = ledger_entries(candidate), ledger_entries(base)
+                  changed_keys = {path for path in before_entries.keys() | after_entries.keys()
+                                  if before_entries.get(path) != after_entries.get(path)}
+                  require(changed_keys <= {path for path in paths if module_path(path)},
+                          "net window ledger changes a waiver without changing its module")
               for revision in git("rev-list", candidate + ".." + base).decode().splitlines():
                   parent = commit(revision + "^1")
                   changed = changes(parent, revision)
@@ -380,41 +484,17 @@ jobs:
 
               repo = os.environ["ROLLBACK_REPOSITORY"]
               require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo), "invalid repository identity")
-              # A denied/missing token or failed/ambiguous API response is a
-              # refusal, never an anonymous retry or an authorization hint.
-              def api(endpoint):
-                  response = subprocess.run(
-                      ["gh", "api", "--method", "GET", endpoint],
-                      check=True, capture_output=True, timeout=30,
-                  )
-                  return json.loads(response.stdout)
-
-              if "ROLLBACK_VERIFIED_BASE" in os.environ:
-                  # Recompute every immutable Git check in each consumer job.
-                  # Only same-run outputs of the candidate-free proof job may
-                  # replace its API evidence; no local file can grant access.
-                  require(candidate == os.environ["ROLLBACK_VERIFIED_BASE"],
-                          "isolated proof did not admit this historical state")
-                  default = os.environ["ROLLBACK_VERIFIED_DEFAULT_BRANCH"]
-              else:
-                  require(bool(os.environ.get("GH_TOKEN")), "PR lookup token unavailable; caller needs pull-requests: read")
-                  # Repository metadata comes from the authenticated API, not an
-                  # additional event field or candidate-controlled default ref.
-                  default = api(f"repos/{repo}")["default_branch"]
+              # Recompute all immutable checks after the authenticated lookup,
+              # and again in consumer jobs. Only trusted same-run step/job
+              # outputs may supply API evidence; this parser gets no token.
+              require(candidate == os.environ["ROLLBACK_VERIFIED_BASE"],
+                      "isolated lookup/proof did not admit this historical state")
+              default = os.environ["ROLLBACK_VERIFIED_DEFAULT_BRANCH"]
               require(isinstance(default, str) and bool(default), "default branch is unavailable")
               if event == "pull_request":
                   require(os.environ["ROLLBACK_BASE_REF"] == default, "PR base is not the default branch")
               else:
                   require(os.environ["ROLLBACK_REF"] == "refs/heads/" + default, "event is not on the default branch")
-              if "ROLLBACK_VERIFIED_BASE" not in os.environ:
-                  pulls = api(f"repos/{repo}/commits/{candidate}/pulls?per_page=100")
-                  require(isinstance(pulls, list), "invalid PR lookup response")
-                  require(any(
-                      isinstance(pr, dict) and pr.get("merge_commit_sha") == candidate and pr.get("merged_at")
-                      and pr.get("base", {}).get("ref") == default
-                      and pr.get("base", {}).get("repo", {}).get("full_name") == repo
-                      for pr in pulls
-                  ), "matching tree is not a merged PR landing on the default branch")
               effective_base = candidate
               reason = f"rewound to X={candidate}, k={k}"
           except Exception as exc:
@@ -422,8 +502,6 @@ jobs:
               # credentials or multiline summary directives).
               if isinstance(exc, ValueError):
                   reason = str(exc)
-              elif isinstance(exc, subprocess.CalledProcessError) and exc.cmd[0] == "gh":
-                  reason = "API lookup failed; caller needs pull-requests: read for PR lookup"
               elif isinstance(exc, subprocess.CalledProcessError):
                   reason = "required Git objects or first-parent history unavailable"
               else:
