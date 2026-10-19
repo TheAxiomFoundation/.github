@@ -147,11 +147,377 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
+# Inherit the caller's token ceiling: existing contents-only callers must keep
+# running when the optional PR-landing lookup is denied. To enable rewind,
+# callers must grant contents: read and pull-requests: read (no write scope).
+# An explicit pull-requests grant here would reject older callers before the
+# verifier could fail closed. Only the isolated proof job inherits permissions;
+# candidate-code jobs retain their contents-only token cap.
 
 jobs:
+  rollback-proof:
+    # Only this job inherits optional caller permissions. It runs no candidate
+    # code; the jobs that install dependencies or run tests remain contents-only.
+    name: rollback proof
+    runs-on: ubuntu-latest
+    # Allow 15 minutes for the 20-first-parent window, including merge-side
+    # history: the reviewed 80-transition case took 111 s before blob caching.
+    # This leaves over 8x that measured runtime for slower runners and setup.
+    timeout-minutes: 15
+    outputs:
+      effective_base: ${{ steps.rollback_rewind.outputs.effective_base }}
+      default_branch: ${{ steps.rollback_rewind.outputs.default_branch }}
+    steps:
+      - name: Checkout rules repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python for rollback proof
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Look up protected-main rollback landing
+        id: rollback_metadata
+        shell: bash
+        env:
+          ROLLBACK_EVENT_NAME: ${{ github.event_name }}
+          ROLLBACK_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          ROLLBACK_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          # The authenticated process uses only the standard library; -S also
+          # disables installed packages and their startup hooks. The separate
+          # parser process below never receives this token.
+          # rollback-metadata-start
+          python -I -S - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          admitted = default = ""
+          git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+          git_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_NO_REPLACE_OBJECTS="1")
+
+          def git(*args):
+              return subprocess.run(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                  env=git_env, check=True, capture_output=True,
+              ).stdout.decode().strip()
+
+          def api(endpoint):
+              request = urllib.request.Request(
+                  "https://api.github.com/" + endpoint,
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28"},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          try:
+              event = os.environ["ROLLBACK_EVENT_NAME"]
+              if event not in {"pull_request", "push", "schedule", "workflow_dispatch"}:
+                  raise ValueError("unsupported event")
+              base = os.environ["ROLLBACK_BASE_SHA"]
+              if event in {"schedule", "workflow_dispatch"} or not base or base == "0" * 40:
+                  base = git("rev-parse", "--verify", "HEAD~1^{commit}")
+              if not re.fullmatch(r"[0-9a-f]{40}", base):
+                  raise ValueError("invalid base")
+              tree = git("rev-parse", "--verify", "HEAD^{tree}")
+              candidate = base
+              for _ in range(20):
+                  candidate = git("rev-parse", "--verify", candidate + "^1^{commit}")
+                  if not re.fullmatch(r"[0-9a-f]{40}", candidate):
+                      raise ValueError("invalid candidate")
+                  if git("rev-parse", "--verify", candidate + "^{tree}") == tree:
+                      break
+              else:
+                  raise ValueError("no matching tree")
+              repo = os.environ["ROLLBACK_REPOSITORY"]
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not os.environ.get("GH_TOKEN"):
+                  raise ValueError("repository or token unavailable")
+              default = api(f"repos/{repo}")["default_branch"]
+              if not isinstance(default, str) or not default or "\n" in default or "\r" in default:
+                  raise ValueError("invalid default branch")
+              pulls = api(f"repos/{repo}/commits/{candidate}/pulls?per_page=100")
+              if not isinstance(pulls, list) or not any(
+                  isinstance(pr, dict) and pr.get("merge_commit_sha") == candidate and pr.get("merged_at")
+                  and pr.get("base", {}).get("ref") == default
+                  and pr.get("base", {}).get("repo", {}).get("full_name") == repo
+                  for pr in pulls
+              ):
+                  raise ValueError("matching state is not a merged landing")
+              admitted = candidate
+          except Exception:
+              # Failed lookups supply no admission, and never echo API errors
+              # or authentication material into logs or workflow outputs.
+              admitted = default = ""
+              print("Rollback metadata unavailable; keeping the ordinary base.")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"admitted_base={admitted}", file=output)
+              print(f"default_branch={default}", file=output)
+          PY
+          # rollback-metadata-end
+
+      - name: Install the rollback ledger parser
+        # Parser unavailability must refuse rewind while retaining the ordinary
+        # comparison base. Install only a pinned wheel, outside candidate code.
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}
+        run: &rollback-ledger-parser-install |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          python -I -m pip --isolated install --disable-pip-version-check --only-binary=:all: pyyaml==6.0.3
+
+      - name: Prove exact protected-main rollback rewind
+        id: rollback_rewind
+        shell: bash
+        env:
+          ROLLBACK_EVENT_NAME: ${{ github.event_name }}
+          ROLLBACK_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          ROLLBACK_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ROLLBACK_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          ROLLBACK_REF: ${{ github.ref }}
+          ROLLBACK_REPOSITORY: ${{ github.repository }}
+          ROLLBACK_VERIFIED_BASE: ${{ steps.rollback_metadata.outputs.admitted_base }}
+          ROLLBACK_VERIFIED_DEFAULT_BRANCH: ${{ steps.rollback_metadata.outputs.default_branch }}
+        run: &rollback-rewind-run |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          # rollback-rewind-start
+          python -I - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tomllib
+
+          N = 20  # Policy constant; never a caller input or event hint.
+          SHA = re.compile(r"[0-9a-f]{40}")
+          LEDGER = "known-validation-gaps.yaml"
+          TOOLCHAIN = ".axiom/toolchain.toml"
+          DIGEST = re.compile(rb'(?m)^validation_waiver_set_sha256 = "(?P<digest>[0-9a-f]{64})"$')
+          # Same module class as encoded_module_path below and the encoder's
+          # protected roots. ProgramSpecs and companion tests are not modules.
+          ENCODED_ROOTS = {"legislation", "policies", "regulations", "statutes"}
+          JURISDICTION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*")
+
+          def module_path(path):
+              if not path.endswith(".yaml") or path.endswith(".test.yaml"):
+                  return False
+              parts = path.split("/")
+              return (len(parts) >= 2 and parts[0] in ENCODED_ROOTS) or (
+                  len(parts) >= 3 and parts[1] in ENCODED_ROOTS
+                  and JURISDICTION.fullmatch(parts[0]) is not None
+              )
+
+          def manifest_path(path):
+              # Encoder _is_encoder_apply_manifest_path: repository root only.
+              return path.startswith(".axiom/encoding-manifests/") and path.endswith(".json")
+
+          def require(condition, reason):
+              if not condition:
+                  raise ValueError(reason)
+
+          # Ignore ambient Git object/config overrides as well as user/system
+          # config. All reads below use immutable objects, never candidate code,
+          # helpers, worktree files, textconv, filters or external diff drivers.
+          git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+          git_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_NO_REPLACE_OBJECTS="1")
+
+          def git(*args):
+              result = subprocess.run(
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                  env=git_env, check=True, capture_output=True,
+              )
+              return result.stdout
+
+          def commit(ref):
+              oid = git("rev-parse", "--verify", ref + "^{commit}").decode().strip()
+              require(SHA.fullmatch(oid), "base is not an exact commit")
+              return oid
+
+          def changes(before, after):
+              fields = git(
+                  "diff", "--raw", "-z", "--no-abbrev", "--no-renames",
+                  "--no-ext-diff", "--no-textconv", before, after, "--",
+              ).split(b"\0")
+              require(fields.pop() == b"", "malformed Git diff")
+              require(len(fields) % 2 == 0, "ambiguous Git diff")
+              paths = set()
+              for metadata, raw_path in zip(fields[::2], fields[1::2]):
+                  path = raw_path.decode("utf-8")
+                  require(metadata.split()[-1] == b"M", "window contains a non-modification change")
+                  require(module_path(path) or manifest_path(path) or path in {LEDGER, TOOLCHAIN},
+                          "window changes a path outside the module/manifest/waiver allowlist")
+                  paths.add(path)
+              return paths
+
+          def blob(ref, path):
+              return git("show", ref + ":" + path)
+
+          ledger_cache = {}
+
+          def ledger_entries(ref):
+              oid = git("rev-parse", "--verify", ref + ":" + LEDGER).decode().strip()
+              require(SHA.fullmatch(oid), "window ledger is not an exact blob")
+              if oid in ledger_cache:
+                  return ledger_cache[oid]
+              # Installed independently of candidate dependencies. Import here
+              # so a missing parser refuses the proof and keeps the real base.
+              import yaml
+
+              raw = git("cat-file", "blob", oid)
+              require(len(raw) <= 2_000_000, "window ledger exceeds the size limit")
+              for event in yaml.parse(raw, Loader=yaml.SafeLoader):
+                  require(not isinstance(event, yaml.events.AliasEvent)
+                          and getattr(event, "anchor", None) is None,
+                          "window ledger contains YAML anchors or aliases")
+
+              class UniqueLoader(yaml.SafeLoader):
+                  pass
+
+              def mapping(loader, node):
+                  result = {}
+                  for key_node, value_node in node.value:
+                      key = loader.construct_object(key_node)
+                      require(isinstance(key, str) and key != "<<" and key not in result,
+                              "window ledger contains ambiguous mapping keys")
+                      result[key] = loader.construct_object(value_node)
+                  return result
+
+              UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+              payload = yaml.load(raw, Loader=UniqueLoader)
+              require(isinstance(payload, dict) and set(payload) == {"validate_failures"},
+                      "window ledger has an unsupported schema")
+              entries = payload["validate_failures"]
+              require(isinstance(entries, dict), "window ledger entries are not a mapping")
+              require(all(module_path(path) for path in entries),
+                      "window ledger key is not a module path")
+              # Canonical JSON keeps scalar types distinct while allowing YAML
+              # formatting changes. The ordinary head audit still checks schema
+              # and expiry; it never inherits this historical comparison base.
+              ledger_cache[oid] = {path: json.dumps(record, sort_keys=True, allow_nan=False)
+                                   for path, record in entries.items()}
+              return ledger_cache[oid]
+
+          def masked_toolchain(ref):
+              raw = blob(ref, TOOLCHAIN)
+              matches = list(DIGEST.finditer(raw))
+              require(len(matches) == 1, "toolchain digest field is not canonical")
+              match = matches[0]
+              payload = tomllib.loads(raw.decode("utf-8"))
+              require(payload["toolchain"]["validation_waiver_set_sha256"] == match["digest"].decode(),
+                      "toolchain digest field is ambiguous")
+              return raw[:match.start("digest")] + b"0" * 64 + raw[match.end("digest"):]
+
+          base = os.environ.get("ROLLBACK_BASE_SHA", "")
+          effective_base = base
+          default = ""
+          reason = "proof unavailable"
+          try:
+              event = os.environ["ROLLBACK_EVENT_NAME"]
+              if event in {"schedule", "workflow_dispatch"} or not base or base == "0" * 40:
+                  base = commit("HEAD~1")
+              effective_base = base
+              require(SHA.fullmatch(base), "event base is not an exact commit")
+              require(git("rev-parse", "--is-shallow-repository").strip() == b"false", "shallow history")
+              require(not git("for-each-ref", "--format=%(refname)", "refs/replace/").strip(), "replace refs present")
+              grafts = Path(os.fsdecode(git("rev-parse", "--git-path", "info/grafts").strip()))
+              require(not grafts.exists(), "grafts present")
+              require(commit(base) == base, "event base is unavailable")
+              if event == "pull_request":
+                  head = os.environ["ROLLBACK_HEAD_SHA"]
+                  require(SHA.fullmatch(head), "PR head is not an exact commit")
+                  try:
+                      git("merge-base", "--is-ancestor", base, head)
+                  except subprocess.CalledProcessError:
+                      raise ValueError("PR head does not contain the protected base") from None
+              elif event not in {"push", "schedule", "workflow_dispatch"}:
+                  raise ValueError("event does not support rewind")
+
+              tree = git("rev-parse", "--verify", "HEAD^{tree}").strip()
+              candidate = base
+              for k in range(1, N + 1):
+                  candidate = commit(candidate + "^1")
+                  if git("rev-parse", "--verify", candidate + "^{tree}").strip() == tree:
+                      break
+              else:
+                  raise ValueError("no exact first-parent tree within 20 steps")
+
+              # Inspect the net window AND every transition, including side
+              # commits of merges. Hidden configuration edits/cancellations and
+              # unrelated-module edits cannot conceal deliberate revocations.
+              paths = changes(candidate, base)
+              if LEDGER in paths:
+                  before_entries, after_entries = ledger_entries(candidate), ledger_entries(base)
+                  changed_keys = {path for path in before_entries.keys() | after_entries.keys()
+                                  if before_entries.get(path) != after_entries.get(path)}
+                  require(changed_keys <= {path for path in paths if module_path(path)},
+                          "net window ledger changes a waiver without changing its module")
+              for revision in git("rev-list", candidate + ".." + base).decode().splitlines():
+                  parent = commit(revision + "^1")
+                  changed = changes(parent, revision)
+                  if LEDGER in changed:
+                      before_entries, after_entries = ledger_entries(parent), ledger_entries(revision)
+                      changed_keys = {path for path in before_entries.keys() | after_entries.keys()
+                                      if before_entries.get(path) != after_entries.get(path)}
+                      require(changed_keys <= {path for path in changed if module_path(path)},
+                              "window ledger changes a waiver without changing its module")
+                  if TOOLCHAIN in changed:
+                      require(masked_toolchain(parent) == masked_toolchain(revision),
+                              "window changes toolchain bytes beyond the waiver digest")
+              require(masked_toolchain(candidate) == masked_toolchain(base),
+                      "toolchain differs beyond the waiver digest")
+              for path in sorted(path for path in paths if manifest_path(path)):
+                  keys = [json.loads(blob(ref, path))["signature"]["key_id"] for ref in (candidate, base)]
+                  require(isinstance(keys[0], str) and bool(keys[0]) and keys[0] == keys[1],
+                          "manifest signing key changed")
+
+              repo = os.environ["ROLLBACK_REPOSITORY"]
+              require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo), "invalid repository identity")
+              # Recompute all immutable checks after the authenticated lookup,
+              # and again in consumer jobs. Only trusted same-run step/job
+              # outputs may supply API evidence; this parser gets no token.
+              require(candidate == os.environ["ROLLBACK_VERIFIED_BASE"],
+                      "isolated lookup/proof did not admit this historical state")
+              default = os.environ["ROLLBACK_VERIFIED_DEFAULT_BRANCH"]
+              require(isinstance(default, str) and bool(default), "default branch is unavailable")
+              if event == "pull_request":
+                  require(os.environ["ROLLBACK_BASE_REF"] == default, "PR base is not the default branch")
+              else:
+                  require(os.environ["ROLLBACK_REF"] == "refs/heads/" + default, "event is not on the default branch")
+              effective_base = candidate
+              reason = f"rewound to X={candidate}, k={k}"
+          except Exception as exc:
+              # Do not echo subprocess stderr or event text (which could carry
+              # credentials or multiline summary directives).
+              if isinstance(exc, ValueError):
+                  reason = str(exc)
+              elif isinstance(exc, subprocess.CalledProcessError):
+                  reason = "required Git objects or first-parent history unavailable"
+              else:
+                  reason = f"proof failed ({type(exc).__name__})"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"effective_base={effective_base}", file=output)
+              print(f"default_branch={default}", file=output)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              print("Rollback rewind: " + ("" if effective_base != base else "no rewind: ") + reason + ".", file=summary)
+          PY
+          # rollback-rewind-end
+
   shards:
+    permissions:
+      contents: read
     name: shards
     runs-on: ubuntu-latest
     # Observed 7-9 s. The runner default is 360 minutes.
@@ -2496,11 +2862,13 @@ jobs:
           echo "Shards: $matrix"
 
   validate:
+    permissions:
+      contents: read
     # Keep the check name exactly `validate` across matrix legs so existing
     # required-status configs keep matching; legacy repos run one `__all__`
     # leg with behavior identical to the pre-shard workflow.
     name: validate
-    needs: shards
+    needs: [shards, rollback-proof]
     env:
       # Read-only Git consumers must not refresh dependency index metadata.
       GIT_OPTIONAL_LOCKS: "0"
@@ -2711,6 +3079,25 @@ jobs:
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ inputs.python-version }}
+
+      - name: Install the rollback ledger parser
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}
+        run: *rollback-ledger-parser-install
+
+      - name: Prove exact protected-main rollback rewind
+        id: rollback_rewind
+        shell: bash
+        env:
+          ROLLBACK_EVENT_NAME: ${{ github.event_name }}
+          ROLLBACK_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          ROLLBACK_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ROLLBACK_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          ROLLBACK_REF: ${{ github.ref }}
+          ROLLBACK_REPOSITORY: ${{ github.repository }}
+          ROLLBACK_VERIFIED_BASE: ${{ needs.rollback-proof.outputs.effective_base }}
+          ROLLBACK_VERIFIED_DEFAULT_BRANCH: ${{ needs.rollback-proof.outputs.default_branch }}
+        run: *rollback-rewind-run
 
       - name: Resolve RuleSpec toolchain
         id: toolchain
@@ -3190,7 +3577,7 @@ jobs:
       - name: Verify immutable retired-schema freeze
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.rollback_rewind.outputs.effective_base || (github.event.pull_request.base.sha || github.event.before) }}
           BOOTSTRAP_SHA256: ${{ inputs.retired-schema-bootstrap-sha256 }}
           CALLER_REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
@@ -3877,6 +4264,7 @@ jobs:
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           MIGRATION_AUTHORIZED: ${{ steps.migration_authorization.outputs.authorized }}
           MIGRATION_CANDIDATE: ${{ steps.migration_authorization.outputs.candidate }}
+          EFFECTIVE_BASE: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.rollback_rewind.outputs.effective_base || '' }}
         run: |
           set -euo pipefail
           unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
@@ -3887,6 +4275,16 @@ jobs:
             base_ref="${{ github.event.before }}"
           else
             base_ref="HEAD~1"
+          fi
+          # Rewind comparison gates only. Selection and the signed audit's
+          # changed paths still use the actual event base above.
+          comparison_base="$base_ref"
+          if [ -n "${EFFECTIVE_BASE:-}" ]; then
+            if [[ ! "$EFFECTIVE_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "ValidationWaiverBaseMissing: comparison base must be an exact commit" >&2
+              exit 1
+            fi
+            comparison_base="$EFFECTIVE_BASE"
           fi
           protected_base="$RUNNER_TEMP/protected-known-validation-gaps.yaml"
           protected_base_toolchain="$RUNNER_TEMP/protected-toolchain.toml"
@@ -3911,7 +4309,7 @@ jobs:
             cp known-validation-gaps.yaml "$protected_base"
             echo "Accepted exact rulespec-us PR #911 validation-waiver bootstrap."
           else
-            git show "$base_ref:known-validation-gaps.yaml" > "$protected_base" || {
+            git show "$comparison_base:known-validation-gaps.yaml" > "$protected_base" || {
               echo "ValidationWaiverBaseMissing: protected base must contain known-validation-gaps.yaml" >&2
               exit 1
               }
@@ -3925,7 +4323,7 @@ jobs:
             # Its historical parent may predate the toolchain pin entirely.
             cp .axiom/toolchain.toml "$protected_base_toolchain"
           else
-            git show "$base_ref:.axiom/toolchain.toml" > "$protected_base_toolchain" || {
+            git show "$comparison_base:.axiom/toolchain.toml" > "$protected_base_toolchain" || {
               echo "ValidationWaiverBaseToolchainMissing: protected base must contain .axiom/toolchain.toml" >&2
               exit 1
             }
@@ -4558,6 +4956,8 @@ jobs:
         shell: bash
         env:
           DEPENDENCY_PINS_CHANGED: ${{ needs.shards.outputs.dependency_pins_changed }}
+          # Unsupported events retain each gate's original comparison base.
+          EFFECTIVE_BASE: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.rollback_rewind.outputs.effective_base || '' }}
         run: |
           set -euo pipefail
           unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
@@ -4580,6 +4980,16 @@ jobs:
           if [[ ! "$base_ref" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GeneratedGuardBaseRef: base ref must be an exact 40-hex commit, got '$base_ref'" >&2
             exit 1
+          fi
+          # Only supported events receive the inline proof's output. Other
+          # events, including pull_request_target and merge_group, retain the
+          # original comparison base resolved above.
+          if [ -n "${EFFECTIVE_BASE:-}" ]; then
+            if [[ ! "$EFFECTIVE_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "GeneratedGuardBaseRef: effective base must be an exact commit" >&2
+              exit 1
+            fi
+            base_ref="$EFFECTIVE_BASE"
           fi
           # generated-guard-base-ref-end
 
@@ -5174,6 +5584,8 @@ jobs:
           fi
 
   validate-complete:
+    permissions:
+      contents: read
     # Matrix jobs get suffixed check names such as `validate (us-ca)`.
     # Keep this aggregate name as `validate` so existing branch-protection
     # rules requiring `validate / validate` have one stable context.
