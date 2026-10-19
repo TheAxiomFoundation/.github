@@ -109,11 +109,12 @@ evidence to retain at the exact adopted validator SHA.
 For `pull_request`, `push`, `schedule`, and `workflow_dispatch`, the workflow can
 rewind its comparison base when the entire checked-out tree exactly returns to
 a merged PR landing on the default branch within the preceding 20 first-parent
-commits. The reverted window must contain only modifications to RuleSpec
-modules, their encoding manifests, `known-validation-gaps.yaml`, and the waiver
-ledger digest in `.axiom/toolchain.toml`. Each added, removed, or changed ledger
-key must name a module changed in that same transition, and manifest signing
-keys must remain unchanged.
+commits. Call the matching earlier commit X and the ordinary comparison base B.
+The reverted window must contain only modifications to RuleSpec modules, any
+`.json` under `.axiom/encoding-manifests/`, `known-validation-gaps.yaml`, and the
+waiver ledger digest in `.axiom/toolchain.toml`. Each added, removed, or changed
+ledger key must name a module changed in that same transition and, for the net
+diff, across X..B. Manifest signing-key equality is checked between X and B only.
 
 Partial reverts, extra edits, additions, deletions, renames, changes outside that
 allowlist, other toolchain changes, and unrelated waiver revocations keep the
@@ -129,7 +130,17 @@ planned next step.
 An admitted rewind changes only the freeze, waiver ratchets, supervised audit
 baseline, and generated guard comparisons. Selection and the audit's changed
 paths still use the ordinary base, so restored modules are revalidated and
-expired waivers still fail.
+expired waivers still fail in callers' pinned supervised audit. The shared CI
+expiry regression is skipped without an encoder loader; setting
+`AXIOM_ENCODE_SOURCE` to the pinned encoder's loader enables that regression.
+
+Ledger parses are cached by immutable blob ID within each proof run. The proof
+job has a 15-minute timeout: the review's 20-PR merge window with 80 transitions
+took 110.5 seconds before caching, so this budget allows over eight times that
+runtime for slower runners. Side-branch history can be larger, so this is an
+operational budget rather than a guaranteed runtime bound. A timeout never
+admits a rewind: it fails the proof job, skips dependent validation, and makes
+the aggregate check fail.
 
 ### Import-aware PR selection
 

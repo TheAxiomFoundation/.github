@@ -6114,6 +6114,10 @@ def test_rollback_rewind_caller_documents_scope_and_permissions() -> None:
         "pull-requests: read", "contents: read", "lookup is denied",
         "companion `.test.yaml` files, test files, or file\nadditions",
         "ordinary base today", "planned next step", "expired waivers still fail",
+        "`.json` under `.axiom/encoding-manifests/`",
+        "across X..B", "between X and B only",
+        "callers' pinned supervised audit", "skipped without an encoder loader",
+        "15-minute timeout", "aggregate check fail",
     ):
         assert required in section, required
     assert "permissions:\n  contents: read\n  pull-requests: read\n" in readme
