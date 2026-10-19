@@ -31,6 +31,10 @@ Jurisdiction rule repositories should keep a small local `validate` workflow tha
 calls the centralized reusable workflow in this repository:
 
 ```yaml
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   validate:
     uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@<workflow-commit-sha>
@@ -99,6 +103,33 @@ pinned encoder's typed waiver audit with the protected base revision. Audit
 that command for rejection of new or broadened waivers. Pin-only updates require
 full RuleSpec revalidation; the acceptance checklist specifies the hosted
 evidence to retain at the exact adopted validator SHA.
+
+### Exact rollback rewind
+
+For `pull_request`, `push`, `schedule`, and `workflow_dispatch`, the workflow can
+rewind its comparison base when the entire checked-out tree exactly returns to
+a merged PR landing on the default branch within the preceding 20 first-parent
+commits. The reverted window must contain only modifications to RuleSpec
+modules, their encoding manifests, `known-validation-gaps.yaml`, and the waiver
+ledger digest in `.axiom/toolchain.toml`. Each added, removed, or changed ledger
+key must name a module changed in that same transition, and manifest signing
+keys must remain unchanged.
+
+Partial reverts, extra edits, additions, deletions, renames, changes outside that
+allowlist, other toolchain changes, and unrelated waiver revocations keep the
+ordinary base. Unavailable history or PR metadata and unsupported events also
+keep the ordinary base. Callers must grant `pull-requests: read` alongside
+`contents: read`, as shown above, so the proof can verify the historical PR
+landing. If that lookup is denied, the proof keeps the ordinary base.
+
+Real revert windows touching companion `.test.yaml` files, test files, or file
+additions fall back to the ordinary base today. Admitting those windows is the
+planned next step.
+
+An admitted rewind changes only the freeze, waiver ratchets, supervised audit
+baseline, and generated guard comparisons. Selection and the audit's changed
+paths still use the ordinary base, so restored modules are revalidated and
+expired waivers still fail.
 
 ### Import-aware PR selection
 

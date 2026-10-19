@@ -5889,6 +5889,20 @@ def test_rollback_rewind_shards_has_no_unused_proof() -> None:
     test_workflow_input_protection_precedes_dependency_checkout()
 
 
+def test_rollback_rewind_caller_documents_scope_and_permissions() -> None:
+    readme = (ROOT / "README.md").read_text()
+    section = readme.split("### Exact rollback rewind\n", 1)[1].split("\n### ", 1)[0]
+    for required in (
+        "entire checked-out tree", "merged PR landing", "20 first-parent",
+        "only modifications", "signing", "Partial reverts", "additions",
+        "pull-requests: read", "contents: read", "lookup is denied",
+        "companion `.test.yaml` files, test files, or file\nadditions",
+        "ordinary base today", "planned next step", "expired waivers still fail",
+    ):
+        assert required in section, required
+    assert "permissions:\n  contents: read\n  pull-requests: read\n" in readme
+
+
 def run_rollback_rewind_tests() -> None:
     tests = (
         test_rollback_rewind_accepts_exact_suffixes_and_all_supported_events,
@@ -5914,6 +5928,7 @@ def run_rollback_rewind_tests() -> None:
         test_rollback_rewind_keeps_restored_waiver_expiry_enforced,
         test_rollback_rewind_static_trust_and_comparison_wiring,
         test_rollback_rewind_shards_has_no_unused_proof,
+        test_rollback_rewind_caller_documents_scope_and_permissions,
     )
     import unittest
     skipped = []
