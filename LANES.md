@@ -4,8 +4,8 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-22 — Stage pending waiver fingerprint for 7 CFR 273.4 under encoder 0.2.2248 (#1850) | 99 | us-rulespec-2026-10-09-az-des-ece-dated | ${{ | success |
-| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-20 — Merge pull request #136 from TheAxiomFoundation/nzhub/repin-corpus-2026-10-20 | 0 | nz-rulespec-2026-10-20 | e0ce1ca9befd45022287675c919db31e83d61850 | — |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-22 — Merge pull request #1847 from TheAxiomFoundation/hub/repin-fs-pilot-reg-e-f | 98 | us-rulespec-2026-10-20-fs-pilot-reg-e-f | ${{ | success |
+| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-20 — Merge pull request #136 from TheAxiomFoundation/nzhub/repin-corpus-2026-10-20 | 1 | nz-rulespec-2026-10-20 | e0ce1ca9befd45022287675c919db31e83d61850 | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-15 — Merge pull request #466 from TheAxiomFoundation/hub/retire-key-reader | 37 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
