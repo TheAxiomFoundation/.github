@@ -88,15 +88,16 @@ Every validate shard acquires the same release at the same time, and both
 acquisitions retry transient failures. The release object download retries
 any failure with `curl --retry 5 --retry-all-errors --retry-max-time 120`: up
 to five more tries, none started more than 120 seconds after the first (a try
-in progress can run longer), waiting 3 to 7 seconds (drawn per run) between
-them. It writes only with `--output`, so curl discards a failed partial
-transfer before it tries again, and the content-address check still decides.
-Provisions placement reads `corpus-fetch --json` and runs it again, at most
-three runs in all, only after exit 1 in which every artifact that failed has a
-transient R2 reason (HTTP 408, 429 or 5xx, a failed request, a broken read),
-none names bytes that do not match the release, and no file differs from its
-lock. A rerun places only what is still missing and verifies every byte it
-places. Before each rerun the step checkpoints what the failed run placed
+in progress can run longer), with a delay of 3 to 7 seconds (drawn per run)
+between them that a server's `Retry-After` can lengthen. It writes only with
+`--output`, so curl discards a failed partial transfer before it tries again,
+and the content-address check still decides. Provisions placement reads
+`corpus-fetch --json` and runs it again, at most three runs in all, only after
+exit 1 in which every artifact that failed has a transient R2 reason (HTTP 408,
+429 or 5xx, a failed request, a broken read), none names bytes that do not
+match the release, and the report lists no modified file. A rerun places only
+what is still missing (a present file of the listed size counts as present)
+and verifies every byte it places. Before each rerun the step checkpoints what the failed run placed
 (`refresh-corpus`, or `refresh-base-corpus` for the protected base), because
 the source-integrity fingerprint covers `data/corpus`; a failed checkpoint or
 integrity check ends placement.
