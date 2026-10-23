@@ -657,7 +657,7 @@ def test_protected_base_placement_reruns_the_same_way_with_its_credentials() -> 
             + _shell_function(base, "base_corpus_fetch_with_credentials")
             + textwrap.dedent(f"""\
                 base_corpus_fetch() {{
-                  printf 'fetch %s %s\\n' "${{R2_ACCESS_KEY_ID:-}}" "$*" >> {shlex.quote(str(log))}
+                  printf 'fetch %s %s %s\\n' "${{R2_ACCESS_KEY_ID:-}}" "${{R2_SECRET_ACCESS_KEY:-}}" "$*" >> {shlex.quote(str(log))}
                   if [ "$(grep -c '^fetch' {shlex.quote(str(log))})" -lt 3 ]; then
                     printf '%s\\n' '{{"release": "base", "failed": {{"{V1}": "{transient}"}}, "modified": {{}}}}'
                     return 1
@@ -665,7 +665,7 @@ def test_protected_base_placement_reruns_the_same_way_with_its_credentials() -> 
                   printf '%s\\n' '{{"release": "base", "failed": {{}}, "modified": {{}}}}'
                 }}
                 checkpoint_base_corpus() {{
-                  printf 'checkpoint %s\\n' "${{R2_ACCESS_KEY_ID:-none}}" >> {shlex.quote(str(log))}
+                  printf 'checkpoint %s %s\\n' "${{R2_ACCESS_KEY_ID:-none}}" "${{R2_SECRET_ACCESS_KEY:-none}}" >> {shlex.quote(str(log))}
                 }}
                 if place_with_retries checkpoint_base_corpus base_corpus_fetch_with_credentials corpus-fetch --corpus-path 'base corpus'; then
                   echo placed
@@ -681,9 +681,12 @@ def test_protected_base_placement_reruns_the_same_way_with_its_credentials() -> 
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip().endswith("placed")
-        fetch = "fetch base-fixture-key corpus-fetch --corpus-path base corpus --json"
-        assert log.read_text().splitlines() == [fetch, "checkpoint none", fetch, "checkpoint none", fetch]
+        # Both credentials reach the encoder; neither reaches the checkpoint,
+        # nor the step's output.
+        fetch = "fetch base-fixture-key base-fixture-secret corpus-fetch --corpus-path base corpus --json"
+        assert log.read_text().splitlines() == [fetch, "checkpoint none none", fetch, "checkpoint none none", fetch]
         assert len(sleep_calls.read_text().split()) == 2
+        assert "base-fixture-key" not in result.stdout + result.stderr
         assert "base-fixture-secret" not in result.stdout + result.stderr
 
 
