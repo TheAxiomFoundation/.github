@@ -88,13 +88,16 @@ Every validate shard acquires the same release at once, and R2 throttles
 simultaneous reads of one object, so both acquisitions retry transient
 failures. The release object download retries any failure with `curl --retry
 5 --retry-all-errors` for up to 120 seconds, waiting 3 to 7 seconds (drawn per
-run) between tries; the content-address check still decides. Provisions
-placement runs `corpus-fetch` again, at most three runs, only after exit 1 whose
-diagnostics name a transient R2 failure (HTTP 429 or 5xx, a failed request, a
-broken read), after a jittered wait. A rerun places only what is still missing
-and verifies every byte. It never reruns another status, a source-integrity
-failure, bytes that do not match the release, or a file that differs from its
-lock.
+run) between tries, and writes only to a file, so a retried partial transfer is
+discarded; the content-address check still decides. Provisions placement reads
+`corpus-fetch --json` and runs it again, at most three runs in all, only after
+exit 1 in which every artifact that failed has a transient R2 reason (HTTP 408,
+429 or 5xx, a failed request, a broken read) and none names bytes that do not
+match the release, and no file differs from its lock. A rerun places only what
+is still missing and verifies every byte. Before each rerun the step checkpoints
+what the failed run placed (`refresh-corpus`, or `refresh-base-corpus` for the
+protected base), because the source-integrity fingerprint covers
+`data/corpus`; a failed checkpoint or integrity check ends placement.
 
 For provisions available only in R2, configure read-only organization or
 repository secrets `R2_CORPUS_READ_ACCESS_KEY_ID` and

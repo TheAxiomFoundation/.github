@@ -3828,7 +3828,7 @@ jobs:
           # failed together do not retry together. --fail still turns an HTTP
           # error into a failure, and the content sha256 check below decides.
           retry_delay=$(( 3 + RANDOM % 5 ))
-          retry=(--retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 120)
+          retry=(--connect-timeout 30 --retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 120)
           if [ -n "$RELEASE_REGISTRY_URL" ]; then
             acquisition=registry
             url="${RELEASE_REGISTRY_URL%/}/rest/v1/release_objects?select=release_object&release_name=eq.${RELEASE_NAME}&content_sha256=eq.${RELEASE_CONTENT_SHA256}&limit=2"
@@ -3953,27 +3953,81 @@ jobs:
           fi
           # corpus-fetch places only the artifacts that are missing and verifies
           # every byte it places, so running it again retries just the ones that
-          # failed. Every validate shard places the same release at once, and R2
-          # throttles simultaneous reads of one object. After exit 1 whose
-          # diagnostics name a transient R2 failure (HTTP 429 or 5xx, a failed
-          # request, a read that broke), wait 10-19 s, then 20-29 s, and run it
-          # again: at most three runs. Never retried: any other status (2: the
-          # release does not load or verify), a source-integrity failure, bytes
-          # that do not match the release, and a file that differs from its lock.
+          # failed. Every validate shard places the same release at once, R2
+          # throttles simultaneous reads of one object, and the encoder's own R2
+          # reads give up within about 1.5 s. place_with_retries CHECKPOINT
+          # COMMAND... runs COMMAND --json and prints its report. It runs it
+          # again (at most three runs; waits of 10-19 s, then 20-29 s) only when
+          # COMMAND exited 1, no file differs from its lock, and every artifact
+          # that failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed
+          # request, a read that broke) and no reason naming bytes that do not
+          # match the release. Before each new run CHECKPOINT records the files
+          # the failed run placed: the source-integrity fingerprint covers
+          # data/corpus. A failed checkpoint ends placement with its status. Any
+          # other exit status (2: the release does not load or verify) is final.
           place_with_retries() {
-            local attempt=1 status delay diagnostics
-            diagnostics="$(mktemp)"
+            local checkpoint=$1 attempt=1 status verdict delay report
+            shift
+            report="$(mktemp)"
             while :; do
-              if "$@" 2> "$diagnostics"; then status=0; else status=$?; fi
-              cat "$diagnostics" >&2
-              if [ "$status" -ne 1 ] || [ "$attempt" -ge 3 ] \
-                || ! grep -qE 'r2: (HTTP (429|5[0-9][0-9]) for |request for [^ ]+ failed: |read failed: )' "$diagnostics" \
-                || grep -qE 'DependencyIntegrityError|does not match the release|bytes but the release lists|more than the [0-9]+ bytes|left untouched' "$diagnostics"; then
-                rm -f "$diagnostics"
+              if "$@" --json > "$report"; then status=0; else status=$?; fi
+              verdict=final
+              if [ "$status" -le 1 ] || [ -s "$report" ]; then
+                if python -I - "$report" "$status" <<'PLACEMENTREPORT'; then verdict=transient; fi
+          import json
+          import re
+          import sys
+
+          path, status = sys.argv[1], int(sys.argv[2])
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  report = json.load(handle)
+          except (OSError, ValueError):
+              report = None
+          if not isinstance(report, dict):
+              print("corpus-fetch printed no readable --json report.", file=sys.stderr)
+              raise SystemExit(1)
+          failed, modified, skipped = (
+              report.get(key) if isinstance(report.get(key), dict) else {}
+              for key in ("failed", "modified", "skipped")
+          )
+          print(
+              f"{report.get('release')}: {report.get('selected')} artifact(s): "
+              f"{report.get('present')} present, {report.get('materialized')} placed "
+              f"({report.get('bytes_materialized')} bytes), {len(skipped)} skipped, "
+              f"{len(modified)} modified, {len(failed)} failed."
+          )
+          if isinstance(report.get("sources"), dict) and report["sources"]:
+              print("sources: " + ", ".join(f"{k} {v}" for k, v in sorted(report["sources"].items())))
+          for heading, rows in (
+              ("skipped (the checkout's locks do not pin the release's bytes; reading these scopes fails):", skipped),
+              ("left untouched (the files differ from the release bytes their locks pin):", modified),
+              ("not placed:", failed),
+          ):
+              if rows:
+                  print(heading, file=sys.stderr)
+                  for artifact, reason in sorted(rows.items()):
+                      print(f"{artifact}: {reason}", file=sys.stderr)
+          transient = re.compile(r"(?:^|; )r2: (?:HTTP (?:408|429|5[0-9][0-9]) for |request for \S+ failed: |read failed: )")
+          wrong_bytes = re.compile(r"sha256 does not match|supplied more than|supplied [0-9]+ bytes but|holds [0-9]+ bytes but")
+          retry = status == 1 and bool(failed) and not modified and all(
+              isinstance(reason, str) and transient.search(reason) and not wrong_bytes.search(reason)
+              for reason in failed.values()
+          )
+          raise SystemExit(0 if retry else 1)
+          PLACEMENTREPORT
+              fi
+              if [ "$status" -ne 1 ] || [ "$verdict" != transient ] || [ "$attempt" -ge 3 ]; then
+                rm -f "$report"
+                return "$status"
+              fi
+              if "$checkpoint"; then :; else
+                status=$?
+                rm -f "$report"
                 return "$status"
               fi
               delay=$(( attempt * 10 + RANDOM % 10 ))
-              echo "Corpus provisions placement run $attempt exited 1 on transient R2 errors; running it again for the unplaced artifacts in ${delay}s." >&2
+              echo "Corpus provisions placement run $attempt left artifacts unplaced on transient R2 errors; running it again in ${delay}s." >&2
               sleep "$delay"
               attempt=$(( attempt + 1 ))
             done
@@ -3983,11 +4037,14 @@ jobs:
             python -I /opt/axiom-dependency-integrity/check.py verify || return "$?"
             axiom-encode corpus-fetch "$@"
           }
+          checkpoint_head_corpus() {
+            sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py refresh-corpus
+          }
           # Explicit release pins are mutually exclusive with --rulespec-root.
           # These outputs came from the caller's .axiom/toolchain.toml; the
           # command reads the release object already fetched into CORPUS_PATH.
           # Let it try local sources before deciding whether R2 is needed.
-          if place_with_retries head_corpus_fetch \
+          if place_with_retries checkpoint_head_corpus head_corpus_fetch \
             --corpus-path "$CORPUS_PATH" \
             --release "$RELEASE_NAME" \
             --content-sha256 "$RELEASE_CONTENT_SHA256"; then
@@ -4725,7 +4782,8 @@ jobs:
           # discards a failed partial transfer it wrote with --output, so the
           # response goes to a file, never a pipe.
           command = ["curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--tlsv1.2",
-                     "--retry", "5", "--retry-all-errors", "--retry-delay", str(random.randint(3, 7)), "--retry-max-time", "120"]
+                     "--connect-timeout", "30", "--retry", "5", "--retry-all-errors",
+                     "--retry-delay", str(random.randint(3, 7)), "--retry-max-time", "120"]
           if registry:
               key = os.environ["RELEASE_REGISTRY_ANON_KEY"]
               command += ["--header", f"apikey: {key}", "--header", f"Authorization: Bearer {key}", "--header", "Accept-Profile: corpus"]
@@ -4794,38 +4852,99 @@ jobs:
           }
           # corpus-fetch places only the artifacts that are missing and verifies
           # every byte it places, so running it again retries just the ones that
-          # failed. Every validate shard places the same release at once, and R2
-          # throttles simultaneous reads of one object. After exit 1 whose
-          # diagnostics name a transient R2 failure (HTTP 429 or 5xx, a failed
-          # request, a read that broke), wait 10-19 s, then 20-29 s, and run it
-          # again: at most three runs. Never retried: any other status (2: the
-          # release does not load or verify), a source-integrity failure, bytes
-          # that do not match the release, and a file that differs from its lock.
+          # failed. Every validate shard places the same release at once, R2
+          # throttles simultaneous reads of one object, and the encoder's own R2
+          # reads give up within about 1.5 s. place_with_retries CHECKPOINT
+          # COMMAND... runs COMMAND --json and prints its report. It runs it
+          # again (at most three runs; waits of 10-19 s, then 20-29 s) only when
+          # COMMAND exited 1, no file differs from its lock, and every artifact
+          # that failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed
+          # request, a read that broke) and no reason naming bytes that do not
+          # match the release. Before each new run CHECKPOINT records the files
+          # the failed run placed: the source-integrity fingerprint covers
+          # data/corpus. A failed checkpoint ends placement with its status. Any
+          # other exit status (2: the release does not load or verify) is final.
           place_with_retries() {
-            local attempt=1 status delay diagnostics
-            diagnostics="$(mktemp)"
+            local checkpoint=$1 attempt=1 status verdict delay report
+            shift
+            report="$(mktemp)"
             while :; do
-              if "$@" 2> "$diagnostics"; then status=0; else status=$?; fi
-              cat "$diagnostics" >&2
-              if [ "$status" -ne 1 ] || [ "$attempt" -ge 3 ] \
-                || ! grep -qE 'r2: (HTTP (429|5[0-9][0-9]) for |request for [^ ]+ failed: |read failed: )' "$diagnostics" \
-                || grep -qE 'DependencyIntegrityError|does not match the release|bytes but the release lists|more than the [0-9]+ bytes|left untouched' "$diagnostics"; then
-                rm -f "$diagnostics"
+              if "$@" --json > "$report"; then status=0; else status=$?; fi
+              verdict=final
+              if [ "$status" -le 1 ] || [ -s "$report" ]; then
+                if python -I - "$report" "$status" <<'PLACEMENTREPORT'; then verdict=transient; fi
+          import json
+          import re
+          import sys
+
+          path, status = sys.argv[1], int(sys.argv[2])
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  report = json.load(handle)
+          except (OSError, ValueError):
+              report = None
+          if not isinstance(report, dict):
+              print("corpus-fetch printed no readable --json report.", file=sys.stderr)
+              raise SystemExit(1)
+          failed, modified, skipped = (
+              report.get(key) if isinstance(report.get(key), dict) else {}
+              for key in ("failed", "modified", "skipped")
+          )
+          print(
+              f"{report.get('release')}: {report.get('selected')} artifact(s): "
+              f"{report.get('present')} present, {report.get('materialized')} placed "
+              f"({report.get('bytes_materialized')} bytes), {len(skipped)} skipped, "
+              f"{len(modified)} modified, {len(failed)} failed."
+          )
+          if isinstance(report.get("sources"), dict) and report["sources"]:
+              print("sources: " + ", ".join(f"{k} {v}" for k, v in sorted(report["sources"].items())))
+          for heading, rows in (
+              ("skipped (the checkout's locks do not pin the release's bytes; reading these scopes fails):", skipped),
+              ("left untouched (the files differ from the release bytes their locks pin):", modified),
+              ("not placed:", failed),
+          ):
+              if rows:
+                  print(heading, file=sys.stderr)
+                  for artifact, reason in sorted(rows.items()):
+                      print(f"{artifact}: {reason}", file=sys.stderr)
+          transient = re.compile(r"(?:^|; )r2: (?:HTTP (?:408|429|5[0-9][0-9]) for |request for \S+ failed: |read failed: )")
+          wrong_bytes = re.compile(r"sha256 does not match|supplied more than|supplied [0-9]+ bytes but|holds [0-9]+ bytes but")
+          retry = status == 1 and bool(failed) and not modified and all(
+              isinstance(reason, str) and transient.search(reason) and not wrong_bytes.search(reason)
+              for reason in failed.values()
+          )
+          raise SystemExit(0 if retry else 1)
+          PLACEMENTREPORT
+              fi
+              if [ "$status" -ne 1 ] || [ "$verdict" != transient ] || [ "$attempt" -ge 3 ]; then
+                rm -f "$report"
+                return "$status"
+              fi
+              if "$checkpoint"; then :; else
+                status=$?
+                rm -f "$report"
                 return "$status"
               fi
               delay=$(( attempt * 10 + RANDOM % 10 ))
-              echo "Corpus provisions placement run $attempt exited 1 on transient R2 errors; running it again for the unplaced artifacts in ${delay}s." >&2
+              echo "Corpus provisions placement run $attempt left artifacts unplaced on transient R2 errors; running it again in ${delay}s." >&2
               sleep "$delay"
               attempt=$(( attempt + 1 ))
             done
+          }
+          # The read credentials reach only the encoder, as before.
+          base_corpus_fetch_with_credentials() {
+            R2_ACCESS_KEY_ID="$base_r2_access_key" R2_SECRET_ACCESS_KEY="$base_r2_secret_key" \
+              base_corpus_fetch "$@"
+          }
+          checkpoint_base_corpus() {
+            sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py refresh-base-corpus
           }
           if [ -d "$base_dependencies/axiom-corpus/.axiom/corpus-locks" ]; then
             if ! base_corpus_fetch corpus-fetch --help >/dev/null 2>&1; then
               echo "::error::Protected-base corpus pin uses locks; its encoder must support corpus-fetch." >&2
               exit 1
             fi
-            if R2_ACCESS_KEY_ID="$base_r2_access_key" R2_SECRET_ACCESS_KEY="$base_r2_secret_key" \
-              place_with_retries base_corpus_fetch corpus-fetch \
+            if place_with_retries checkpoint_base_corpus base_corpus_fetch_with_credentials corpus-fetch \
               --corpus-path "$base_dependencies/axiom-corpus" \
               --release "$base_release_name" \
               --content-sha256 "$base_release_sha256"; then
