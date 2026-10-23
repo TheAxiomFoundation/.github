@@ -294,10 +294,12 @@ jobs:
             allowed_extra="sources"
           fi
           matrix=$(printf '%s\n' "${shards[@]}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "first=${shards[0]}" >> "$GITHUB_OUTPUT"
-          echo "roots=$roots" >> "$GITHUB_OUTPUT"
-          echo "allowed-extra=$allowed_extra" >> "$GITHUB_OUTPUT"
+          {
+            echo "matrix=$matrix"
+            echo "first=${shards[0]}"
+            echo "roots=$roots"
+            echo "allowed-extra=$allowed_extra"
+          } >> "$GITHUB_OUTPUT"
           echo "Shards: $matrix"
 
   waiver-change-guard:
@@ -1383,9 +1385,11 @@ jobs:
           sort -u "$rulespec_file_list" -o "$rulespec_file_list"
           sort -u "$test_file_list" -o "$test_file_list"
 
-          echo "RULESPEC_FILE_LIST=$rulespec_file_list" >> "$GITHUB_ENV"
-          echo "RULESPEC_TEST_FILE_LIST=$test_file_list" >> "$GITHUB_ENV"
-          echo "RULESPEC_VALIDATION_MODE=$mode" >> "$GITHUB_ENV"
+          {
+            echo "RULESPEC_FILE_LIST=$rulespec_file_list"
+            echo "RULESPEC_TEST_FILE_LIST=$test_file_list"
+            echo "RULESPEC_VALIDATION_MODE=$mode"
+          } >> "$GITHUB_ENV"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
           echo "RuleSpec validation mode: $mode"

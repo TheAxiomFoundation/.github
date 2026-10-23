@@ -33,7 +33,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 WORKFLOW = WORKFLOWS / "validate-rulespec.yml"
-TEMP_PARENT = "/private/tmp" if Path("/private/tmp").is_dir() else None
+TEMP_PARENT = tempfile.gettempdir()
 
 SETUP_UV = "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"
 UV_VERSION = "0.11.7"
@@ -298,9 +298,17 @@ _ENCODER_TREE = [
 # Shell quoting is removed, so `"--target=$x"` and `--target "$x"` both appear
 # here as parsed arguments; any other installer anywhere fails the test.
 INSTALLERS = {
+    ("rollback-proof", "Install the rollback ledger parser"): [
+        ("python", "-I", "-m", "pip", "--isolated", "install",
+         "--disable-pip-version-check", "--only-binary=:all:", "pyyaml==6.0.3"),
+    ],
     ("shards", "Install the ProgramSpec shape-check parser"): [
         ("python", "-I", "-m", "pip", "--isolated", "install",
          "--disable-pip-version-check", "pyyaml==6.0.3"),
+    ],
+    ("validate", "Install the rollback ledger parser"): [
+        ("python", "-I", "-m", "pip", "--isolated", "install",
+         "--disable-pip-version-check", "--only-binary=:all:", "pyyaml==6.0.3"),
     ],
     ("validate", HEAD): [
         _ENCODER_SYNC,
@@ -520,6 +528,55 @@ class LockedSitePackagesTests(unittest.TestCase):
 
     def test_installers_are_exactly_the_locked_allowlist(self):
         self.assertEqual(installer_violations(WORKFLOW.read_text(encoding="utf-8")), [])
+
+    @staticmethod
+    def rollback_parser_workflow() -> dict:
+        """Exercise main's parser installs even against the pre-rollback workflow."""
+        workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        for job in ("rollback-proof", "validate"):
+            steps = workflow["jobs"].setdefault(job, {}).setdefault("steps", [])
+            if not any(item.get("name") == "Install the rollback ledger parser" for item in steps):
+                steps.insert(0, {
+                    "name": "Install the rollback ledger parser",
+                    "run": "python -I -m pip --isolated install --disable-pip-version-check "
+                           "--only-binary=:all: pyyaml==6.0.3",
+                })
+        return workflow
+
+    def test_rollback_parser_installs_are_allowed_in_both_jobs(self):
+        self.assertEqual(installer_violations(yaml.dump(self.rollback_parser_workflow())), [])
+
+    def test_rollback_parser_guard_rejects_argument_drift(self):
+        text = yaml.dump(self.rollback_parser_workflow())
+        self.assertEqual(installer_violations(text), [])
+        mutations = {
+            "python isolation": ("python -I ", "python "),
+            "pip isolation": ("--isolated ", ""),
+            "version check": ("--disable-pip-version-check ", ""),
+            "wheels only": ("--only-binary=:all: ", ""),
+            "package pin": ("pyyaml==6.0.3", "pyyaml"),
+            "extra package": ("pyyaml==6.0.3", "pyyaml==6.0.3 hostile-pkg"),
+        }
+        for job in ("rollback-proof", "validate"):
+            for label, (old, new) in mutations.items():
+                with self.subTest(job=job, mutation=label):
+                    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+                    parser = next(item for item in workflow["jobs"][job]["steps"]
+                                  if item.get("name") == "Install the rollback ledger parser")
+                    self.assertIn(old, parser["run"])
+                    parser["run"] = parser["run"].replace(old, new)
+                    self.assertNotEqual(installer_violations(yaml.dump(workflow)), [])
+            for duplicate in (False, True):
+                with self.subTest(job=job, duplicate=duplicate):
+                    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+                    steps = workflow["jobs"][job]["steps"]
+                    parser = next(item for item in steps
+                                  if item.get("name") == "Install the rollback ledger parser")
+                    if duplicate:
+                        steps.append(parser)
+                    else:
+                        steps.remove(parser)
+                    self.assertNotEqual(installer_violations(yaml.dump(workflow)), [])
 
     def test_installer_guard_rejects_unlocked_variants(self):
         text = WORKFLOW.read_text(encoding="utf-8")
