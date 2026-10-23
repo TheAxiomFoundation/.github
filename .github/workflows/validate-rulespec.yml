@@ -3825,9 +3825,9 @@ jobs:
           # Retry any failure (an HTTP error, a refused or dropped connection) up
           # to five times; curl starts no new try more than 120 s after the
           # first, and removes a failed partial --output file before it tries
-          # again. The delay between tries is 3-7 s, drawn per run, so parallel
-          # shards that failed together do not retry together; a Retry-After
-          # the server sends can lengthen it. --fail still
+          # again. The delay between tries is 3-7 s, drawn per run, which
+          # spreads out the retries of parallel shards that failed together; a
+          # Retry-After the server sends can lengthen it. --fail still
           # turns an HTTP error into a failure, and the content sha256 check
           # below decides.
           retry_delay=$(( 3 + RANDOM % 5 ))
