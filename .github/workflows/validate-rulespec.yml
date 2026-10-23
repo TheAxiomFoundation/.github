@@ -3213,6 +3213,7 @@ jobs:
           set -euo pipefail
           # checkout requires a workspace child; use an exclusively created
           # staging directory, never a caller-owned path such as _axiom.
+          # A release step removes it once its checkouts are relocated.
           stage="$(mktemp -d "$GITHUB_WORKSPACE/.axiom-dependency-stage.XXXXXXXX")"
           tools="$(mktemp -d "$RUNNER_TEMP/axiom-dependencies.XXXXXXXX")"
           export stage tools
@@ -3375,6 +3376,23 @@ jobs:
           test ! -e "$destination"
           test ! -L "$destination"
           mv "$source" "$destination"
+
+      # Every startup dependency now lives under AXIOM_DEPENDENCY_ROOT. Remove
+      # the staging directory so validation and the caller's own tests see
+      # only the caller's checkout at the workspace root.
+      - name: Release dependency staging directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AXIOM_DEPENDENCY_STAGE" =~ ^\.axiom-dependency-stage\.[A-Za-z0-9]{8}$ ]] || {
+            echo "unexpected dependency staging directory: $AXIOM_DEPENDENCY_STAGE" >&2; exit 1;
+          }
+          stage="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE"
+          test -d "$stage"
+          test ! -L "$stage"
+          # rmdir refuses a non-empty directory: a checkout left in the stage
+          # fails here instead of being deleted.
+          rmdir "$stage"
 
       - name: Authenticate composer commit
         if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
@@ -5438,6 +5456,17 @@ jobs:
             --fail-on-untested-comparable \
             --limit 50
 
+      # The startup stage was released before validation. Reserve a fresh one
+      # the same way (mktemp creates it exclusively) instead of letting
+      # checkout recreate the released path.
+      - name: Reserve oracle coverage staging directory
+        if: ${{ github.event_name == 'pull_request' && steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d "$GITHUB_WORKSPACE/.axiom-dependency-stage.XXXXXXXX")"
+          printf 'AXIOM_DEPENDENCY_STAGE=%s\n' "${stage#"$GITHUB_WORKSPACE/"}" >> "$GITHUB_ENV"
+
       - name: Checkout changed-file oracle coverage classifier
         if: ${{ github.event_name == 'pull_request' && steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -5459,6 +5488,19 @@ jobs:
           test ! -e "$destination"
           test ! -L "$destination"
           mv "$source" "$destination"
+
+      - name: Release oracle coverage staging directory
+        if: ${{ github.event_name == 'pull_request' && steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AXIOM_DEPENDENCY_STAGE" =~ ^\.axiom-dependency-stage\.[A-Za-z0-9]{8}$ ]] || {
+            echo "unexpected dependency staging directory: $AXIOM_DEPENDENCY_STAGE" >&2; exit 1;
+          }
+          stage="$GITHUB_WORKSPACE/$AXIOM_DEPENDENCY_STAGE"
+          test -d "$stage"
+          test ! -L "$stage"
+          rmdir "$stage"
 
       - name: Install changed-file oracle coverage classifier
         if: ${{ github.event_name == 'pull_request' && steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}

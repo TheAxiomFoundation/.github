@@ -92,6 +92,115 @@ class LayoutTests(unittest.TestCase):
                 self.assertEqual(result.stdout.splitlines(), expected)
         self.assertEqual(WORKFLOW.read_text().count('"${composer_args[@]}" "${dependency_args[@]}"'), 3)
 
+    def test_release_removes_stage_and_leaves_caller_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace, env = self.layout(Path(directory))
+            (workspace / 'policy.yaml').write_bytes(b'caller-owned policy\n')
+            (workspace / '_axiom').mkdir()
+            staged = workspace / env['AXIOM_DEPENDENCY_STAGE'] / 'axiom-encode'
+            staged.mkdir()
+            self.assertEqual(run('Relocate dependency axiom-encode', env).returncode, 0)
+            result = run('Release dependency staging directory', env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sorted(p.name for p in workspace.iterdir()), ['_axiom', 'policy.yaml'])
+            self.assertTrue((Path(env['AXIOM_DEPENDENCY_ROOT']) / 'axiom-encode').is_dir())
+
+    def test_release_fails_closed_without_deleting(self):
+        for name in ('Release dependency staging directory', 'Release oracle coverage staging directory'):
+            with tempfile.TemporaryDirectory() as directory:
+                workspace, env = self.layout(Path(directory))
+                stage = workspace / env['AXIOM_DEPENDENCY_STAGE']
+                # A checkout that was never relocated stays where it is.
+                (stage / 'axiom-encode').mkdir()
+                (stage / 'axiom-encode' / 'keep').write_text('kept\n')
+                self.assertNotEqual(run(name, env).returncode, 0)
+                self.assertEqual((stage / 'axiom-encode' / 'keep').read_text(), 'kept\n')
+                (stage / 'axiom-encode' / 'keep').unlink()
+                (stage / 'axiom-encode').rmdir()
+                # A stage replaced by a symlink is refused, and its target kept.
+                target = workspace / 'caller-dir'
+                target.mkdir()
+                stage.rmdir()
+                stage.symlink_to(target, target_is_directory=True)
+                self.assertNotEqual(run(name, env).returncode, 0)
+                self.assertTrue(target.is_dir())
+                stage.unlink()
+                # Only a name mktemp could have produced is removed.
+                for bad in ('', '.', '..', '_axiom', 'caller-dir', '.axiom-dependency-stage.bogus',
+                            '.axiom-dependency-stage.Ab3dE6f8/..', '../.axiom-dependency-stage.Ab3dE6f8'):
+                    (workspace / '_axiom').mkdir(exist_ok=True)
+                    self.assertNotEqual(run(name, {**env, 'AXIOM_DEPENDENCY_STAGE': bad}).returncode, 0, bad)
+                    self.assertEqual(sorted(p.name for p in workspace.iterdir()), ['_axiom', 'caller-dir'], bad)
+
+    def test_staging_windows_close_before_repository_tests(self):
+        windows, window_if, is_open = 0, None, False
+        for item in STEPS:
+            name, body = item.get('name', ''), item.get('run', '')
+            path = item.get('with', {}).get('path', '')
+            if name == 'Run repository tests':
+                self.assertFalse(is_open, 'repository tests run while a staging directory exists')
+            if 'mktemp -d "$GITHUB_WORKSPACE/' in body:
+                self.assertIn('.axiom-dependency-stage.XXXXXXXX', body, name)
+                self.assertFalse(is_open, name)
+                windows, window_if, is_open = windows + 1, item.get('if'), True
+            elif 'rmdir "$stage"' in body:
+                self.assertTrue(is_open, name)
+                self.assertEqual(item.get('if'), window_if, name)
+                is_open = False
+            elif 'AXIOM_DEPENDENCY_STAGE' in body or 'AXIOM_DEPENDENCY_STAGE' in path:
+                self.assertTrue(is_open, name + ' uses a released staging directory')
+                if window_if is not None:
+                    self.assertEqual(item.get('if'), window_if, name)
+        self.assertFalse(is_open)
+        self.assertEqual(windows, 2)
+
+    def test_step_sequence_leaves_caller_root_clean_on_every_branch(self):
+        compose = "${{ needs.shards.outputs.axiom_compose_ref != '' }}"
+        oracle = ("${{ github.event_name == 'pull_request' && "
+                  "steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}")
+        stage_expr = '${{ env.AXIOM_DEPENDENCY_STAGE }}/'
+        for with_compose in (True, False):
+            for with_oracle in (True, False):
+                enabled = {None: True, compose: with_compose, oracle: with_oracle}
+                with tempfile.TemporaryDirectory() as directory, self.subTest(compose=with_compose, oracle=with_oracle):
+                    parent = Path(directory)
+                    workspace = parent / 'rulespec-xx'
+                    workspace.mkdir()
+                    (workspace / 'xx').mkdir()
+                    (workspace / 'README.md').write_text('caller\n')
+                    temp = parent / 'runner temp'
+                    temp.mkdir()
+                    envfile = parent / 'env'
+                    envfile.touch()
+                    env = {'GITHUB_WORKSPACE': str(workspace), 'RUNNER_TEMP': str(temp), 'GITHUB_ENV': str(envfile)}
+                    for item in STEPS:
+                        name = item.get('name', '')
+                        if name == 'Run repository tests':
+                            self.assertEqual(sorted(p.name for p in workspace.iterdir()), ['README.md', 'xx'])
+                            break
+                        path = item.get('with', {}).get('path', '')
+                        staged = path.startswith(stage_expr)
+                        if not (staged or name.startswith(('Reserve ', 'Relocate dependency ', 'Release '))):
+                            continue
+                        self.assertIn(item.get('if'), enabled, name + ' has a condition this test does not model')
+                        if not enabled[item.get('if')]:
+                            continue
+                        if staged:
+                            # actions/checkout creates missing parents of its path.
+                            checkout = workspace / env['AXIOM_DEPENDENCY_STAGE'] / path[len(stage_expr):]
+                            checkout.mkdir(parents=True)
+                            (checkout / 'pyproject.toml').write_text('checked out\n')
+                            continue
+                        result = run(name, env)
+                        self.assertEqual(result.returncode, 0, name + ': ' + result.stderr)
+                        env.update(dict(line.split('=', 1) for line in envfile.read_text().splitlines()))
+                    else:
+                        self.fail('Run repository tests step not found')
+                    expected = {'axiom-encode', 'axiom-rules-engine', 'axiom-corpus', 'rulespec-us'}
+                    expected |= {'axiom-compose'} if with_compose else set()
+                    expected |= {'axiom-encode-oracle-coverage'} if with_oracle else set()
+                    self.assertEqual({p.name for p in Path(env['AXIOM_DEPENDENCY_ROOT']).iterdir()}, expected)
+
     def test_every_dependency_checkout_is_relocated_before_next_step(self):
         count = 0
         for index, checkout in enumerate(STEPS):
