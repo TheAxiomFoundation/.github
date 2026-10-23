@@ -79,8 +79,17 @@ def run_corpus_placement(
     supported: bool = True,
     credentials: bool = False,
     r2_only: bool = False,
+    fetch_script: tuple[tuple[int, str], ...] = (),
+    sleeps: list[str] | None = None,
+    integrity_fail_after: int | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict], bool]:
-    """Run the actual shell using a pinned-encoder stand-in, without network access."""
+    """Run the actual shell using a pinned-encoder stand-in, without network access.
+
+    ``fetch_script`` gives the (exit status, stderr) of the first placement
+    runs; later runs place the artifact. ``sleeps`` collects the step's waits,
+    which a stand-in ``sleep`` records instead of sleeping.
+    ``integrity_fail_after`` makes every ``verify`` after that many fail.
+    """
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         workspace = root / "rulespec with spaces"
@@ -132,6 +141,14 @@ def run_corpus_placement(
                 assert args.content_sha256 == os.environ["RELEASE_CONTENT_SHA256"]
                 release = args.corpus_path / "releases" / args.release / (args.content_sha256 + ".json")
                 assert release.is_file(), "must reuse the previously fetched release object"
+                script = json.loads(os.environ["FETCH_SCRIPT"])
+                runs = Path(os.environ["FETCH_RUNS"])
+                run = int(runs.read_text()) if runs.exists() else 0
+                runs.write_text(str(run + 1))
+                if run < len(script):
+                    status, diagnostic = script[run]
+                    print(diagnostic, file=sys.stderr)
+                    sys.exit(status)
                 if os.environ["R2_ONLY"] == "true" and not (
                     os.environ.get("R2_ACCESS_KEY_ID") and os.environ.get("R2_SECRET_ACCESS_KEY")
                 ):
@@ -144,6 +161,10 @@ def run_corpus_placement(
                 """)
         )
         fake.chmod(0o755)
+        sleep_calls = root / "sleep-calls.txt"
+        stand_in_sleep = bin_path / "sleep"
+        stand_in_sleep.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$SLEEP_CALLS"\n')
+        stand_in_sleep.chmod(0o755)
         # Keep ambient credentials out of these fixtures, including developer
         # overrides that could accidentally make the missing-secret case pass.
         env = {key: value for key, value in os.environ.items() if not key.startswith("R2_")}
@@ -160,11 +181,28 @@ def run_corpus_placement(
             "LOCAL_PROVISIONS": str(local),
             "R2_ACCESS_KEY_ID": "fixture-read-access-key" if credentials else "",
             "R2_SECRET_ACCESS_KEY": "fixture-read-secret-key" if credentials else "",
+            "FETCH_SCRIPT": json.dumps(list(fetch_script)),
+            "FETCH_RUNS": str(root / "fetch-runs.txt"),
+            "SLEEP_CALLS": str(sleep_calls),
+            "INTEGRITY_CALLS": str(root / "integrity-calls.txt"),
+            "INTEGRITY_FAIL_AFTER": "" if integrity_fail_after is None else str(integrity_fail_after),
         })
         # Source integrity has its own real-Git regression suite. This fixture
         # exercises corpus placement after that precondition using a fake CLI.
         integrity = root / "integrity.py"
-        integrity.write_text("import sys\nassert sys.argv[1] in {'verify', 'refresh-corpus'}\n")
+        integrity.write_text(textwrap.dedent("""\
+            import os
+            from pathlib import Path
+            import sys
+            assert sys.argv[1] in {'verify', 'refresh-corpus'}
+            if sys.argv[1] == 'verify':
+                calls = Path(os.environ['INTEGRITY_CALLS'])
+                count = (int(calls.read_text()) if calls.exists() else 0) + 1
+                calls.write_text(str(count))
+                limit = os.environ['INTEGRITY_FAIL_AFTER']
+                if limit and count > int(limit):
+                    raise SystemExit('DependencyIntegrityError: fixture drift')
+            """))
         shell = corpus_placement_step()["run"].replace(
             "/opt/axiom-dependency-integrity/check.py", str(integrity),
         ).replace('sudo "$(command -v python)" -I', '"$(command -v python)" -I')
@@ -176,6 +214,8 @@ def run_corpus_placement(
             text=True,
         )
         invocations = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+        if sleeps is not None and sleep_calls.exists():
+            sleeps.extend(sleep_calls.read_text().split())
         destination = corpus / "data/corpus/provisions/us/statutes/v1.json"
         placed = destination.exists() and destination.read_bytes() == local.read_bytes()
         # Credential values may reach the encoder's environment, never shell logs.
@@ -232,6 +272,176 @@ def test_post_switch_corpus_fetch_failure_preserves_missing_artifact_diagnostic(
     assert "::error::" in output
     assert "data/corpus/provisions/us/statutes/v1.json" in output
     assert "R2 read credentials absent" in output
+
+
+TRANSIENT_DIAGNOSTICS = (
+    "data/corpus/provisions/us-az/manual/v1.jsonl: git: absent; git-lock: absent; "
+    "r2: HTTP 500 for objects/sha256/02/" + "2" * 64,
+    "data/corpus/provisions/us/regulation/v1.jsonl: git: absent; git-lock: absent; "
+    "r2: request for objects/sha256/a4/" + "4" * 64 + " failed: TimeoutError('timed out')",
+    "data/corpus/provisions/us/statute/v1.jsonl: git: absent; git-lock: absent; "
+    "r2: read failed: [Errno 104] Connection reset by peer",
+    "data/corpus/provisions/us/statute/v2.jsonl: git: absent; git-lock: absent; "
+    "r2: HTTP 429 for objects/sha256/fc/" + "c" * 64,
+)
+
+
+def test_corpus_placement_reruns_after_transient_r2_failures() -> None:
+    sleeps: list[str] = []
+    result, invocations, placed = run_corpus_placement(
+        credentials=True,
+        r2_only=True,
+        fetch_script=((1, TRANSIENT_DIAGNOSTICS[0]), (1, "\n".join(TRANSIENT_DIAGNOSTICS[1:]))),
+        sleeps=sleeps,
+    )
+    assert result.returncode == 0, result.stderr
+    assert placed
+    assert [call["args"][:2] for call in invocations] == [["corpus-fetch", "--help"]] + [
+        ["corpus-fetch", "--corpus-path"]
+    ] * 3
+    assert all(call["access_key_id"] == "fixture-read-access-key" for call in invocations[1:])
+    first, second = map(int, sleeps)
+    assert 10 <= first <= 19 and 20 <= second <= 29, sleeps
+    output = result.stdout + result.stderr
+    assert all(diagnostic in output for diagnostic in TRANSIENT_DIAGNOSTICS)
+    assert output.count("running it again for the unplaced artifacts") == 2
+    assert "::error::" not in output
+
+
+def test_corpus_placement_gives_up_after_three_transient_runs() -> None:
+    sleeps: list[str] = []
+    result, invocations, placed = run_corpus_placement(
+        credentials=True, r2_only=True, fetch_script=((1, TRANSIENT_DIAGNOSTICS[0]),) * 5, sleeps=sleeps
+    )
+    assert result.returncode == 1
+    assert not placed
+    assert len(invocations) == 4, "one capability probe and three placement runs"
+    assert len(sleeps) == 2
+    output = result.stdout + result.stderr
+    assert output.count(TRANSIENT_DIAGNOSTICS[0]) == 3
+    assert "::error::Failed to place the pinned corpus release's provisions (exit 1)" in output
+
+
+def test_corpus_placement_never_reruns_a_failure_no_rerun_can_fix() -> None:
+    transient = TRANSIENT_DIAGNOSTICS[0]
+    for status, diagnostic in (
+        # The release itself does not load or verify.
+        (2, "axiom-encode corpus-fetch: release object signature does not verify"),
+        (3, transient),
+        # Not a transient R2 answer.
+        (1, "data/corpus/provisions/us/statute/v1.jsonl: git: absent; git-lock: absent; r2: HTTP 403 for objects/sha256/00/0"),
+        (1, "data/corpus/provisions/us/statute/v1.jsonl: git: absent; git-lock: absent; r2: absent"),
+        (1, "data/corpus/provisions/us/statute/v1.jsonl: git: absent; git-lock: absent"),
+        # Wrong bytes or a file that differs from its lock, even beside a transient failure.
+        (1, transient + "\ndata/corpus/provisions/us/statute/v2.jsonl: r2: sha256 does not match the release"),
+        (1, transient + "\ndata/corpus/provisions/us/statute/v2.jsonl: r2: supplied 3 bytes but the release lists 4"),
+        (1, transient + "\ndata/corpus/provisions/us/statute/v2.jsonl: r2: supplied more than the 4 bytes the release lists"),
+        (1, transient + "\ndata/corpus/provisions/us/statute/v2.jsonl: r2: object holds 9 bytes but the release lists 4"),
+        (1, "left untouched (the files differ from the release bytes their locks pin):\n"
+            "data/corpus/provisions/us/statute/v2.jsonl: existing file's sha256 differs from the release; left untouched\n"
+            + transient),
+        (1, "DependencyIntegrityError: authenticated source changed\n" + transient),
+    ):
+        sleeps: list[str] = []
+        result, invocations, placed = run_corpus_placement(
+            credentials=True, r2_only=True, fetch_script=((status, diagnostic),), sleeps=sleeps
+        )
+        assert result.returncode == status, (status, diagnostic, result.stderr)
+        assert len(invocations) == 2, (diagnostic, invocations)
+        assert not sleeps and not placed, diagnostic
+        assert diagnostic in result.stdout + result.stderr
+
+
+def test_corpus_placement_checks_integrity_before_each_run_and_never_retries_a_failed_check() -> None:
+    sleeps: list[str] = []
+    # verify 1: the step's own check; 2: before the first run; 3: before the second.
+    result, invocations, placed = run_corpus_placement(
+        credentials=True,
+        r2_only=True,
+        fetch_script=((1, TRANSIENT_DIAGNOSTICS[0]),),
+        sleeps=sleeps,
+        integrity_fail_after=2,
+    )
+    assert result.returncode == 1
+    assert not placed
+    assert len(invocations) == 2, "the second run must stop at its integrity check"
+    assert len(sleeps) == 1
+    assert "DependencyIntegrityError: fixture drift" in result.stderr
+
+
+def test_corpus_release_object_fetches_retry_and_still_verify() -> None:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    fetch = next(step for step in steps if step.get("name") == "Fetch pinned signed corpus release object")["run"]
+    assert 'retry=(--retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 120)' in fetch
+    assert "retry_delay=$(( 3 + RANDOM % 5 ))" in fetch
+    curls = [line for line in fetch.splitlines() if line.strip().startswith("curl ")]
+    assert len(curls) == 2
+    for line in curls:
+        assert line.strip().startswith("curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \"${retry[@]}\"")
+    assert fetch.count('--output "$destination.tmp"') == 2
+    # Verification runs on the downloaded bytes, after every acquisition path.
+    assert fetch.index("content sha256 mismatch") > max(fetch.index(line) for line in curls)
+    assert fetch.index('path.replace(path.with_suffix(""))') > fetch.index("content sha256 mismatch")
+
+    preparation = next(step for step in steps if step.get("name") == BASE_CORPUS_PREPARATION_STEP)["run"]
+    command = preparation.split("\ncommand = [", 1)[1].split("]\n", 1)[0]
+    for flag in ('"--fail"', '"--retry", "5"', '"--retry-all-errors"', '"--retry-delay", str(random.randint(3, 7))',
+                 '"--retry-max-time", "120"'):
+        assert flag in command, flag
+    assert 'subprocess.run([*command, "--output", str(downloaded), url], check=True)' in preparation
+    assert "check_output([*command" not in preparation
+    assert preparation.index("protected-base corpus release digest mismatch") > preparation.index('"--output", str(downloaded)')
+
+
+def _place_with_retries(run: str) -> str:
+    return "place_with_retries() {\n" + run.split("place_with_retries() {\n", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+
+def test_protected_base_placement_reruns_the_same_way_with_its_credentials() -> None:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    head = corpus_placement_step()["run"]
+    base = next(step for step in steps if step.get("name") == BASE_CORPUS_PREPARATION_STEP)["run"]
+    assert _place_with_retries(head) == _place_with_retries(base)
+    assert ('if R2_ACCESS_KEY_ID="$base_r2_access_key" R2_SECRET_ACCESS_KEY="$base_r2_secret_key" \\\n'
+            "    place_with_retries base_corpus_fetch corpus-fetch \\\n") in base
+    assert base.index("place_with_retries() {") > base.index("base_corpus_fetch() {")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        tools = root / "tools"
+        tools.mkdir()
+        (tools / "sleep").write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$SLEEP_CALLS"\n')
+        (tools / "sleep").chmod(0o755)
+        log, sleep_calls = root / "runs.txt", root / "sleeps.txt"
+        fixture = textwrap.dedent(f"""\
+            set -euo pipefail
+            {_place_with_retries(base)}
+            base_corpus_fetch() {{
+              printf '%s %s\\n' "$R2_ACCESS_KEY_ID" "$*" >> {shlex.quote(str(log))}
+              if [ "$(wc -l < {shlex.quote(str(log))})" -lt 3 ]; then
+                echo 'data/corpus/provisions/us/v1.jsonl: git: absent; git-lock: absent; r2: HTTP 503 for objects/sha256/00/0' >&2
+                return 1
+              fi
+            }}
+            if R2_ACCESS_KEY_ID=base-fixture-key R2_SECRET_ACCESS_KEY=base-fixture-secret \\
+              place_with_retries base_corpus_fetch corpus-fetch --corpus-path 'base corpus'; then
+              echo placed
+            else
+              exit "$?"
+            fi
+            """)
+        result = subprocess.run(
+            ["bash", "-c", fixture],
+            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""), "SLEEP_CALLS": str(sleep_calls)},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "placed"
+        assert log.read_text().splitlines() == ["base-fixture-key corpus-fetch --corpus-path base corpus"] * 3
+        assert len(sleep_calls.read_text().split()) == 2
 
 
 def git(root: Path, *args: str) -> str:
@@ -7147,7 +7357,13 @@ def main() -> None:
     test_post_switch_corpus_places_pinned_release_with_read_credentials()
     test_post_switch_corpus_accepts_local_artifacts_without_credentials()
     test_post_switch_corpus_fetch_failure_preserves_missing_artifact_diagnostic()
-    print("pinned corpus placement: 6 regression checks passed")
+    test_corpus_placement_reruns_after_transient_r2_failures()
+    test_corpus_placement_gives_up_after_three_transient_runs()
+    test_corpus_placement_never_reruns_a_failure_no_rerun_can_fix()
+    test_corpus_placement_checks_integrity_before_each_run_and_never_retries_a_failed_check()
+    test_corpus_release_object_fetches_retry_and_still_verify()
+    test_protected_base_placement_reruns_the_same_way_with_its_credentials()
+    print("pinned corpus placement: 12 regression checks passed")
     test_release_pin_companion_requires_strict_retirement()
     test_release_pin_companion_accepts_exact_staged_consumption()
     run_rollback_rewind_tests()

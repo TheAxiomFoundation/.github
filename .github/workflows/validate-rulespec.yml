@@ -3822,10 +3822,17 @@ jobs:
           python -I /opt/axiom-dependency-integrity/check.py verify
           destination="${AXIOM_DEPENDENCY_ROOT}/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
           mkdir -p "$(dirname "$destination")"
+          # Retry any failure (a throttled or dropped request; curl removes a
+          # partial --output file before it tries again) for up to 120 s. The
+          # wait between tries is 3-7 s, drawn per run, so parallel shards that
+          # failed together do not retry together. --fail still turns an HTTP
+          # error into a failure, and the content sha256 check below decides.
+          retry_delay=$(( 3 + RANDOM % 5 ))
+          retry=(--retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 120)
           if [ -n "$RELEASE_REGISTRY_URL" ]; then
             acquisition=registry
             url="${RELEASE_REGISTRY_URL%/}/rest/v1/release_objects?select=release_object&release_name=eq.${RELEASE_NAME}&content_sha256=eq.${RELEASE_CONTENT_SHA256}&limit=2"
-            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "${retry[@]}" \
               --header "apikey: $RELEASE_REGISTRY_ANON_KEY" \
               --header "Authorization: Bearer $RELEASE_REGISTRY_ANON_KEY" \
               --header "Accept-Profile: corpus" \
@@ -3833,7 +3840,7 @@ jobs:
           else
             acquisition=object
             url="${RELEASE_BASE_URL%/}/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
-            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "${retry[@]}" \
               --output "$destination.tmp" "$url"
           fi
           python -I - "$destination.tmp" "$RELEASE_NAME" "$RELEASE_CONTENT_SHA256" "$acquisition" <<'PY'
@@ -3944,11 +3951,43 @@ jobs:
             echo "::error::This corpus pin is after the lock switch; pin an axiom-encode that includes #1742 (corpus-fetch)." >&2
             exit 1
           fi
+          # corpus-fetch places only the artifacts that are missing and verifies
+          # every byte it places, so running it again retries just the ones that
+          # failed. Every validate shard places the same release at once, and R2
+          # throttles simultaneous reads of one object. After exit 1 whose
+          # diagnostics name a transient R2 failure (HTTP 429 or 5xx, a failed
+          # request, a read that broke), wait 10-19 s, then 20-29 s, and run it
+          # again: at most three runs. Never retried: any other status (2: the
+          # release does not load or verify), a source-integrity failure, bytes
+          # that do not match the release, and a file that differs from its lock.
+          place_with_retries() {
+            local attempt=1 status delay diagnostics
+            diagnostics="$(mktemp)"
+            while :; do
+              if "$@" 2> "$diagnostics"; then status=0; else status=$?; fi
+              cat "$diagnostics" >&2
+              if [ "$status" -ne 1 ] || [ "$attempt" -ge 3 ] \
+                || ! grep -qE 'r2: (HTTP (429|5[0-9][0-9]) for |request for [^ ]+ failed: |read failed: )' "$diagnostics" \
+                || grep -qE 'DependencyIntegrityError|does not match the release|bytes but the release lists|more than the [0-9]+ bytes|left untouched' "$diagnostics"; then
+                rm -f "$diagnostics"
+                return "$status"
+              fi
+              delay=$(( attempt * 10 + RANDOM % 10 ))
+              echo "Corpus provisions placement run $attempt exited 1 on transient R2 errors; running it again for the unplaced artifacts in ${delay}s." >&2
+              sleep "$delay"
+              attempt=$(( attempt + 1 ))
+            done
+          }
+          # Each run checks source integrity first; a failed check is never retried.
+          head_corpus_fetch() {
+            python -I /opt/axiom-dependency-integrity/check.py verify || return "$?"
+            axiom-encode corpus-fetch "$@"
+          }
           # Explicit release pins are mutually exclusive with --rulespec-root.
           # These outputs came from the caller's .axiom/toolchain.toml; the
           # command reads the release object already fetched into CORPUS_PATH.
           # Let it try local sources before deciding whether R2 is needed.
-          if axiom-encode corpus-fetch \
+          if place_with_retries head_corpus_fetch \
             --corpus-path "$CORPUS_PATH" \
             --release "$RELEASE_NAME" \
             --content-sha256 "$RELEASE_CONTENT_SHA256"; then
@@ -4667,9 +4706,11 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import random
           import re
           import subprocess
           import sys
+          import tempfile
           import tomllib
 
           repo, corpus = map(Path, sys.argv[1:])
@@ -4680,14 +4721,21 @@ jobs:
               or not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{64}", sha) is None):
               raise SystemExit("ManifestAuditError: invalid protected-base corpus release pins")
           registry = os.environ["RELEASE_REGISTRY_URL"]
-          command = ["curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--tlsv1.2"]
+          # Retries as in "Fetch pinned signed corpus release object". curl only
+          # discards a failed partial transfer it wrote with --output, so the
+          # response goes to a file, never a pipe.
+          command = ["curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--tlsv1.2",
+                     "--retry", "5", "--retry-all-errors", "--retry-delay", str(random.randint(3, 7)), "--retry-max-time", "120"]
           if registry:
               key = os.environ["RELEASE_REGISTRY_ANON_KEY"]
               command += ["--header", f"apikey: {key}", "--header", f"Authorization: Bearer {key}", "--header", "Accept-Profile: corpus"]
               url = f"{registry.rstrip('/')}/rest/v1/release_objects?select=release_object&release_name=eq.{name}&content_sha256=eq.{sha}&limit=2"
           else:
               url = f"{os.environ['RELEASE_BASE_URL'].rstrip('/')}/releases/{name}/{sha}.json"
-          response = json.loads(subprocess.check_output([*command, url]))
+          with tempfile.TemporaryDirectory() as scratch:
+              downloaded = Path(scratch) / "release.json"
+              subprocess.run([*command, "--output", str(downloaded), url], check=True)
+              response = json.loads(downloaded.read_bytes())
           if registry:
               if not isinstance(response, list) or len(response) != 1 or not isinstance(response[0], dict):
                   raise SystemExit("ManifestAuditError: base release registry must return exactly one row")
@@ -4744,13 +4792,40 @@ jobs:
             /opt/axiom-base-verification/python/bin/python${{ inputs.python-version }} -I -B -c \
               'from axiom_encode.entrypoint import main; raise SystemExit(main())' "$@"
           }
+          # corpus-fetch places only the artifacts that are missing and verifies
+          # every byte it places, so running it again retries just the ones that
+          # failed. Every validate shard places the same release at once, and R2
+          # throttles simultaneous reads of one object. After exit 1 whose
+          # diagnostics name a transient R2 failure (HTTP 429 or 5xx, a failed
+          # request, a read that broke), wait 10-19 s, then 20-29 s, and run it
+          # again: at most three runs. Never retried: any other status (2: the
+          # release does not load or verify), a source-integrity failure, bytes
+          # that do not match the release, and a file that differs from its lock.
+          place_with_retries() {
+            local attempt=1 status delay diagnostics
+            diagnostics="$(mktemp)"
+            while :; do
+              if "$@" 2> "$diagnostics"; then status=0; else status=$?; fi
+              cat "$diagnostics" >&2
+              if [ "$status" -ne 1 ] || [ "$attempt" -ge 3 ] \
+                || ! grep -qE 'r2: (HTTP (429|5[0-9][0-9]) for |request for [^ ]+ failed: |read failed: )' "$diagnostics" \
+                || grep -qE 'DependencyIntegrityError|does not match the release|bytes but the release lists|more than the [0-9]+ bytes|left untouched' "$diagnostics"; then
+                rm -f "$diagnostics"
+                return "$status"
+              fi
+              delay=$(( attempt * 10 + RANDOM % 10 ))
+              echo "Corpus provisions placement run $attempt exited 1 on transient R2 errors; running it again for the unplaced artifacts in ${delay}s." >&2
+              sleep "$delay"
+              attempt=$(( attempt + 1 ))
+            done
+          }
           if [ -d "$base_dependencies/axiom-corpus/.axiom/corpus-locks" ]; then
             if ! base_corpus_fetch corpus-fetch --help >/dev/null 2>&1; then
               echo "::error::Protected-base corpus pin uses locks; its encoder must support corpus-fetch." >&2
               exit 1
             fi
             if R2_ACCESS_KEY_ID="$base_r2_access_key" R2_SECRET_ACCESS_KEY="$base_r2_secret_key" \
-              base_corpus_fetch corpus-fetch \
+              place_with_retries base_corpus_fetch corpus-fetch \
               --corpus-path "$base_dependencies/axiom-corpus" \
               --release "$base_release_name" \
               --content-sha256 "$base_release_sha256"; then
