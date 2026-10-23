@@ -3552,8 +3552,10 @@ jobs:
           sudo install -m 644 "$RUNNER_TEMP/axiom-dependency-integrity.py" /opt/axiom-dependency-integrity/check.py
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py snapshot "$AXIOM_DEPENDENCY_ROOT"
 
-      - name: Install uv for composer runtime
-        if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
+      # The same setup-uv commit and uv version as axiom-encode's own staging
+      # workflows. Every protected site-packages tree below is staged from a
+      # uv.lock export.
+      - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: "0.11.7"
@@ -3575,19 +3577,76 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP"
           unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          export UV_NO_CONFIG=1
           python -I /opt/axiom-dependency-integrity/check.py verify
-          python -I -m pip --isolated install --upgrade pip
-          python -I -m pip --isolated install pytest pyyaml
           # Build backends may create metadata in their project directory.
           # Install from an external copy, keeping every authenticated source
           # byte unchanged and avoiding editable import paths into checkouts.
-          rm -rf "$RUNNER_TEMP/axiom-encode-install"
-          cp -a "${AXIOM_DEPENDENCY_ROOT}/axiom-encode" "$RUNNER_TEMP/axiom-encode-install"
-          python -I -m pip --isolated install "$RUNNER_TEMP/axiom-encode-install"
-          rm -rf "$RUNNER_TEMP/axiom-verification-site-packages"
-          python -I -m pip --isolated install \
-            --target "$RUNNER_TEMP/axiom-verification-site-packages" \
-            "$RUNNER_TEMP/axiom-encode-install"
+          encoder="$RUNNER_TEMP/axiom-encode-install"
+          rm -rf "$encoder"
+          cp -a "${AXIOM_DEPENDENCY_ROOT}/axiom-encode" "$encoder"
+          # The protected verification tree, and this job's interpreter, hold
+          # exactly the encoder's uv.lock set. A resolving `pip install` ignores
+          # the lock and floats every `>=` dependency to the index's latest at
+          # run time (axiom-encode targeted run 36174590343 staged
+          # claude-agent-sdk 0.2.159 beside the locked 0.1.47). Export the lock
+          # and install its hash-pinned registry set with --require-hashes, then
+          # the one commit-pinned git dependency (a VCS checkout has no hash)
+          # and the project itself, all --no-deps so nothing is resolved here.
+          # The interpreter matters too: the provisioner below runs it as root
+          # with site enabled, and every later step runs it with sudo available.
+          # A fresh step-local cache shares hash-checked downloads and builds.
+          uv_cache="$(mktemp -d "$RUNNER_TEMP/axiom-uv-cache.XXXXXXXX")"
+          export UV_CACHE_DIR="$uv_cache"
+          python_bin="$(command -v python)"
+          reference="$RUNNER_TEMP/axiom-encode-locked-environment"
+          site_packages="$RUNNER_TEMP/axiom-verification-site-packages"
+          locked="$RUNNER_TEMP/axiom-verification-locked-requirements.txt"
+          rm -rf "$reference" "$site_packages"
+          UV_PROJECT_ENVIRONMENT="$reference" uv sync --project "$encoder" \
+            --locked --no-dev --python "$python_bin"
+          uv export --project "$encoder" --locked --no-dev --no-emit-project \
+            --no-emit-package axiom-oracles --format requirements-txt \
+            --output-file "$locked"
+          oracles="$(uv export --project "$encoder" --locked --no-dev --no-emit-project \
+            --no-hashes --no-annotate --no-header --format requirements-txt \
+            | grep -xE 'axiom-oracles @ git\+https://github\.com/TheAxiomFoundation/axiom-oracles@[0-9a-f]{40}')"
+          uv pip install --python "$python_bin" --target "$site_packages" \
+            --require-hashes --no-deps -r "$locked"
+          uv pip install --python "$python_bin" --target "$site_packages" \
+            --no-deps "$oracles"
+          uv pip install --python "$python_bin" --target "$site_packages" \
+            --no-deps "$encoder"
+          uv pip install --python "$python_bin" --require-hashes --no-deps -r "$locked"
+          uv pip install --python "$python_bin" --no-deps "$oracles"
+          uv pip install --python "$python_bin" --no-deps "$encoder"
+          # Differential check: the staged tree and the interpreter must equal
+          # the locked environment. pip is left out of the interpreter's side
+          # of the check on both ends: the toolcache bundles one, and the lock
+          # pins its own (sqlite-utils depends on pip) that replaces it.
+          uv pip freeze --python "$reference/bin/python" --exclude-editable \
+            > "$RUNNER_TEMP/axiom-verification-locked.freeze"
+          uv pip freeze --python "$python_bin" --target "$site_packages" \
+            --exclude axiom-encode > "$RUNNER_TEMP/axiom-verification-staged.freeze"
+          uv pip freeze --python "$reference/bin/python" --exclude-editable \
+            --exclude pip > "$RUNNER_TEMP/axiom-interpreter-locked.freeze"
+          uv pip freeze --python "$python_bin" --exclude pip \
+            --exclude axiom-encode > "$RUNNER_TEMP/axiom-interpreter.freeze"
+          test -s "$RUNNER_TEMP/axiom-verification-locked.freeze"
+          diff -u "$RUNNER_TEMP/axiom-verification-locked.freeze" \
+            "$RUNNER_TEMP/axiom-verification-staged.freeze"
+          diff -u "$RUNNER_TEMP/axiom-interpreter-locked.freeze" \
+            "$RUNNER_TEMP/axiom-interpreter.freeze"
+          # pytest for the repository tests: the version the lock's dev extra
+          # pins, its closure held to that extra's hashes.
+          tests_locked="$RUNNER_TEMP/axiom-repository-tests-locked-requirements.txt"
+          uv export --project "$encoder" --locked --no-dev --extra dev --no-emit-project \
+            --no-emit-package axiom-oracles --format requirements-txt \
+            --output-file "$tests_locked"
+          pytest_pin="$(grep -oE '^pytest==[^ ]+' "$tests_locked")"
+          uv pip install --python "$python_bin" --require-hashes \
+            --constraints "$tests_locked" "$pytest_pin"
+          rm -rf "$reference" "$uv_cache"
           python -I /opt/axiom-dependency-integrity/check.py verify
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add \
             verification-site-packages "$RUNNER_TEMP/axiom-verification-site-packages" runtime
@@ -4020,6 +4079,20 @@ jobs:
           python -I /opt/axiom-dependency-integrity/check.py verify
           uv python install 3.14
           uv venv --python 3.14 "$RUNNER_TEMP/axiom-compose-build"
+          # The composer runtime is likewise exactly its uv.lock set: hashed and
+          # unresolved, then checked against a `uv sync --locked` environment.
+          # Its export is wheels only (axiom-encode sits in an optional extra),
+          # so --no-build fails closed rather than build a source distribution
+          # with unpinned build backends.
+          compose_reference="$RUNNER_TEMP/axiom-compose-locked-environment"
+          rm -rf "$compose_reference" "$RUNNER_TEMP/axiom-compose-site-packages"
+          UV_PROJECT_ENVIRONMENT="$compose_reference" uv sync \
+            --project "${AXIOM_DEPENDENCY_ROOT}/axiom-compose" \
+            --locked \
+            --no-dev \
+            --no-install-project \
+            --no-build \
+            --python "$RUNNER_TEMP/axiom-compose-build/bin/python"
           uv export \
             --project "${AXIOM_DEPENDENCY_ROOT}/axiom-compose" \
             --locked \
@@ -4030,7 +4103,19 @@ jobs:
           uv pip install \
             --python "$RUNNER_TEMP/axiom-compose-build/bin/python" \
             --target "$RUNNER_TEMP/axiom-compose-site-packages" \
+            --require-hashes \
+            --no-deps \
+            --no-build \
             --requirement "$RUNNER_TEMP/axiom-compose-requirements.txt"
+          uv pip freeze --python "$compose_reference/bin/python" \
+            > "$RUNNER_TEMP/axiom-compose-locked.freeze"
+          uv pip freeze --python "$RUNNER_TEMP/axiom-compose-build/bin/python" \
+            --target "$RUNNER_TEMP/axiom-compose-site-packages" \
+            > "$RUNNER_TEMP/axiom-compose-staged.freeze"
+          test -s "$RUNNER_TEMP/axiom-compose-locked.freeze"
+          diff -u "$RUNNER_TEMP/axiom-compose-locked.freeze" \
+            "$RUNNER_TEMP/axiom-compose-staged.freeze"
+          rm -rf "$compose_reference"
           python -I /opt/axiom-dependency-integrity/check.py verify
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add \
             composer-site-packages "$RUNNER_TEMP/axiom-compose-site-packages" runtime
@@ -4654,9 +4739,38 @@ jobs:
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-rules "$base_rules" repository
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-encoder "$base_dependencies/axiom-encode" repository
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-corpus "$base_dependencies/axiom-corpus" repository
-          cp -a "$base_dependencies/axiom-encode" "$audit_root/encoder-install"
-          python -I -m pip --isolated install --no-cache-dir \
-            --target "$audit_root/site-packages" "$audit_root/encoder-install"
+          # The protected-base runtime is the base encoder's own uv.lock set,
+          # staged and checked exactly as the head tree is.
+          export UV_NO_CONFIG=1
+          uv_cache="$(mktemp -d "$RUNNER_TEMP/axiom-uv-cache.XXXXXXXX")"
+          export UV_CACHE_DIR="$uv_cache"
+          python_bin="$(command -v python)"
+          encoder="$audit_root/encoder-install"
+          reference="$audit_root/locked-environment"
+          site_packages="$audit_root/site-packages"
+          locked="$audit_root/locked-requirements.txt"
+          cp -a "$base_dependencies/axiom-encode" "$encoder"
+          UV_PROJECT_ENVIRONMENT="$reference" uv sync --project "$encoder" \
+            --locked --no-dev --python "$python_bin"
+          uv export --project "$encoder" --locked --no-dev --no-emit-project \
+            --no-emit-package axiom-oracles --format requirements-txt \
+            --output-file "$locked"
+          oracles="$(uv export --project "$encoder" --locked --no-dev --no-emit-project \
+            --no-hashes --no-annotate --no-header --format requirements-txt \
+            | grep -xE 'axiom-oracles @ git\+https://github\.com/TheAxiomFoundation/axiom-oracles@[0-9a-f]{40}')"
+          uv pip install --python "$python_bin" --target "$site_packages" \
+            --require-hashes --no-deps -r "$locked"
+          uv pip install --python "$python_bin" --target "$site_packages" \
+            --no-deps "$oracles"
+          uv pip install --python "$python_bin" --target "$site_packages" \
+            --no-deps "$encoder"
+          uv pip freeze --python "$reference/bin/python" --exclude-editable \
+            > "$audit_root/locked.freeze"
+          uv pip freeze --python "$python_bin" --target "$site_packages" \
+            --exclude axiom-encode > "$audit_root/staged.freeze"
+          test -s "$audit_root/locked.freeze"
+          diff -u "$audit_root/locked.freeze" "$audit_root/staged.freeze"
+          rm -rf "$reference" "$uv_cache"
           python -I /opt/axiom-dependency-integrity/check.py verify
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-site-packages "$audit_root/site-packages" runtime
 

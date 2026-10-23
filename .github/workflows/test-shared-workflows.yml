@@ -39,3 +39,5 @@ jobs:
         run: python scripts/test_legacy_encoder_waiver_workflow.py
       - name: Test pin bump manifest revalidation
         run: python scripts/test_pin_bump_manifest_workflow.py
+      - name: Test locked protected site-packages
+        run: python scripts/test_locked_site_packages_workflow.py
