@@ -131,17 +131,17 @@ def is_installer(argv: list[str]) -> bool:
 
 
 def installers(run: str) -> tuple[list[tuple[str, ...]], list[str]]:
-    """Every installer command in a run block, and any that hide from parsing."""
+    """Parsed installers and lines where the regex cross-check disagrees."""
     found, hidden = [], []
     for line in logical_lines(run):
         hits = len(INSTALLER.findall(line))
         commands = simple_commands(line)
         parsed = [tuple(argv) for argv in commands or [] if is_installer(argv)]
-        if commands is None or hits != len(parsed):
-            if hits:
-                hidden.append(line)
-            continue
+        # Parsing is authoritative. The raw cross-check may add a finding,
+        # but must never discard a recognized installer, even with zero hits.
         found.extend(parsed)
+        if hits != len(parsed):
+            hidden.append(line)
     return found, hidden
 
 
@@ -351,7 +351,7 @@ def installer_violations(text: str) -> list[str]:
         for item in steps:
             found, hidden = installers(item.get("run", ""))
             key = (job_name, item.get("name"))
-            violations += [f"{key}: installer hidden from parsing: {line}" for line in hidden]
+            violations += [f"{key}: installer detector disagreement: {line}" for line in hidden]
             if found:
                 seen[key] = seen.get(key, []) + found
         if job_name == "validate":
@@ -619,6 +619,44 @@ class LockedSitePackagesTests(unittest.TestCase):
             with self.subTest(mutation=label):
                 self.assertNotEqual(mutated, text)
                 self.assertNotEqual(installer_violations(mutated), [])
+
+    def test_installer_disagreements_preserve_commands_and_report_the_line(self):
+        for line in (
+            'pip --isolated install --target "$site_packages" hostile-pkg',
+            'noise="$(uv pip install hostile-pkg)"',
+            'pip install "$(pip install hostile-pkg)"',
+            'uv pip install one; pip --isolated install hostile-pkg',
+            'uv pip install "unterminated',
+        ):
+            with self.subTest(command=line):
+                commands = simple_commands(line)
+                parsed = [tuple(argv) for argv in commands or [] if is_installer(argv)]
+                self.assertNotEqual(len(INSTALLER.findall(line)), len(parsed))
+                found, hidden = installers(line)
+                self.assertEqual(found, parsed)
+                self.assertEqual(hidden, [line])
+
+    def test_installer_guard_reports_option_path_and_continuation_mutations(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        cleanup = '          rm -rf "$reference" "$uv_cache"\n'
+        self.assertEqual(text.count(cleanup), 2)
+        commands = (
+            'pip --isolated install --target "$site_packages" hostile-pkg',
+            'pip -q install --target "$site_packages" hostile-pkg',
+            'python -m pip --no-cache-dir install --target "$site_packages" hostile-pkg',
+            '/usr/bin/pip install --target "$site_packages" hostile-pkg',
+            '"$VENV/bin/pip" install --target "$site_packages" hostile-pkg',
+            'uv --no-cache pip install --target "$site_packages" hostile-pkg',
+            'uv pip --no-cache-dir install --target "$site_packages" hostile-pkg',
+            'uv --no-cache pip --quiet install --target "$site_packages" hostile-pkg',
+            'pip --isolated install \\\n                --target "$site_packages" hostile-pkg',
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                mutated = text.replace(cleanup, cleanup + "          " + command + "\n", 1)
+                violations = installer_violations(mutated)
+                self.assertTrue(any(HEAD in violation and "hostile-pkg" in violation
+                                    for violation in violations), violations)
 
     def test_staging_blocks_are_exactly_the_locked_install(self):
         self.assertEqual(block(HEAD, HEAD_FIRST, HEAD_LAST), HEAD_CANONICAL)
