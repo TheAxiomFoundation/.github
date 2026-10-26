@@ -2877,7 +2877,8 @@ jobs:
     # 1,298 green rulespec-us legs took p50 23, p99 131, max 153 minutes.
     # A hung leg must not hold its runner for six hours: rulespec-us#1431
     # held 52 runners for 3.5-6 hours in three runs and starved the org.
-    timeout-minutes: 180
+    # The limit is the waiver ratchet step's 210 minutes plus setup.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       # The org plan runs at most 60 hosted jobs at once, and rulespec-us
@@ -4264,17 +4265,30 @@ jobs:
       - name: Enforce validation waiver ratchet
         shell: bash
         # Green rulespec-us legs, September 2026: p50 13, at most 125
-        # minutes. Fail here, naming the step, before the job limit.
-        timeout-minutes: 150
+        # minutes. In October 2026 the step took up to 149 minutes on us-mo
+        # and then, after the waiver count changed, on us-ms, and was cut at
+        # 150 four times (main run 40240298705 on us-mo; rulespec-us#1916
+        # and #1914 on us-ms). Which leg runs long changes with the waiver
+        # count (see the worker note below). Fail here, naming the step,
+        # before the job limit.
+        timeout-minutes: 210
         env:
           AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
-          # The matrix already partitions the audit across 52 runners, so
-          # keep each leg serial except us-wa. Its two adjacent expensive
-          # tariff chapters exceeded the unchanged 150-minute step limit in
-          # rulespec-us#1431 run 36741794354. Two interleaved encoder workers
-          # separate their first-pass work; all discrepancies still receive
-          # the encoder's isolated serial recheck before any accusation.
-          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: ${{ github.repository == 'TheAxiomFoundation/rulespec-us' && matrix.shard == 'us-wa' && '2' || '1' }}
+          # The encoder deals waivers to legs round-robin by sorted path, so
+          # adding or removing one waiver moves later modules to other legs,
+          # and the few expensive generated tariff chapters move with them.
+          # This setting does not reach the encoder today: the signing
+          # supervisor builds the child's environment from an allowlist that
+          # omits it (axiom-encode cmd/axiom-encode-signing-supervisor,
+          # cleanChildEnvironment), so every leg runs the encoder's default:
+          # min(8, os.cpu_count()) workers, capped at the leg's module count,
+          # which is up to 4 on GitHub's standard hosted Linux runners for
+          # public repositories. rulespec-us names that same 4, so its legs
+          # keep their worker count once a supervisor that forwards the
+          # setting is adopted; other repositories declare 1. Discrepancies
+          # still receive the encoder's isolated serial recheck before any
+          # accusation.
+          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: ${{ github.repository == 'TheAxiomFoundation/rulespec-us' && '4' || '1' }}
           BOOTSTRAP_SHA256: ${{ inputs.validation-waiver-bootstrap-sha256 }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
