@@ -4280,12 +4280,14 @@ jobs:
           # This setting does not reach the encoder today: the signing
           # supervisor builds the child's environment from an allowlist that
           # omits it (axiom-encode cmd/axiom-encode-signing-supervisor,
-          # cleanChildEnvironment), so every leg runs the encoder's default of
-          # min(8, os.cpu_count()) workers: 4 on GitHub's standard hosted Linux
-          # runners for public repositories. rulespec-us names that same 4, so
-          # its legs keep their worker count once a supervisor that forwards
-          # the setting is adopted. Discrepancies still receive the encoder's
-          # isolated serial recheck before any accusation.
+          # cleanChildEnvironment), so every leg runs the encoder's default:
+          # min(8, os.cpu_count()) workers, capped at the leg's module count,
+          # which is up to 4 on GitHub's standard hosted Linux runners for
+          # public repositories. rulespec-us names that same 4, so its legs
+          # keep their worker count once a supervisor that forwards the
+          # setting is adopted; other repositories declare 1. Discrepancies
+          # still receive the encoder's isolated serial recheck before any
+          # accusation.
           AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: ${{ github.repository == 'TheAxiomFoundation/rulespec-us' && '4' || '1' }}
           BOOTSTRAP_SHA256: ${{ inputs.validation-waiver-bootstrap-sha256 }}
           EVENT_NAME: ${{ github.event_name }}
