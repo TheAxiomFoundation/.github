@@ -4,9 +4,9 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-26 — Merge pull request #1916 from TheAxiomFoundation/hub/waiver-pending-nyc-11-1704-1 | 92 | us-rulespec-2026-10-25-ssi-poms-public-laws | ${{ | queued |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-26 — Merge pull request #1914 from TheAxiomFoundation/household-choices-montana-2021-2023 | 41 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | in_progress |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-26 — Merge pull request #494 from TheAxiomFoundation/hub/uk-waiver-staging | 38 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-26 — Merge pull request #139 from TheAxiomFoundation/repin/axiom-encode-fa0da5e8 | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-23 — Merge pull request #465 from TheAxiomFoundation/docs/uk-ctr-route-2026-10 | 39 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-15 — Merge pull request #28 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
