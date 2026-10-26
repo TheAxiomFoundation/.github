@@ -4268,13 +4268,19 @@ jobs:
         timeout-minutes: 150
         env:
           AXIOM_COMPOSE_REF: ${{ needs.shards.outputs.axiom_compose_ref }}
-          # The matrix already partitions the audit across 52 runners, so
-          # keep each leg serial except us-wa. Its two adjacent expensive
-          # tariff chapters exceeded the unchanged 150-minute step limit in
-          # rulespec-us#1431 run 36741794354. Two interleaved encoder workers
-          # separate their first-pass work; all discrepancies still receive
-          # the encoder's isolated serial recheck before any accusation.
-          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: ${{ github.repository == 'TheAxiomFoundation/rulespec-us' && matrix.shard == 'us-wa' && '2' || '1' }}
+          # The matrix already partitions the audit across its runners, but
+          # the encoder deals waivers to legs round-robin by sorted path, so
+          # adding or removing one waiver moves every later module to the
+          # next leg. The few expensive generated tariff chapters drift with
+          # them: us-wa exceeded the 150-minute step limit in rulespec-us#1431
+          # run 36741794354, us-mo then ran 117-145 minutes serially, and
+          # after one more waiver us-ms ran 118-150 minutes and hit the limit
+          # three times (rulespec-us#1916 and #1914, October 2026). So every
+          # rulespec-us leg runs two interleaved encoder workers, which split
+          # adjacent expensive modules wherever they land; us-wa has run that
+          # way since #1431. All discrepancies still receive the encoder's
+          # isolated serial recheck before any accusation.
+          AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: ${{ github.repository == 'TheAxiomFoundation/rulespec-us' && '2' || '1' }}
           BOOTSTRAP_SHA256: ${{ inputs.validation-waiver-bootstrap-sha256 }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}

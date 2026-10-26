@@ -6643,11 +6643,14 @@ def test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix() -> 
     assert "needs.shards.outputs.first" not in audit_step
     assert '--partition-key "${{ matrix.shard }}"' in audit_step
     assert "--partition-keys-json '${{ needs.shards.outputs.matrix }}'" in audit_step
+    # Round-robin partitions move the expensive tariff chapters between legs
+    # whenever the waiver count changes, so no single leg can be singled out.
     assert (
         "AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: "
         "${{ github.repository == 'TheAxiomFoundation/rulespec-us' "
-        "&& matrix.shard == 'us-wa' && '2' || '1' }}"
+        "&& '2' || '1' }}"
     ) in audit_step
+    assert "matrix.shard == 'us-wa'" not in audit_step
 
 
 def test_lane_registry_regressions_run_from_shared_workflow_entrypoint() -> None:
