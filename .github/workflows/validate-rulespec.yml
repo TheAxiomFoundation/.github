@@ -4665,6 +4665,46 @@ jobs:
             test "$(git -C "$base_dependencies/$name" rev-parse HEAD)" = "$pin"
             test -z "$(git -C "$base_dependencies/$name" status --porcelain --untracked-files=all --ignored)"
           done
+          # base-encoder-main-record-start
+          # The guard admits a producer other than the pin only by proving its
+          # ancestry on official main, which it reads from the encoder
+          # checkout's fetch record (FETCH_HEAD). A local clone carries no
+          # fetch record and no main branch, so the base audit could only say
+          # ancestry is unprovable while the head audit gives the real verdict,
+          # and an inherited producer defect would look new. Give the base
+          # checkout the head checkout's record, written by the authenticated
+          # fetch of official main above, so both audits judge producers
+          # against the same main.
+          head_encoder="$AXIOM_DEPENDENCY_ROOT/axiom-encode"
+          base_encoder="$base_dependencies/axiom-encode"
+          python -I - \
+            "$head_encoder/$(git -C "$head_encoder" rev-parse --git-path FETCH_HEAD)" \
+            "$(git -C "$head_encoder" rev-parse --verify 'refs/remotes/origin/main^{commit}')" \
+            "$base_encoder/$(git -C "$base_encoder" rev-parse --git-path FETCH_HEAD)" <<'PYMAINRECORD'
+          import os
+          import re
+          import stat
+          import sys
+
+          source, fetched_main, destination = sys.argv[1:4]
+          try:
+              info = os.lstat(source)
+          except FileNotFoundError:
+              raise SystemExit("ManifestAuditError: the encoder checkout has no main fetch record")
+          if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+              raise SystemExit("ManifestAuditError: the encoder main fetch record is not a small regular file")
+          with open(source, "rb") as handle:
+              record = handle.read(4097)
+          match = re.fullmatch(rb"([0-9a-f]{40})\t(?:not-for-merge)?\tbranch 'main' of "
+                               rb"https://github\.com/TheAxiomFoundation/axiom-encode(?:\.git)?/?\n?", record)
+          if match is None or match.group(1).decode() != fetched_main:
+              raise SystemExit("ManifestAuditError: the encoder fetch record is not the authenticated official main")
+          # O_EXCL and O_NOFOLLOW: never overwrite or follow anything the clone left.
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+          with os.fdopen(descriptor, "wb") as handle:
+              handle.write(record)
+          PYMAINRECORD
+          # base-encoder-main-record-end
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-rules "$base_rules" repository
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-encoder "$base_dependencies/axiom-encode" repository
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-corpus "$base_dependencies/axiom-corpus" repository

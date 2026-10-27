@@ -624,7 +624,12 @@ The whole-repository generated-content audit is a ratchet: run supervised
 proposed tree with its pins, reject issues present only at the proposed tree,
 and report inherited issues as information. Missing legacy manifests or stale
 waiver digests therefore do not alone block an unchanged-content validator
-adoption PR. This audit does not excuse a newly introduced issue or replace
+adoption PR. The guard admits a producer other than the pin only by proving its
+ancestry on official main, read from the encoder checkout's fetch record, so the
+base encoder clone receives the proposed encoder checkout's record of the
+authenticated main fetch; without it the base audit reports every such
+producer as unprovable and an inherited producer issue reads as new at the
+proposed tree. This audit does not excuse a newly introduced issue or replace
 module validation. Staged inactive composer pins remain inactive for older
 encoder callers. Local fixtures exercise this comparison; they do not establish
 the external encoder's manifest-admission policy on complete live repositories.
