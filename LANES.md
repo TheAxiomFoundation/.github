@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-26 — Merge pull request #1922 from TheAxiomFoundation/hub/validator-pin-test-pattern | 41 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-27 — Merge pull request #1937 from TheAxiomFoundation/hub/validator-adopt-59e48cf8 | 40 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | queued |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-26 — Merge pull request #494 from TheAxiomFoundation/hub/uk-waiver-staging | 38 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-26 — Merge pull request #139 from TheAxiomFoundation/repin/axiom-encode-fa0da5e8 | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
@@ -15,9 +15,9 @@
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-10-14 — Merge pull request #106 from TheAxiomFoundation/hub/retire-signed-apply | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-10-14 — Merge pull request #29 from TheAxiomFoundation/hub/retire-signed-apply | 1 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-10-11 — Merge pull request #16 from TheAxiomFoundation/hub/encoder-guard-on | 0 | ng-rulespec-2026-07-22 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-10-11 — Merge pull request #131 from TheAxiomFoundation/hub/encoder-guard-on | 1 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 178 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
-| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 4 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-10-11 — Merge pull request #131 from TheAxiomFoundation/hub/encoder-guard-on | 2 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 179 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
+| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 5 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 
 <!-- curated:start -->
 ## Lane ownership and standing constraints (curated — edit by PR only)
