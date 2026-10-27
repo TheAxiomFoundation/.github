@@ -17,6 +17,7 @@ against a fake ``uv`` to prove its argv sequence and its fail-closed paths.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import random
@@ -68,45 +69,138 @@ def logical_lines(script: str) -> list[str]:
     return lines
 
 
-def workflow_steps():
-    for path in sorted(WORKFLOWS.glob("*.yml")):
-        workflow = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-        for job_name, job in workflow.get("jobs", {}).items():
-            for index, step in enumerate(job.get("steps", [])):
-                yield path.name, job_name, index, step
+def workflow_texts() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8")
+            for path in sorted(WORKFLOWS.glob("*.yml"))}
 
 
 # Any command that can put a distribution on disk or into an interpreter.
-# Matched over the raw logical line, so an installer hidden inside a quoted
-# command substitution is still counted.
+# Matched over the raw logical line as a cross-check on the parser below; it
+# misses option-prefixed forms, so it may only add findings.
 INSTALLER = re.compile(
     r"(?<![\w./-])(?:uv\s+pip\s+(?:install|sync)|uv\s+(?:sync|add|run|tool)\b"
     r"|uv\s+python\s+install|uvx|pip3?(?:\.\d+)?\s+install|-m\s+(?:pip|ensurepip)\b"
     r"|easy_install)(?![\w-])"
 )
+# Every word that can name an installer program or module. Two detectors that
+# agree on zero installers prove nothing, so each raw occurrence must also turn
+# up in a parsed word of a command the parser classified.
+INSTALLER_TOKEN = re.compile(
+    r"(?<![\w.-])(?:uvx|uv|pipx|pip3?(?:\.\d+)*|easy_install|ensurepip)(?![\w-])"
+)
 SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "{", "}"}
 DIRECTORY_OPTIONS = ("--target", "-t", "--prefix", "--root", "--user")
+PLACEHOLDER = re.compile(r"__axiom_substitution_(\d+)__")
+
+
+def _closing_backtick(text: str, index: int) -> int:
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+        elif text[index] == "`":
+            return index
+        else:
+            index += 1
+    raise ValueError("unterminated backtick substitution")
+
+
+def _closing_paren(text: str, index: int) -> int:
+    """Index of the ``)`` closing a group whose ``(`` ends just before index."""
+    depth, quote = 1, None
+    while index < len(text):
+        char = text[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\":
+            index += 1
+        elif char == "`":
+            index = _closing_backtick(text, index + 1)
+        elif quote == '"':
+            if char == '"':
+                quote = None
+            elif text.startswith("$(", index):
+                index = _closing_paren(text, index + 2)
+        elif char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    raise ValueError("unterminated substitution")
+
+
+def split_substitutions(line: str) -> tuple[str, list[str], list[str]]:
+    """The line with each ``$(...)``, backtick, ``<(...)`` and ``>(...)``
+    replaced by a placeholder word, plus each one's body and original text.
+
+    Substitutions run whether or not they sit inside double quotes, so only
+    single quotes hide them. Raises ValueError on an unterminated one.
+    """
+    out, bodies, originals = [], [], []
+    index, quote = 0, None
+    while index < len(line):
+        char = line[index]
+        if quote == "'":
+            quote = None if char == "'" else quote
+            out.append(char)
+            index += 1
+            continue
+        if char == "\\":
+            out.append(line[index:index + 2])
+            index += 2
+            continue
+        opens = line.startswith("$(", index) or (
+            quote is None and char in "<>" and line.startswith("(", index + 1))
+        if opens or char == "`":
+            if char == "`":
+                end = _closing_backtick(line, index + 1)
+                body = re.sub(r"\\([`$\\])", r"\1", line[index + 1:end])
+            else:
+                end = _closing_paren(line, index + 2)
+                body = line[index + 2:end]
+            out.append(f"__axiom_substitution_{len(bodies)}__")
+            bodies.append(body)
+            originals.append(line[index:end + 1])
+            index = end + 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+        elif char == "'" and quote is None:
+            quote = "'"
+        out.append(char)
+        index += 1
+    if quote:
+        raise ValueError("unterminated quote")
+    return "".join(out), bodies, originals
 
 
 def simple_commands(line: str) -> list[list[str]] | None:
-    """Top-level simple commands of one logical line; None if unparseable."""
+    """Simple commands of one substitution-free line; None if unparseable.
+
+    Redirection targets come back as their own one-word commands, so a token
+    hidden in one is still seen and attributed to no installer.
+    """
     try:
         lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>(){}")
         lexer.whitespace_split = True
         tokens = list(lexer)
     except ValueError:
         return None
-    commands, current, skip = [], [], False
+    commands, current, target = [], [], False
     for token in tokens:
-        if skip:
-            skip = False
-            continue
-        if token in SEPARATORS:
+        if target:
+            target = False
+            commands.append([">", token])
+        elif token in SEPARATORS:
             if current:
                 commands.append(current)
             current = []
         elif set(token) <= set("<>"):
-            skip = True  # the redirection target is not an argument
+            target = True
         else:
             current.append(token)
     if current:
@@ -114,41 +208,251 @@ def simple_commands(line: str) -> list[list[str]] | None:
     return commands
 
 
-def is_installer(argv: list[str]) -> bool:
-    for index, token in enumerate(argv):
-        name = token.rsplit("/", 1)[-1]
-        rest = argv[index + 1:]
-        if name == "uv" and (rest[:2] in (["pip", "install"], ["pip", "sync"], ["python", "install"])
-                             or rest[:1] in (["sync"], ["add"], ["run"], ["tool"])):
-            return True
-        if name == "uvx" or name == "easy_install":
-            return True
-        if re.fullmatch(r"pip3?(\.\d+)?", name) and "install" in rest:
-            return True
-        if token == "-m" and rest[:1] in (["pip"], ["ensurepip"]):
-            return True
-    return False
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=.*", re.S)
+# Prefixes that run the rest of the line as the command. Their own options are
+# skipped; one that takes a value (sudo -u root) leaves that value as the
+# command name, so any installer token after it goes unattributed.
+PREFIXES = {"sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice",
+            "timeout", "stdbuf", "setsid", "xargs", "if", "then", "elif", "else", "while",
+            "until", "do", "!"}
+PYTHON = re.compile(r"python(?:\d+(?:\.\d+)*)?")
+PIP = re.compile(r"pip3?(?:\.\d+)*")
+DYNAMIC = re.compile(r"[$`]|__axiom_substitution_\d+__")
+DYNAMIC_VERBS = {"install", "sync", "add", "run", "tool", "pip", "python", "download", "wheel"}
+DYNAMIC_ANYWHERE = {"install", "--with", "--with-requirements", "--with-editable"}
+
+PIP_FLAGS = {"--isolated", "--quiet", "--verbose", "--no-cache-dir", "--disable-pip-version-check",
+             "--no-color", "--no-input", "--require-virtualenv", "--no-python-version-warning",
+             "--debug"}
+PIP_VALUES = {"--python", "--log", "--log-file", "--proxy", "--retries", "--timeout",
+              "--exists-action", "--trusted-host", "--cert", "--client-cert", "--cache-dir",
+              "--keyring-provider", "--use-feature", "--use-deprecated", "--resume-retries"}
+PIP_INSTALLING = {"install", "download", "wheel"}
+PIP_READ_ONLY = {"freeze", "list", "show", "check", "help", "hash", "inspect", "debug",
+                 "--version", "-V", "--help", "-h"}
+
+UV_FLAGS = {"--quiet", "--verbose", "-n", "--no-cache", "--offline", "--no-offline",
+            "--native-tls", "--no-native-tls", "--no-progress", "--no-config",
+            "--no-python-downloads", "--managed-python", "--no-managed-python", "--preview",
+            "--no-preview", "--isolated", "--show-settings"}
+UV_VALUES = {"--cache-dir", "--color", "--directory", "--project", "--config-file",
+             "--python-preference", "--allow-insecure-host", "--preview-features"}
+UV_INSTALLING = {"run", "sync", "add", "remove", "tool"}
+UV_READ_ONLY = {"export", "tree", "help", "--version", "-V", "--help", "-h"}
+UV_PIP_INSTALLING = {"install", "sync"}
+UV_PIP_READ_ONLY = {"freeze", "list", "show", "check", "tree"}
+
+
+def _subcommand(rest: list[str], flags: set[str], values: set[str],
+                read_only: set[str]) -> tuple[int | None, str]:
+    """Index of the first non-option word, skipping only known options.
+
+    An unknown option might take the next word as its value, so it makes the
+    subcommand unknowable and the command unclassifiable.
+    """
+    index = 0
+    while index < len(rest):
+        word = rest[index]
+        if word in read_only or not word.startswith("-"):
+            return index, ""
+        if word in values:
+            index += 2
+        elif word in flags or re.fullmatch(r"-[qv]+", word) or word.split("=", 1)[0] in values:
+            index += 1
+        else:
+            return None, f"unknown option {word}"
+    return None, "no subcommand"
+
+
+def pip_command(rest: list[str]) -> tuple[str, str]:
+    index, reason = _subcommand(rest, PIP_FLAGS, PIP_VALUES, PIP_READ_ONLY)
+    if index is None:
+        return "unclassified", f"pip: {reason}"
+    if rest[index] in PIP_INSTALLING:
+        return "install", ""
+    if rest[index] in PIP_READ_ONLY:
+        return "read-only", ""
+    return "unclassified", f"pip subcommand {rest[index]}"
+
+
+def uv_command(rest: list[str]) -> tuple[str, str]:
+    index, reason = _subcommand(rest, UV_FLAGS, UV_VALUES, UV_READ_ONLY)
+    if index is None:
+        return "unclassified", f"uv: {reason}"
+    command, after = rest[index], rest[index + 1:]
+    if command in UV_INSTALLING:
+        return "install", ""
+    if command in UV_READ_ONLY:
+        return "read-only", ""
+    if command == "venv":
+        return ("install", "") if "--seed" in after else ("read-only", "")
+    if command == "pip":
+        sub, reason = _subcommand(after, UV_FLAGS, UV_VALUES, set())
+        if sub is None:
+            return "unclassified", f"uv pip: {reason}"
+        if after[sub] in UV_PIP_INSTALLING:
+            return "install", ""
+        if after[sub] in UV_PIP_READ_ONLY:
+            return "read-only", ""
+        return "unclassified", f"uv pip subcommand {after[sub]}"
+    if command == "python":
+        sub = next((word for word in after if not word.startswith("-")), None)
+        if sub == "install":
+            return "install", ""
+        if sub in ("find", "list", "dir"):
+            return "read-only", ""
+        return "unclassified", f"uv python subcommand {sub}"
+    return "unclassified", f"uv subcommand {command}"
+
+
+def python_command(rest: list[str]) -> tuple[str, str]:
+    """Only ``-m pip``, ``-m uv`` and installer modules are installer commands."""
+    index = 0
+    while index < len(rest):
+        option = re.fullmatch(r"-([bBdEhiIOPqRsSuvVx]*)([mcWX]?)(.*)", rest[index], re.S)
+        if not rest[index].startswith("-") or rest[index] == "-" or not option:
+            return "foreign", ""
+        letter, value = option.group(2), option.group(3)
+        if not letter and value:
+            return "foreign", ""
+        if letter == "c":
+            return "foreign", ""
+        if letter in "WX" and letter:
+            index += 1 if value else 2
+            continue
+        if letter == "m":
+            if not value and index + 1 >= len(rest):
+                return "unclassified", "python -m without a module"
+            module = value or rest[index + 1]
+            after = rest[index + 1:] if value else rest[index + 2:]
+            if PIP.fullmatch(module):
+                return pip_command(after)
+            if module == "uv":
+                return uv_command(after)
+            if module in ("ensurepip", "pipx", "easy_install"):
+                return "install", ""
+            if INSTALLER_TOKEN.match(module):
+                return "unclassified", f"python -m {module}"
+            return "foreign", ""
+        index += 1
+    return "foreign", ""
+
+
+def classify(argv: list[str]) -> tuple[str, str]:
+    """install, read-only, foreign (not an installer program) or unclassified."""
+    index = 0
+    while index < len(argv):
+        name = argv[index].rsplit("/", 1)[-1]
+        if ASSIGNMENT.fullmatch(argv[index]):
+            index += 1
+        elif name in PREFIXES:
+            index += 1
+            while index < len(argv) and argv[index].startswith("-") and argv[index] != "-":
+                index += 1
+        else:
+            break
+    if index == len(argv):
+        return "foreign", ""
+    word, rest = argv[index], argv[index + 1:]
+    name = word.rsplit("/", 1)[-1]
+    if PYTHON.fullmatch(name):
+        return python_command(rest)
+    if PIP.fullmatch(name):
+        return pip_command(rest)
+    if name == "uv":
+        return uv_command(rest)
+    if name in ("uvx", "pipx", "easy_install"):
+        return "install", ""
+    if name == "eval":
+        return "unclassified", "eval"
+    if DYNAMIC.search(word):
+        verb = next((arg for arg in rest if not arg.startswith("-")), None)
+        if verb in DYNAMIC_VERBS or DYNAMIC_ANYWHERE & set(rest):
+            return "unclassified", f"variable-expanded command name {word}"
+    return "foreign", ""
+
+
+def _parse(text: str, found: list, problems: list) -> int:
+    """Classify every command in text and its substitutions, recursively.
+
+    Returns how many installer tokens the parsed words hold, so the caller can
+    compare it with the raw count.
+    """
+    try:
+        rewritten, bodies, originals = split_substitutions(text)
+    except ValueError:
+        commands = None
+    else:
+        commands = simple_commands(rewritten)
+    if commands is None:
+        tokens = len(INSTALLER_TOKEN.findall(text))
+        if tokens:
+            problems.append(f"cannot tokenise installer-shaped text: {text}")
+        return tokens
+
+    def restore(word: str) -> str:
+        return PLACEHOLDER.sub(lambda match: originals[int(match.group(1))], word)
+
+    counted = 0
+    for argv in commands:
+        tokens = sum(len(INSTALLER_TOKEN.findall(word)) for word in argv)
+        counted += tokens
+        kind, reason = classify(argv)
+        command = tuple(restore(word) for word in argv)
+        if kind == "install":
+            found.append(command)
+        elif kind == "unclassified":
+            problems.append(f"unclassifiable installer syntax ({reason}): {shlex.join(command)}")
+        elif kind == "foreign" and tokens:
+            problems.append(f"installer token outside an installer command: {shlex.join(command)}")
+    for body in bodies:
+        counted += _parse(body, found, problems)
+    return counted
 
 
 def installers(run: str) -> tuple[list[tuple[str, ...]], list[str]]:
-    """Parsed installers and lines where the regex cross-check disagrees."""
+    """Parsed installers, and every line the guard cannot fully account for."""
+    found, hidden = _installers(run)
+    return list(found), list(hidden)
+
+
+@functools.lru_cache(maxsize=None)
+def _installers(run: str) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]]:
     found, hidden = [], []
     for line in logical_lines(run):
-        hits = len(INSTALLER.findall(line))
-        commands = simple_commands(line)
-        parsed = [tuple(argv) for argv in commands or [] if is_installer(argv)]
+        parsed, problems = [], []
+        counted = _parse(line, parsed, problems)
+        raw = len(INSTALLER_TOKEN.findall(line))
+        if counted != raw:
+            problems.append(f"{raw} installer tokens in the raw line, {counted} in parsed words")
         # Parsing is authoritative. The raw cross-check may add a finding,
         # but must never discard a recognized installer, even with zero hits.
+        if len(INSTALLER.findall(line)) != len(parsed):
+            problems.append("installer detector disagreement")
         found.extend(parsed)
-        if hits != len(parsed):
-            hidden.append(line)
-    return found, hidden
+        hidden.extend(f"{problem} (line: {line})" for problem in problems)
+    return tuple(found), tuple(hidden)
 
 
 def installs_into_a_directory(argv: tuple[str, ...]) -> bool:
     return any(token == option or token.startswith(option + "=")
                or (option == "-t" and token.startswith("-t") and len(token) > 2)
                for token in argv for option in DIRECTORY_OPTIONS)
+
+
+def directory_installs(texts: dict[str, str]) -> tuple[list[tuple], list[str]]:
+    """Every directory install across workflow texts, and every unaccounted line."""
+    directory, hidden = [], []
+    for name, text in texts.items():
+        workflow = yaml.load(text, Loader=yaml.BaseLoader)
+        for job_name, job in workflow.get("jobs", {}).items():
+            for item in job.get("steps", []):
+                found, problems = installers(item.get("run", ""))
+                hidden += [f"{name}:{job_name}/{item.get('name')}: {problem}"
+                           for problem in problems]
+                directory += [(name, job_name, item.get("name"), argv) for argv in found
+                              if installs_into_a_directory(argv)]
+    return directory, hidden
 
 
 VALIDATE_STEPS = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)[
@@ -341,9 +645,9 @@ INSTALLERS = {
 }
 
 
-def installer_violations(text: str) -> list[str]:
+def installer_violations(text: str | dict) -> list[str]:
     """Every way validate-rulespec.yml's installers differ from INSTALLERS."""
-    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    workflow = text if isinstance(text, dict) else yaml.load(text, Loader=yaml.BaseLoader)
     violations = []
     seen = {}
     for job_name, job in workflow.get("jobs", {}).items():
@@ -506,16 +810,16 @@ def execute(name: str, *, unhashed_export: str = UNHASHED_EXPORT,
 
 
 class LockedSitePackagesTests(unittest.TestCase):
+    @staticmethod
+    def expected_directory_installs() -> list[tuple]:
+        return [(WORKFLOW.name, job, name, argv)
+                for (job, name), commands in INSTALLERS.items()
+                for argv in commands if installs_into_a_directory(argv)]
+
     def test_every_directory_install_in_any_workflow_is_a_locked_uv_install(self):
-        directory = []
-        for workflow, job, _index, item in workflow_steps():
-            found, hidden = installers(item.get("run", ""))
-            self.assertEqual(hidden, [], f"{workflow}:{job}/{item.get('name')}")
-            directory += [(workflow, job, item.get("name"), argv) for argv in found
-                          if installs_into_a_directory(argv)]
-        expected = [(WORKFLOW.name, job, name, argv)
-                    for (job, name), commands in INSTALLERS.items()
-                    for argv in commands if installs_into_a_directory(argv)]
+        directory, hidden = directory_installs(workflow_texts())
+        self.assertEqual(hidden, [])
+        expected = self.expected_directory_installs()
         # Non-vacuity: 3 head, 3 protected-base and 1 composer staging install.
         self.assertEqual(len(expected), 7)
         self.assertEqual(sorted(directory, key=str), sorted(expected, key=str))
@@ -621,20 +925,161 @@ class LockedSitePackagesTests(unittest.TestCase):
                 self.assertNotEqual(installer_violations(mutated), [])
 
     def test_installer_disagreements_preserve_commands_and_report_the_line(self):
-        for line in (
-            'pip --isolated install --target "$site_packages" hostile-pkg',
-            'noise="$(uv pip install hostile-pkg)"',
-            'pip install "$(pip install hostile-pkg)"',
-            'uv pip install one; pip --isolated install hostile-pkg',
-            'uv pip install "unterminated',
+        for line, parsed in (
+            ('pip --isolated install --target "$site_packages" hostile-pkg',
+             [("pip", "--isolated", "install", "--target", "$site_packages", "hostile-pkg")]),
+            ('uv pip install one; pip --isolated install hostile-pkg',
+             [("uv", "pip", "install", "one"), ("pip", "--isolated", "install", "hostile-pkg")]),
+            ('uv --no-cache run --with hostile-pkg python -c pass',
+             [("uv", "--no-cache", "run", "--with", "hostile-pkg", "python", "-c", "pass")]),
+            ('uv pip install "unterminated', []),
+            ("bash -c 'pip install hostile-pkg'", []),
+            ('p"i"p install hostile-pkg', [("pip", "install", "hostile-pkg")]),
+            ('eval "$installer"', []),
+            ('"$PIP" install hostile-pkg', []),
         ):
             with self.subTest(command=line):
-                commands = simple_commands(line)
-                parsed = [tuple(argv) for argv in commands or [] if is_installer(argv)]
-                self.assertNotEqual(len(INSTALLER.findall(line)), len(parsed))
                 found, hidden = installers(line)
                 self.assertEqual(found, parsed)
-                self.assertEqual(hidden, [line])
+                self.assertTrue(hidden, line)
+                self.assertTrue(all(problem.endswith(f"(line: {line})") for problem in hidden))
+
+    def test_substitutions_are_parsed_as_commands(self):
+        for line, parsed in (
+            ('noise="$(uv pip install hostile-pkg)"', [("uv", "pip", "install", "hostile-pkg")]),
+            ('pip install "$(pip install hostile-pkg)"',
+             [("pip", "install", "$(pip install hostile-pkg)"), ("pip", "install", "hostile-pkg")]),
+            ("x=`uv pip install hostile-pkg`", [("uv", "pip", "install", "hostile-pkg")]),
+            ('diff <(uv pip install a) >(uv pip install b)',
+             [("uv", "pip", "install", "a"), ("uv", "pip", "install", "b")]),
+            ('echo "$(echo "$(uv pip install hostile-pkg)")"',
+             [("uv", "pip", "install", "hostile-pkg")]),
+            ("echo '$(uv pip install quoted)'", None),
+        ):
+            with self.subTest(command=line):
+                found, hidden = installers(line)
+                if parsed is None:
+                    # Single quotes keep it literal, but the token still counts.
+                    self.assertEqual(found, [])
+                    self.assertTrue(hidden)
+                else:
+                    self.assertEqual(found, parsed)
+                    self.assertEqual(hidden, [])
+
+    def test_review_round_three_bypasses_fail_both_guard_tests(self):
+        """Each reviewer command, after the head cleanup, fails both guards."""
+        text = WORKFLOW.read_text(encoding="utf-8")
+        cleanup = '          rm -rf "$reference" "$uv_cache"\n'
+        self.assertEqual(text.count(cleanup), 2)
+        expected = sorted(self.expected_directory_installs(), key=str)
+        for command, directory_install in (
+            ('noise="$(pip --isolated install --target "$site_packages" hostile-pkg)"', True),
+            ("uv --no-cache run --with hostile-pkg --no-project python -c pass", False),
+        ):
+            with self.subTest(command=command):
+                mutated = text.replace(cleanup, cleanup + "          " + command + "\n", 1)
+                violations = installer_violations(mutated)
+                self.assertTrue(any(HEAD in violation and "hostile-pkg" in violation
+                                    for violation in violations), violations)
+                directory, hidden = directory_installs({**workflow_texts(),
+                                                        WORKFLOW.name: mutated})
+                self.assertTrue(hidden or sorted(directory, key=str) != expected)
+                if directory_install:
+                    self.assertIn(
+                        (WORKFLOW.name, "validate", HEAD,
+                         ("pip", "--isolated", "install", "--target", "$site_packages",
+                          "hostile-pkg")),
+                        directory)
+                else:
+                    self.assertTrue(any("disagreement" in problem for problem in hidden))
+
+    # Installer forms that put option words before the subcommand, hide the
+    # program name, or run it through another command.
+    INSTALLER_FORMS = (
+        'pip --isolated install --target "$site_packages" hostile-pkg',
+        "pip3 -q install hostile-pkg",
+        "pip --log /tmp/pip.log install hostile-pkg",
+        "pip3.13 --no-input install hostile-pkg",
+        "python -m pip --isolated install hostile-pkg",
+        "python -I -m pip --no-cache-dir install hostile-pkg",
+        "python3 -Im pip install hostile-pkg",
+        "python -mpip install hostile-pkg",
+        "python -X utf8 -m pip install hostile-pkg",
+        "python -m pip._internal install hostile-pkg",
+        "python -m ensurepip",
+        "python -m uv pip install hostile-pkg",
+        "uv --no-cache run --with hostile-pkg --no-project python -c pass",
+        "uv --cache-dir /tmp/c run --with-requirements hostile.txt python -c pass",
+        'uv -q pip install --target "$site_packages" hostile-pkg',
+        "uv --directory /tmp pip install hostile-pkg",
+        "uv --color never pip --quiet install hostile-pkg",
+        "uv --no-config tool install hostile-pkg",
+        "uv --offline tool run hostile-pkg",
+        "uv --unknown-flag pip install hostile-pkg",
+        "uv --project=/tmp sync",
+        "uv venv --seed /tmp/hostile-venv",
+        "uvx --with hostile-pkg ruff",
+        "easy_install hostile-pkg",
+        "pipx install hostile-pkg",
+        '"$VENV/bin/pip" --isolated install hostile-pkg',
+        '"$PIP" install hostile-pkg',
+        "$UV --no-cache run --with hostile-pkg python",
+        '"$python_bin" -m pip install hostile-pkg',
+        "${{ inputs.installer }} install hostile-pkg",
+        'eval "pip install hostile-pkg"',
+        'p"i"p install hostile-pkg',
+        "bash -c 'pip --isolated install hostile-pkg'",
+        "sudo -u root pip install hostile-pkg",
+        "env -i pip install hostile-pkg",
+        "if pip install hostile-pkg; then :; fi",
+    )
+    # Ways to embed one command in a line; {} is the command.
+    EMBEDDINGS = (
+        "{}",
+        'noise="$({})"',
+        "noise=$({})",
+        'noise="`{}`"',
+        ': "$(true; {})"',
+        "cat <({})",
+        "tee >({}) </dev/null",
+        'echo "$(echo "$({})")"',
+        'x="${{y:-$({})}}"',
+    )
+
+    def test_installer_guard_mutation_table(self):
+        workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        head = next(item for item in workflow["jobs"]["validate"]["steps"]
+                    if item.get("name") == HEAD)
+        original = head["run"]
+        cleanup = 'rm -rf "$reference" "$uv_cache"\n'
+        self.assertEqual(original.count(cleanup), 1)
+        self.assertEqual(installer_violations(workflow), [])
+        survivors = []
+        for form in self.INSTALLER_FORMS:
+            for embedding in self.EMBEDDINGS:
+                line = embedding.format(form)
+                head["run"] = original.replace(cleanup, cleanup + line + "\n")
+                if not any(HEAD in violation for violation in installer_violations(workflow)):
+                    survivors.append(line)
+        head["run"] = original
+        self.assertEqual(survivors, [])
+        self.assertEqual(len(self.INSTALLER_FORMS) * len(self.EMBEDDINGS), 324)
+
+        # Non-vacuity the other way: read-only uv and pip, and commands that
+        # merely run an interpreter, stay accepted in the same embeddings.
+        for form in (
+            'uv --no-cache pip freeze --python "$python_bin"',
+            'uv --quiet export --project "$encoder" --locked --format requirements-txt',
+            "uv pip --quiet list",
+            '"$python_bin" -I -c pass',
+            'sudo "$(command -v python)" -I /opt/check.py add base "$encoder" repository',
+        ):
+            for embedding in self.EMBEDDINGS:
+                line = embedding.format(form)
+                with self.subTest(accepted=line):
+                    head["run"] = original.replace(cleanup, cleanup + line + "\n")
+                    self.assertEqual(installer_violations(workflow), [])
+        head["run"] = original
 
     def test_installer_guard_reports_option_path_and_continuation_mutations(self):
         text = WORKFLOW.read_text(encoding="utf-8")
