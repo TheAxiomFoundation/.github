@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-26 — Merge pull request #1914 from TheAxiomFoundation/household-choices-montana-2021-2023 | 41 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | in_progress |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-26 — Merge pull request #1922 from TheAxiomFoundation/hub/validator-pin-test-pattern | 41 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-26 — Merge pull request #494 from TheAxiomFoundation/hub/uk-waiver-staging | 38 | uk-rulespec-2026-09-07 | c326d1ac0acdb557f047a3054160b19dd72602fa | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-26 — Merge pull request #139 from TheAxiomFoundation/repin/axiom-encode-fa0da5e8 | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-15 — Merge pull request #22 from TheAxiomFoundation/ci/manifest-sync-guard | 0 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
