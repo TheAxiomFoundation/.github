@@ -3884,9 +3884,9 @@ jobs:
           mkdir -p "$(dirname "$destination")"
           # Retry any failure (an HTTP error, a refused, dropped or stalled
           # connection) up to five times. Each try is bounded, so one stalled
-          # try cannot use up the retry window: curl abandons a try that
-          # receives less than 1 KiB/s for 30 s, and any try still running
-          # after 180 s. It starts a retry only while less than 600 s have
+          # try cannot use up the retry window: curl abandons a try whose
+          # speed, averaged over up to the last 5 s, stays under 1 KiB/s for
+          # 30 s, and any try still running after 180 s. It starts a retry only while less than 600 s have
           # passed since the first try; it checks before its wait, so a last try
           # can start a few seconds after that and run to its own 180 s bound.
           # It removes a failed partial --output file before it tries again.

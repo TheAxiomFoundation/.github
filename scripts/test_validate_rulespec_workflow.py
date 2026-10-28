@@ -586,12 +586,15 @@ def test_release_object_fetch_bounds_agree_and_leave_room_for_every_retry() -> N
                           "--retry-all-errors", "--retry-delay", "--retry-max-time"}, shell
     speed_time, max_time = int(shell["--speed-time"]), int(shell["--max-time"])
     window, retries, longest_delay = int(shell["--retry-max-time"]), int(shell["--retry"]), 7
+    # curl averages speed over up to the last 5 s (CURR_TIME in lib/urldata.h),
+    # so a stall after a fast burst ends up to 5 s after `--speed-time` alone.
+    averaging = 5
     assert int(shell["--speed-limit"]) > 0
     # A stalled try is abandoned well before the per-try cap, and even a try
     # that runs to the cap ends inside the retry window, so it leaves a retry.
     assert speed_time < max_time < window
     # Every retry still starts when each try stalls until the speed check ends it.
-    assert retries * (speed_time + longest_delay) < window
+    assert retries * (speed_time + averaging + longest_delay) < window
     # The whole acquisition stays bounded: the last retry starts within the
     # window (plus one delay) and runs at most one try's cap.
     assert window + longest_delay + max_time <= 15 * 60
@@ -624,7 +627,7 @@ def _release_fetch_shell(integrity: Path, timings: dict[str, str] | None = None,
 
 # How long a scripted stall or trickle lasts before the server drops it: longer
 # than the scaled retry window, so a try that waits it out leaves no retry.
-STALL_SECONDS = 9
+STALL_SECONDS = 16
 
 
 def test_release_object_fetch_retries_transient_failures_and_still_verifies_over_https() -> None:
@@ -694,8 +697,11 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
         # Scaled-down bounds keep the order of the real ones (speed check <
         # per-try cap < retry window) while keeping the test short. The stall
         # and trickle outlast the window, as both CI stalls outlasted the old
-        # 120 s window, so the controls fail the way those runs did.
-        scaled = {"--speed-time": "1", "--max-time": "3", "--retry-max-time": "6"}
+        # 120 s window, so the controls fail the way those runs did. curl
+        # samples speed once a second and averages it over up to 5 s, so a 1 s
+        # speed check can take a few seconds to end a stall on a loaded runner;
+        # the gaps leave room for that.
+        scaled = {"--speed-time": "1", "--max-time": "6", "--retry-max-time": "12"}
         speed_check, cap = ("--speed-limit", "--speed-time"), ("--max-time",)
         shells = {
             "default": shell,
@@ -707,11 +713,13 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
         }
         row = json.dumps([{"release_object": json.loads(good)}]).encode()
         # curl reports each abandoned try on stderr, even when a retry succeeds.
+        # With one bound, only that bound can end the try; with both, either can.
+        either = ("Operation too slow", "Operation timed out")
         diagnostics = {
-            "a stalled transfer then the object": "Operation too slow",
-            "a trickle then the object": "Operation timed out",
-            "registry stall then its row": "Operation too slow",
-            "registry trickle then its row": "Operation timed out",
+            "a stalled transfer then the object": ("Operation too slow",),
+            "a trickle then the object": ("Operation timed out",),
+            "registry stall then its row": either,
+            "registry trickle then its row": either,
         }
         base = f"https://127.0.0.1:{server.server_address[1]}"
         try:
@@ -765,7 +773,7 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
                 if case == "server error then wrong bytes":
                     assert "content sha256 mismatch" in result.stderr
                 if case in diagnostics:
-                    assert diagnostics[case] in result.stderr, (case, result.stderr)
+                    assert any(message in result.stderr for message in diagnostics[case]), (case, result.stderr)
         finally:
             server.shutdown()
 

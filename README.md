@@ -91,8 +91,9 @@ five more tries while less than 600 seconds have passed since the first (curl
 checks before its wait, so a last try can start a few seconds later), with a
 delay of 3 to 7 seconds (drawn per run) between them. Each try is bounded so a
 stalled one cannot use up that window: `--speed-limit 1024 --speed-time 30`
-abandons a try that receives less than 1 KiB/s for 30 seconds, and
-`--max-time 180` ends any try after 180 seconds. A try that stalled until the
+abandons a try whose speed, which curl averages over up to the last five
+seconds, stays under 1 KiB/s for 30 seconds, and `--max-time 180` ends any try
+after 180 seconds. A try that stalled until the
 connection reset after several minutes used to leave no retry. curl also
 honours a server's `Retry-After` on HTTP 408, 429, 500, 502, 503 and 504, and
 stops retrying when that wait would pass the 600-second limit. It writes only
