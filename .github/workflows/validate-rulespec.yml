@@ -3882,19 +3882,22 @@ jobs:
           python -I /opt/axiom-dependency-integrity/check.py verify
           destination="${AXIOM_DEPENDENCY_ROOT}/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
           mkdir -p "$(dirname "$destination")"
-          # Retry any failure (an HTTP error, a refused or dropped connection)
-          # up to five times. curl retries only while less than 120 s have
-          # passed since the first try; it checks before its wait, so a last try
-          # can start a few seconds after that, and a try in progress can run
-          # longer. It removes a failed partial --output file before it tries
-          # again. The delay between tries is 3-7 s, drawn per run, which
-          # spreads out the retries of parallel shards that failed together.
-          # curl also honours a Retry-After on HTTP 408, 429, 500, 502, 503 and
-          # 504, and stops retrying when that wait would pass the 120 s limit.
-          # --fail still turns an HTTP error into a failure, and the content
-          # sha256 check below decides.
+          # Retry any failure (an HTTP error, a refused, dropped or stalled
+          # connection) up to five times. Each try is bounded, so one stalled
+          # try cannot use up the retry window: curl abandons a try whose speed,
+          # averaged over up to the last 5 s, stays under 1 KiB/s for 30 s, and
+          # any try still running after 180 s. It starts a retry only while less
+          # than 600 s have passed since the first try; it checks before its
+          # wait, so a last try can start a few seconds after that and run to
+          # its own 180 s bound. It removes a failed partial --output file
+          # before it tries again. The delay between tries is 3-7 s, drawn per
+          # run, which spreads out the retries of parallel shards that failed
+          # together. curl also honours a Retry-After on HTTP 408, 429, 500,
+          # 502, 503 and 504, and stops retrying when that wait would pass the
+          # 600 s limit. --fail still turns an HTTP error into a failure, and
+          # the content sha256 check below decides.
           retry_delay=$(( 3 + RANDOM % 5 ))
-          retry=(--connect-timeout 30 --retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 120)
+          retry=(--connect-timeout 30 --speed-limit 1024 --speed-time 30 --max-time 180 --retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 600)
           if [ -n "$RELEASE_REGISTRY_URL" ]; then
             acquisition=registry
             url="${RELEASE_REGISTRY_URL%/}/rest/v1/release_objects?select=release_object&release_name=eq.${RELEASE_NAME}&content_sha256=eq.${RELEASE_CONTENT_SHA256}&limit=2"
@@ -4961,8 +4964,9 @@ jobs:
           # discards a failed partial transfer it wrote with --output, so the
           # response goes to a file, never a pipe.
           command = ["curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--tlsv1.2",
-                     "--connect-timeout", "30", "--retry", "5", "--retry-all-errors",
-                     "--retry-delay", str(random.randint(3, 7)), "--retry-max-time", "120"]
+                     "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "30", "--max-time", "180",
+                     "--retry", "5", "--retry-all-errors",
+                     "--retry-delay", str(random.randint(3, 7)), "--retry-max-time", "600"]
           if registry:
               key = os.environ["RELEASE_REGISTRY_ANON_KEY"]
               command += ["--header", f"apikey: {key}", "--header", f"Authorization: Bearer {key}", "--header", "Accept-Profile: corpus"]
