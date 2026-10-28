@@ -3882,9 +3882,11 @@ jobs:
           python -I /opt/axiom-dependency-integrity/check.py verify
           destination="${AXIOM_DEPENDENCY_ROOT}/axiom-corpus/releases/$RELEASE_NAME/$RELEASE_CONTENT_SHA256.json"
           mkdir -p "$(dirname "$destination")"
-          # Retry any failure (an HTTP error, a refused or dropped connection) up
-          # to five times; curl starts no new try more than 120 s after the
-          # first, and removes a failed partial --output file before it tries
+          # Retry any failure (an HTTP error, a refused or dropped connection)
+          # up to five times. curl retries only while less than 120 s have
+          # passed since the first try; it checks before its wait, so a last try
+          # can start a few seconds after that, and a try in progress can run
+          # longer. It removes a failed partial --output file before it tries
           # again. The delay between tries is 3-7 s, drawn per run, which
           # spreads out the retries of parallel shards that failed together.
           # curl also honours a Retry-After on HTTP 408, 429, 500, 502, 503 and

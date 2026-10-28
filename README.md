@@ -87,8 +87,9 @@ command for its release, scope-lock, size and SHA-256 checks before adoption.
 Every validate shard acquires the same release at the same time, and both
 acquisitions retry transient failures. The release object download retries any
 failure with `curl --retry 5 --retry-all-errors --retry-max-time 120`: up to
-five more tries, none started more than 120 seconds after the first (a try in
-progress can run longer), with a delay of 3 to 7 seconds (drawn per run)
+five more tries while less than 120 seconds have passed since the first (curl
+checks before its wait, so a last try can start a few seconds later, and a try
+in progress can run longer), with a delay of 3 to 7 seconds (drawn per run)
 between them. curl also honours a server's `Retry-After` on HTTP 408, 429,
 500, 502, 503 and 504, and stops retrying when that wait would pass the
 120-second limit. It writes only with `--output`, so curl discards a failed
