@@ -3886,10 +3886,11 @@ jobs:
           # to five times; curl starts no new try more than 120 s after the
           # first, and removes a failed partial --output file before it tries
           # again. The delay between tries is 3-7 s, drawn per run, which
-          # spreads out the retries of parallel shards that failed together; a
-          # Retry-After the server sends can lengthen it. --fail still
-          # turns an HTTP error into a failure, and the content sha256 check
-          # below decides.
+          # spreads out the retries of parallel shards that failed together.
+          # curl also honours a Retry-After on HTTP 408, 429, 500, 502, 503 and
+          # 504, and stops retrying when that wait would pass the 120 s limit.
+          # --fail still turns an HTTP error into a failure, and the content
+          # sha256 check below decides.
           retry_delay=$(( 3 + RANDOM % 5 ))
           retry=(--connect-timeout 30 --retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 120)
           if [ -n "$RELEASE_REGISTRY_URL" ]; then
@@ -4023,8 +4024,9 @@ jobs:
           # may take up to 60 s). place_with_retries CHECKPOINT
           # COMMAND... runs COMMAND --json and prints its report. It runs it
           # again (at most three runs; waits of 10-19 s, then 20-29 s) only when
-          # COMMAND exited 1, its report lists no modified file, and every artifact
-          # that failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed
+          # COMMAND exited 1, its report's failed, modified and skipped fields
+          # are objects, it lists no modified file, and every artifact that
+          # failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed
           # request, a read that broke) and no reason naming bytes that do not
           # match the release. Before each new run CHECKPOINT records the files
           # the failed run placed: the source-integrity fingerprint covers
@@ -4052,10 +4054,12 @@ jobs:
           if not isinstance(report, dict):
               print("corpus-fetch printed no readable --json report.", file=sys.stderr)
               raise SystemExit(1)
-          failed, modified, skipped = (
-              report.get(key) if isinstance(report.get(key), dict) else {}
-              for key in ("failed", "modified", "skipped")
-          )
+          # corpus-fetch reports these three as objects; a report shaped any other way is final.
+          fields = ("failed", "modified", "skipped")
+          malformed = [key for key in fields if not isinstance(report.get(key), dict)]
+          failed, modified, skipped = ({} if key in malformed else report[key] for key in fields)
+          if malformed:
+              print("corpus-fetch's --json report has no object for: " + ", ".join(malformed) + ".", file=sys.stderr)
           print(
               f"{report.get('release')}: {report.get('selected')} artifact(s): "
               f"{report.get('present')} present, {report.get('materialized')} placed "
@@ -4075,7 +4079,7 @@ jobs:
                       print(f"{artifact}: {reason}", file=sys.stderr)
           transient = re.compile(r"(?:^|; )r2: (?:HTTP (?:408|429|5[0-9][0-9]) for |request for \S+ failed: |read failed: )")
           wrong_bytes = re.compile(r"sha256 does not match|supplied more than|supplied [0-9]+ bytes but|holds [0-9]+ bytes but")
-          retry = status == 1 and bool(failed) and not modified and all(
+          retry = status == 1 and not malformed and bool(failed) and not modified and all(
               isinstance(reason, str) and transient.search(reason) and not wrong_bytes.search(reason)
               for reason in failed.values()
           )
@@ -5032,8 +5036,9 @@ jobs:
           # may take up to 60 s). place_with_retries CHECKPOINT
           # COMMAND... runs COMMAND --json and prints its report. It runs it
           # again (at most three runs; waits of 10-19 s, then 20-29 s) only when
-          # COMMAND exited 1, its report lists no modified file, and every artifact
-          # that failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed
+          # COMMAND exited 1, its report's failed, modified and skipped fields
+          # are objects, it lists no modified file, and every artifact that
+          # failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed
           # request, a read that broke) and no reason naming bytes that do not
           # match the release. Before each new run CHECKPOINT records the files
           # the failed run placed: the source-integrity fingerprint covers
@@ -5061,10 +5066,12 @@ jobs:
           if not isinstance(report, dict):
               print("corpus-fetch printed no readable --json report.", file=sys.stderr)
               raise SystemExit(1)
-          failed, modified, skipped = (
-              report.get(key) if isinstance(report.get(key), dict) else {}
-              for key in ("failed", "modified", "skipped")
-          )
+          # corpus-fetch reports these three as objects; a report shaped any other way is final.
+          fields = ("failed", "modified", "skipped")
+          malformed = [key for key in fields if not isinstance(report.get(key), dict)]
+          failed, modified, skipped = ({} if key in malformed else report[key] for key in fields)
+          if malformed:
+              print("corpus-fetch's --json report has no object for: " + ", ".join(malformed) + ".", file=sys.stderr)
           print(
               f"{report.get('release')}: {report.get('selected')} artifact(s): "
               f"{report.get('present')} present, {report.get('materialized')} placed "
@@ -5084,7 +5091,7 @@ jobs:
                       print(f"{artifact}: {reason}", file=sys.stderr)
           transient = re.compile(r"(?:^|; )r2: (?:HTTP (?:408|429|5[0-9][0-9]) for |request for \S+ failed: |read failed: )")
           wrong_bytes = re.compile(r"sha256 does not match|supplied more than|supplied [0-9]+ bytes but|holds [0-9]+ bytes but")
-          retry = status == 1 and bool(failed) and not modified and all(
+          retry = status == 1 and not malformed and bool(failed) and not modified and all(
               isinstance(reason, str) and transient.search(reason) and not wrong_bytes.search(reason)
               for reason in failed.values()
           )

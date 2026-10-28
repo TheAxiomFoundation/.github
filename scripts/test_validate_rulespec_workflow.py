@@ -101,11 +101,12 @@ def run_corpus_placement(
     """Run the actual shell using a pinned-encoder stand-in, without network access.
 
     ``fetch_script`` scripts the first placement runs: ``status``, ``failed``
-    and ``modified`` maps for the ``--json`` report, ``place`` (files the run
-    places anyway), ``stderr``, and ``unreadable`` (no JSON). Later runs place
-    the artifact. ``sleeps`` collects the step's waits, which a stand-in
-    ``sleep`` records instead of sleeping; ``integrity_log`` collects the
-    integrity helper's actions. ``real_integrity`` runs the workflow's own
+    and ``modified`` maps for the ``--json`` report, ``report`` (fields that
+    replace the report's own) and ``drop`` (fields it leaves out), ``place``
+    (files the run places anyway), ``stderr``, and ``unreadable`` (no JSON).
+    Later runs place the artifact. ``sleeps`` collects the step's waits, which
+    a stand-in ``sleep`` records instead of sleeping; ``integrity_log`` collects
+    the integrity helper's actions. ``real_integrity`` runs the workflow's own
     helper over a Git corpus checkout instead of the stand-in.
     """
     with tempfile.TemporaryDirectory() as directory:
@@ -194,6 +195,9 @@ def run_corpus_placement(
                     "sources": {"git": len(placed)} if placed else {}, "skipped": {},
                     "modified": outcome.get("modified", {}), "failed": outcome.get("failed", {}), "notes": {},
                 }
+                report.update(outcome.get("report", {}))
+                for key in outcome.get("drop", []):
+                    del report[key]
                 if outcome.get("unreadable"):
                     print("not a report")
                 elif args.json:
@@ -424,6 +428,13 @@ def test_corpus_placement_never_reruns_a_failure_no_rerun_can_fix() -> None:
         {"status": 1, "modified": left_untouched},
         # No readable report.
         {"status": 1, "failed": {V1: transient}, "unreadable": True},
+        # A report not shaped like the one corpus-fetch prints, beside a transient failure.
+        {"status": 1, "failed": {V1: transient}, "report": {"modified": [V2]}},
+        {"status": 1, "failed": {V1: transient}, "report": {"modified": None}},
+        {"status": 1, "failed": {V1: transient}, "report": {"skipped": "every scope"}},
+        {"status": 1, "failed": {V1: transient}, "drop": ["modified"]},
+        {"status": 1, "failed": {V1: transient}, "drop": ["skipped"]},
+        {"status": 1, "report": {"failed": [transient]}},
     ):
         sleeps: list[str] = []
         integrity: list[str] = []
@@ -441,6 +452,10 @@ def test_corpus_placement_never_reruns_a_failure_no_rerun_can_fix() -> None:
                 assert reason in output, (outcome, reason)
         if "stderr" in outcome:
             assert outcome["stderr"] in output
+        if "report" in outcome or "drop" in outcome:
+            malformed = ", ".join(key for key in ("failed", "modified", "skipped")
+                                  if key in outcome.get("drop", []) or key in outcome.get("report", {}))
+            assert f"corpus-fetch's --json report has no object for: {malformed}." in output, (outcome, output)
 
 
 def test_corpus_placement_checks_integrity_before_each_run_and_stops_on_a_failed_check() -> None:
@@ -660,10 +675,10 @@ def test_protected_base_placement_reruns_the_same_way_with_its_credentials() -> 
                 base_corpus_fetch() {{
                   printf 'fetch %s %s %s\\n' "${{R2_ACCESS_KEY_ID:-}}" "${{R2_SECRET_ACCESS_KEY:-}}" "$*" >> {shlex.quote(str(log))}
                   if [ "$(grep -c '^fetch' {shlex.quote(str(log))})" -lt 3 ]; then
-                    printf '%s\\n' '{{"release": "base", "failed": {{"{V1}": "{transient}"}}, "modified": {{}}}}'
+                    printf '%s\\n' '{{"release": "base", "failed": {{"{V1}": "{transient}"}}, "modified": {{}}, "skipped": {{}}}}'
                     return 1
                   fi
-                  printf '%s\\n' '{{"release": "base", "failed": {{}}, "modified": {{}}}}'
+                  printf '%s\\n' '{{"release": "base", "failed": {{}}, "modified": {{}}, "skipped": {{}}}}'
                 }}
                 checkpoint_base_corpus() {{
                   printf 'checkpoint %s %s\\n' "${{R2_ACCESS_KEY_ID:-none}}" "${{R2_SECRET_ACCESS_KEY:-none}}" >> {shlex.quote(str(log))}
