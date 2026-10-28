@@ -625,7 +625,7 @@ class PinBumpManifestTests(unittest.TestCase):
         self.assertEqual(preparation["env"]["BASE_CORPUS_REF"], "${{ needs.shards.outputs.base_axiom_corpus_ref }}")
         source = preparation["run"]
         for fragment in ('checkout --detach "$BASE_SHA"', 'axiom-encode:$BASE_ENCODER_REF',
-                         'axiom-corpus:$BASE_CORPUS_REF', 'pip --isolated install --no-cache-dir',
+                         'axiom-corpus:$BASE_CORPUS_REF', '--require-hashes --no-deps -r "$locked"',
                          'base-encoder "$base_dependencies/axiom-encode" repository',
                          'base-corpus "$base_dependencies/axiom-corpus" repository',
                          'base-verification-runtime /opt/axiom-base-verification runtime'):
