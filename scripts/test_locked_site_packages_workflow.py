@@ -10,9 +10,16 @@ release at run time: axiom-encode targeted run 36174590343 logged
 job interpreter matters as well: the head provisioner runs it as root with
 site enabled, and every later step runs it with sudo available.
 
-These tests fail on any unlocked ``--target`` install in this repository's
-workflows, pin each staging block line for line, and execute every real block
+These tests pin each staging block line for line and execute every real block
 against a fake ``uv`` to prove its argv sequence and its fail-closed paths.
+The installer guard is a regression aid over workflow ``run:`` text, not a
+proof: it parses each line, including command substitutions, and fails on an
+installer it finds outside the allowlist or on installer-shaped text it cannot
+classify. Known blind spots: installs inside scripts a step calls, ``${{ }}``
+expressions that expand to a whole command without an install verb,
+``python -m venv --upgrade-deps`` (which downloads pip), ``pipenv install``,
+ANSI-C quoted program names such as ``$'\\x75vx'``, and step- or job-level
+``env:`` blocks, which are not inspected.
 """
 
 from __future__ import annotations
@@ -60,7 +67,10 @@ LOCKED_GIT_LINE = (
 
 
 def logical_lines(script: str) -> list[str]:
-    joined = re.sub(r"\\\n\s*", " ", script)
+    # Bash ends a comment at its newline, so a comment's trailing backslash
+    # continues nothing; elsewhere backslash-newline vanishes, even mid-word.
+    script = re.sub(r"(?m)^(\s*#.*?)\\$", r"\1", script)
+    joined = re.sub(r"\\\n", "", script)
     lines = []
     for line in joined.splitlines():
         stripped = line.strip()
@@ -972,9 +982,16 @@ class LockedSitePackagesTests(unittest.TestCase):
         cleanup = '          rm -rf "$reference" "$uv_cache"\n'
         self.assertEqual(text.count(cleanup), 2)
         expected = sorted(self.expected_directory_installs(), key=str)
+        pip_target = ("pip", "--isolated", "install", "--target", "$site_packages", "hostile-pkg")
         for command, directory_install in (
-            ('noise="$(pip --isolated install --target "$site_packages" hostile-pkg)"', True),
-            ("uv --no-cache run --with hostile-pkg --no-project python -c pass", False),
+            ('noise="$(pip --isolated install --target "$site_packages" hostile-pkg)"', pip_target),
+            ("uv --no-cache run --with hostile-pkg --no-project python -c pass", None),
+            # A comment's trailing backslash continues nothing, so bash runs the next line.
+            ('# staged above \\\n          pip --isolated install --target "$site_packages" hostile-pkg',
+             pip_target),
+            # Backslash-newline vanishes mid-word: bash runs `pip`.
+            ('pi\\\n          p --isolated install --target "$site_packages" hostile-pkg',
+             pip_target),
         ):
             with self.subTest(command=command):
                 mutated = text.replace(cleanup, cleanup + "          " + command + "\n", 1)
@@ -985,11 +1002,7 @@ class LockedSitePackagesTests(unittest.TestCase):
                                                         WORKFLOW.name: mutated})
                 self.assertTrue(hidden or sorted(directory, key=str) != expected)
                 if directory_install:
-                    self.assertIn(
-                        (WORKFLOW.name, "validate", HEAD,
-                         ("pip", "--isolated", "install", "--target", "$site_packages",
-                          "hostile-pkg")),
-                        directory)
+                    self.assertIn((WORKFLOW.name, "validate", HEAD, directory_install), directory)
                 else:
                     self.assertTrue(any("disagreement" in problem for problem in hidden))
 
@@ -1032,6 +1045,8 @@ class LockedSitePackagesTests(unittest.TestCase):
         "sudo -u root pip install hostile-pkg",
         "env -i pip install hostile-pkg",
         "if pip install hostile-pkg; then :; fi",
+        "# a comment's backslash continues nothing \\\npip install hostile-pkg",
+        "pi\\\np install hostile-pkg",
     )
     # Ways to embed one command in a line; {} is the command.
     EMBEDDINGS = (
@@ -1063,7 +1078,7 @@ class LockedSitePackagesTests(unittest.TestCase):
                     survivors.append(line)
         head["run"] = original
         self.assertEqual(survivors, [])
-        self.assertEqual(len(self.INSTALLER_FORMS) * len(self.EMBEDDINGS), 324)
+        self.assertEqual(len(self.INSTALLER_FORMS) * len(self.EMBEDDINGS), 342)
 
         # Non-vacuity the other way: read-only uv and pip, and commands that
         # merely run an interpreter, stay accepted in the same embeddings.
