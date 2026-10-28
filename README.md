@@ -84,6 +84,28 @@ pinned release's provisions before provisioning the supervisor or running its
 gates. It supplies the release object already acquired above. Audit the pinned
 command for its release, scope-lock, size and SHA-256 checks before adoption.
 
+Every validate shard acquires the same release at the same time, and both
+acquisitions retry transient failures. The release object download retries any
+failure with `curl --retry 5 --retry-all-errors --retry-max-time 120`: up to
+five more tries while less than 120 seconds have passed since the first (curl
+checks before its wait, so a last try can start a few seconds later, and a try
+in progress can run longer), with a delay of 3 to 7 seconds (drawn per run)
+between them. curl also honours a server's `Retry-After` on HTTP 408, 429,
+500, 502, 503 and 504, and stops retrying when that wait would pass the
+120-second limit. It writes only with `--output`, so curl discards a failed
+partial transfer before it tries again, and the content-address check still
+decides. Provisions placement reads `corpus-fetch --json` and runs it again,
+at most three runs in all, only after exit 1 in which every artifact that
+failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed request, a
+broken read), none names bytes that do not match the release, and the report
+lists no modified file (a report whose `failed`, `modified` or `skipped` is
+missing or not an object is final). A rerun places only what is still missing
+(a present file of the listed size counts as present) and verifies every byte
+it places. Before each rerun the step checkpoints what the failed run placed
+(`refresh-corpus`, or `refresh-base-corpus` for the protected base), because
+the source-integrity fingerprint covers `data/corpus`; a failed checkpoint or
+integrity check ends placement.
+
 For provisions available only in R2, configure read-only organization or
 repository secrets `R2_CORPUS_READ_ACCESS_KEY_ID` and
 `R2_CORPUS_READ_SECRET_ACCESS_KEY`, and pass them with `secrets: inherit` as in

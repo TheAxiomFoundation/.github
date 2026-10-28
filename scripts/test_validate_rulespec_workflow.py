@@ -74,24 +74,53 @@ def test_corpus_placement_runs_before_supervised_gates_with_step_only_credential
         assert "axiom-encode-signing-supervisor" not in earlier.get("run", "")
 
 
+def integrity_helper_source() -> str:
+    """The workflow's own source-integrity helper, as the step installs it."""
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    run = next(step["run"] for step in steps if "# dependency-integrity-python-start" in step.get("run", ""))
+    start = run.index("# dependency-integrity-python-start")
+    return run[start:run.index("# dependency-integrity-python-end")]
+
+
 def run_corpus_placement(
     *,
     locks: bool = True,
     supported: bool = True,
     credentials: bool = False,
     r2_only: bool = False,
+    fetch_script: tuple[dict, ...] = (),
+    sleeps: list[str] | None = None,
+    integrity_log: list[str] | None = None,
+    integrity_fail_after: int | None = None,
+    refresh_fails: bool = False,
+    real_integrity: bool = False,
+    shell_edit: tuple[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict], bool]:
-    """Run the actual shell using a pinned-encoder stand-in, without network access."""
+    """Run the actual shell using a pinned-encoder stand-in, without network access.
+
+    ``fetch_script`` scripts the first placement runs: ``status``, ``failed``
+    and ``modified`` maps for the ``--json`` report, ``report`` (fields that
+    replace the report's own) and ``drop`` (fields it leaves out), ``place``
+    (files the run places anyway), ``stderr``, and ``unreadable`` (no JSON).
+    Later runs place the artifact. ``sleeps`` collects the step's waits, which
+    a stand-in ``sleep`` records instead of sleeping; ``integrity_log`` collects
+    the integrity helper's actions. ``real_integrity`` runs the workflow's own
+    helper over a Git corpus checkout instead of the stand-in.
+    """
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         workspace = root / "rulespec with spaces"
-        corpus = root / "corpus checkout with spaces"
+        dependency_root = root / "dependency root"
+        corpus = dependency_root / "axiom-corpus" if real_integrity else root / "corpus checkout with spaces"
         bin_path = root / "bin"
         workspace.mkdir()
-        corpus.mkdir()
+        corpus.mkdir(parents=True)
         bin_path.mkdir()
         if locks:
             (corpus / ".axiom/corpus-locks").mkdir(parents=True)
+            (corpus / ".axiom/corpus-locks/README").write_text("scope locks\n")
         release_name, release_sha = "pinned-release", "b" * 64
         release = corpus / "releases" / release_name / f"{release_sha}.json"
         release.parent.mkdir(parents=True)
@@ -127,31 +156,69 @@ def run_corpus_placement(
                 parser.add_argument("--release", required=True)
                 parser.add_argument("--content-sha256", required=True)
                 parser.add_argument("--artifact-class", action="append", choices=["provisions"])
+                parser.add_argument("--json", action="store_true")
                 args = parser.parse_args(sys.argv[2:])
                 assert args.corpus_path == Path(os.environ["CORPUS_PATH"])
                 assert args.release == os.environ["RELEASE_NAME"]
                 assert args.content_sha256 == os.environ["RELEASE_CONTENT_SHA256"]
                 release = args.corpus_path / "releases" / args.release / (args.content_sha256 + ".json")
                 assert release.is_file(), "must reuse the previously fetched release object"
+                script = json.loads(os.environ["FETCH_SCRIPT"])
+                runs = Path(os.environ["FETCH_RUNS"])
+                run = int(runs.read_text()) if runs.exists() else 0
+                runs.write_text(str(run + 1))
+                outcome = script[run] if run < len(script) else {}
                 if os.environ["R2_ONLY"] == "true" and not (
                     os.environ.get("R2_ACCESS_KEY_ID") and os.environ.get("R2_SECRET_ACCESS_KEY")
                 ):
-                    print("data/corpus/provisions/us/statutes/v1.json: git: absent; R2 read credentials absent", file=sys.stderr)
-                    sys.exit(1)
-                destination = args.corpus_path / "data/corpus/provisions/us/statutes/v1.json"
-                destination.parent.mkdir(parents=True)
-                destination.write_bytes(Path(os.environ["LOCAL_PROVISIONS"]).read_bytes())
-                print("pinned-release: 1 artifact(s) placed")
+                    outcome = {"status": 1, "failed": {
+                        "data/corpus/provisions/us/statutes/v1.json": "git: absent; R2 read credentials absent",
+                    }}
+                status = outcome.get("status", 0)
+                if outcome.get("stderr"):
+                    print(outcome["stderr"], file=sys.stderr)
+                if status == 2:
+                    sys.exit(2)
+                placed = {}
+                targets = list(outcome.get("place", []))
+                if not status:
+                    targets.append("data/corpus/provisions/us/statutes/v1.json")
+                for relative in targets:
+                    destination = args.corpus_path / relative
+                    if not destination.exists():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(Path(os.environ["LOCAL_PROVISIONS"]).read_bytes())
+                        placed[relative] = "git"
+                report = {
+                    "release": args.release, "content_sha256": args.content_sha256,
+                    "selected": 2, "present": 0, "materialized": len(placed), "bytes_materialized": 0,
+                    "sources": {"git": len(placed)} if placed else {}, "skipped": {},
+                    "modified": outcome.get("modified", {}), "failed": outcome.get("failed", {}), "notes": {},
+                }
+                report.update(outcome.get("report", {}))
+                for key in outcome.get("drop", []):
+                    del report[key]
+                if outcome.get("unreadable"):
+                    print("not a report")
+                elif args.json:
+                    print(json.dumps(report))
+                else:
+                    print(f"{args.release}: {len(placed)} artifact(s) placed")
+                sys.exit(status)
                 """)
         )
         fake.chmod(0o755)
+        sleep_calls = root / "sleep-calls.txt"
+        stand_in_sleep = bin_path / "sleep"
+        stand_in_sleep.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$SLEEP_CALLS"\n')
+        stand_in_sleep.chmod(0o755)
         # Keep ambient credentials out of these fixtures, including developer
         # overrides that could accidentally make the missing-secret case pass.
         env = {key: value for key, value in os.environ.items() if not key.startswith("R2_")}
         env.update({
             "PATH": str(bin_path) + os.pathsep + env.get("PATH", ""),
             "GITHUB_WORKSPACE": str(workspace),
-            "AXIOM_DEPENDENCY_ROOT": str(root),
+            "AXIOM_DEPENDENCY_ROOT": str(dependency_root if real_integrity else root),
             "CORPUS_PATH": str(corpus),
             "RELEASE_NAME": release_name,
             "RELEASE_CONTENT_SHA256": release_sha,
@@ -161,14 +228,52 @@ def run_corpus_placement(
             "LOCAL_PROVISIONS": str(local),
             "R2_ACCESS_KEY_ID": "fixture-read-access-key" if credentials else "",
             "R2_SECRET_ACCESS_KEY": "fixture-read-secret-key" if credentials else "",
+            "FETCH_SCRIPT": json.dumps(list(fetch_script)),
+            "FETCH_RUNS": str(root / "fetch-runs.txt"),
+            "SLEEP_CALLS": str(sleep_calls),
+            "INTEGRITY_CALLS": str(root / "integrity-calls.txt"),
+            "INTEGRITY_FAIL_AFTER": "" if integrity_fail_after is None else str(integrity_fail_after),
+            "INTEGRITY_REFRESH_FAILS": "1" if refresh_fails else "",
         })
-        # Source integrity has its own real-Git regression suite. This fixture
-        # exercises corpus placement after that precondition using a fake CLI.
-        integrity = root / "integrity.py"
-        integrity.write_text("import sys\nassert sys.argv[1] in {'verify', 'refresh-corpus'}\n")
+        if real_integrity:
+            # The workflow's own helper fingerprints the Git checkout, data/corpus
+            # included, exactly as the step's source-integrity checks do.
+            for args in (("init", "-q"), ("add", "-A"),
+                         ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                          "-c", "commit.gpgsign=false", "commit", "-qm", "corpus checkout")):
+                subprocess.run(["git", "-C", str(corpus), *args], check=True)
+            integrity = root / "integrity/check.py"
+            integrity.parent.mkdir()
+            integrity.write_text(integrity_helper_source())
+            integrity.with_name("sources.json").write_text("{}\n")
+            subprocess.run([sys.executable, "-I", str(integrity), "add", "axiom-corpus", str(corpus), "repository"],
+                           check=True, env=env)
+        else:
+            # Source integrity has its own real-Git regression suite. This
+            # stand-in records the step's checks and checkpoints in order.
+            integrity = root / "integrity.py"
+            integrity.write_text(textwrap.dedent("""\
+                import os
+                from pathlib import Path
+                import sys
+                action = sys.argv[1]
+                assert action in {'verify', 'refresh-corpus'}, action
+                calls = Path(os.environ['INTEGRITY_CALLS'])
+                with calls.open('a') as log:
+                    log.write(action + '\\n')
+                verifies = calls.read_text().split().count('verify')
+                limit = os.environ['INTEGRITY_FAIL_AFTER']
+                if action == 'verify' and limit and verifies > int(limit):
+                    raise SystemExit('DependencyIntegrityError: fixture drift')
+                if action == 'refresh-corpus' and os.environ['INTEGRITY_REFRESH_FAILS']:
+                    raise SystemExit('DependencyIntegrityError: authenticated source changed during artifact creation: axiom-corpus')
+                """))
         shell = corpus_placement_step()["run"].replace(
             "/opt/axiom-dependency-integrity/check.py", str(integrity),
         ).replace('sudo "$(command -v python)" -I', '"$(command -v python)" -I')
+        if shell_edit is not None:
+            assert shell_edit[0] in shell, shell_edit[0]
+            shell = shell.replace(*shell_edit)
         result = subprocess.run(
             ["bash", "-c", shell],
             cwd=workspace,
@@ -177,6 +282,11 @@ def run_corpus_placement(
             text=True,
         )
         invocations = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+        if sleeps is not None and sleep_calls.exists():
+            sleeps.extend(sleep_calls.read_text().split())
+        integrity_calls = root / "integrity-calls.txt"
+        if integrity_log is not None and integrity_calls.exists():
+            integrity_log.extend(integrity_calls.read_text().split())
         destination = corpus / "data/corpus/provisions/us/statutes/v1.json"
         placed = destination.exists() and destination.read_bytes() == local.read_bytes()
         # Credential values may reach the encoder's environment, never shell logs.
@@ -233,6 +343,367 @@ def test_post_switch_corpus_fetch_failure_preserves_missing_artifact_diagnostic(
     assert "::error::" in output
     assert "data/corpus/provisions/us/statutes/v1.json" in output
     assert "R2 read credentials absent" in output
+
+
+V1 = "data/corpus/provisions/us/statutes/v1.json"
+V2 = "data/corpus/provisions/us/statutes/v2.json"
+TRANSIENT_REASONS = (
+    "git: absent; git-lock: absent; r2: HTTP 500 for objects/sha256/02/" + "2" * 64,
+    "git: absent; git-lock: absent; r2: request for objects/sha256/a4/" + "4" * 64 + " failed: TimeoutError('timed out')",
+    "git: absent; git-lock: absent; r2: read failed: [Errno 104] Connection reset by peer",
+    "git: absent; git-lock: absent; r2: HTTP 429 for objects/sha256/fc/" + "c" * 64,
+    "r2: HTTP 408 for objects/sha256/0d/" + "d" * 64,
+)
+
+
+def test_corpus_placement_reruns_after_transient_r2_failures() -> None:
+    sleeps: list[str] = []
+    integrity: list[str] = []
+    result, invocations, placed = run_corpus_placement(
+        credentials=True,
+        r2_only=True,
+        fetch_script=(
+            {"status": 1, "failed": {V1: TRANSIENT_REASONS[0]}},
+            {"status": 1, "failed": dict(zip((V1, V2, "a", "b"), TRANSIENT_REASONS[1:]))},
+        ),
+        sleeps=sleeps,
+        integrity_log=integrity,
+    )
+    assert result.returncode == 0, result.stderr
+    assert placed
+    runs = invocations[1:]
+    assert invocations[0]["args"] == ["corpus-fetch", "--help"]
+    assert len(runs) == 3 and all(run["args"][-1] == "--json" for run in runs)
+    assert all(run["access_key_id"] == "fixture-read-access-key" for run in runs)
+    first, second = map(int, sleeps)
+    assert 10 <= first <= 19 and 20 <= second <= 29, sleeps
+    # The step's own check, then before every run a check, and after every
+    # failed run (and at the end) a checkpoint of what it placed.
+    assert integrity == ["verify", "verify", "refresh-corpus", "verify", "refresh-corpus", "verify", "refresh-corpus"]
+    output = result.stdout + result.stderr
+    assert all(reason in output for reason in TRANSIENT_REASONS)
+    assert output.count("running it again in") == 2
+    assert "pinned-release: 2 artifact(s): 0 present, 1 placed" in result.stdout
+    assert "::error::" not in output
+
+
+def test_corpus_placement_gives_up_after_three_transient_runs() -> None:
+    sleeps: list[str] = []
+    result, invocations, placed = run_corpus_placement(
+        credentials=True,
+        r2_only=True,
+        fetch_script=({"status": 1, "failed": {V1: TRANSIENT_REASONS[0]}},) * 5,
+        sleeps=sleeps,
+    )
+    assert result.returncode == 1
+    assert not placed
+    assert len(invocations) == 4, "one capability probe and three placement runs"
+    assert len(sleeps) == 2
+    output = result.stdout + result.stderr
+    assert output.count(TRANSIENT_REASONS[0]) == 3
+    assert "::error::Failed to place the pinned corpus release's provisions (exit 1)" in output
+
+
+def test_corpus_placement_never_reruns_a_failure_no_rerun_can_fix() -> None:
+    transient = TRANSIENT_REASONS[0]
+    left_untouched = {V2: "existing file's sha256 differs from the release; left untouched"}
+    for outcome in (
+        # The release itself does not load or verify, or another status.
+        {"status": 2, "stderr": "axiom-encode corpus-fetch: release object signature does not verify"},
+        {"status": 3, "failed": {V1: transient}},
+        # Not a transient R2 answer.
+        {"status": 1, "failed": {V1: "git: absent; git-lock: absent; r2: HTTP 403 for objects/sha256/00/0"}},
+        {"status": 1, "failed": {V1: "git: absent; git-lock: absent; r2: absent"}},
+        {"status": 1, "failed": {V1: "git: absent; git-lock: absent"}},
+        {"status": 1, "failed": {V1: "no source is configured"}},
+        {"status": 1, "failed": {V1: transient, V2: "git: absent; git-lock: absent"}},
+        # Bytes that do not match the release, even beside a transient failure.
+        {"status": 1, "failed": {V1: transient, V2: "git: absent; r2: sha256 does not match the release"}},
+        {"status": 1, "failed": {V1: "cache: sha256 does not match the release; r2: HTTP 500 for objects/sha256/00/0"}},
+        {"status": 1, "failed": {V1: transient, V2: "r2: supplied 3 bytes but the release lists 4"}},
+        {"status": 1, "failed": {V1: transient, V2: "r2: supplied more than the 4 bytes the release lists"}},
+        {"status": 1, "failed": {V1: transient, V2: "r2: object holds 9 bytes but the release lists 4"}},
+        # A file that differs from its lock, with or without a transient failure.
+        {"status": 1, "failed": {V1: transient}, "modified": left_untouched},
+        {"status": 1, "modified": left_untouched},
+        # No readable report.
+        {"status": 1, "failed": {V1: transient}, "unreadable": True},
+        # A report not shaped like the one corpus-fetch prints, beside a transient failure.
+        {"status": 1, "failed": {V1: transient}, "report": {"modified": [V2]}},
+        {"status": 1, "failed": {V1: transient}, "report": {"modified": None}},
+        {"status": 1, "failed": {V1: transient}, "report": {"skipped": "every scope"}},
+        {"status": 1, "failed": {V1: transient}, "drop": ["modified"]},
+        {"status": 1, "failed": {V1: transient}, "drop": ["skipped"]},
+        {"status": 1, "report": {"failed": [transient]}},
+    ):
+        sleeps: list[str] = []
+        integrity: list[str] = []
+        result, invocations, placed = run_corpus_placement(
+            credentials=True, r2_only=True, fetch_script=(outcome,), sleeps=sleeps, integrity_log=integrity
+        )
+        assert result.returncode == outcome["status"], (outcome, result.stderr)
+        assert len(invocations) == 2, (outcome, invocations)
+        assert not sleeps and not placed, outcome
+        assert integrity == ["verify", "verify"], (outcome, integrity)
+        output = result.stdout + result.stderr
+        assert "::error::Failed to place the pinned corpus release's provisions" in output
+        if not outcome.get("unreadable"):
+            for reason in (*outcome.get("failed", {}).values(), *outcome.get("modified", {}).values()):
+                assert reason in output, (outcome, reason)
+        if "stderr" in outcome:
+            assert outcome["stderr"] in output
+        if "report" in outcome or "drop" in outcome:
+            malformed = ", ".join(key for key in ("failed", "modified", "skipped")
+                                  if key in outcome.get("drop", []) or key in outcome.get("report", {}))
+            assert f"corpus-fetch's --json report has no object for: {malformed}." in output, (outcome, output)
+
+
+def test_corpus_placement_checks_integrity_before_each_run_and_stops_on_a_failed_check() -> None:
+    sleeps: list[str] = []
+    # verify 1: the step's own check; 2: before the first run; 3: before the second.
+    result, invocations, placed = run_corpus_placement(
+        credentials=True,
+        r2_only=True,
+        fetch_script=({"status": 1, "failed": {V1: TRANSIENT_REASONS[0]}},),
+        sleeps=sleeps,
+        integrity_fail_after=2,
+    )
+    assert result.returncode == 1
+    assert not placed
+    assert len(invocations) == 2, "the second run must stop at its integrity check"
+    assert len(sleeps) == 1
+    assert "DependencyIntegrityError: fixture drift" in result.stderr
+
+
+def test_corpus_placement_stops_when_its_checkpoint_fails() -> None:
+    sleeps: list[str] = []
+    result, invocations, placed = run_corpus_placement(
+        credentials=True,
+        r2_only=True,
+        fetch_script=({"status": 1, "failed": {V1: TRANSIENT_REASONS[0]}},),
+        sleeps=sleeps,
+        refresh_fails=True,
+    )
+    assert result.returncode == 1
+    assert not placed and not sleeps
+    assert len(invocations) == 2
+    assert "authenticated source changed during artifact creation" in result.stderr
+
+
+def test_corpus_placement_checkpoints_partial_placements_under_the_real_integrity_check() -> None:
+    """A rerun after a partly successful run passes the workflow's own fingerprint check."""
+    partial = ({"status": 1, "place": [V2], "failed": {V1: TRANSIENT_REASONS[0]}},)
+    sleeps: list[str] = []
+    result, invocations, placed = run_corpus_placement(
+        credentials=True, r2_only=True, fetch_script=partial, sleeps=sleeps, real_integrity=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert placed and len(invocations) == 3 and len(sleeps) == 1
+    # Control: without the checkpoint, the rerun fails the fingerprint check on
+    # the file the first run placed, so the check above is load-bearing.
+    result, invocations, placed = run_corpus_placement(
+        credentials=True, r2_only=True, fetch_script=partial, real_integrity=True,
+        shell_edit=('if "$checkpoint"; then :; else', "if true; then :; else"),
+    )
+    assert result.returncode != 0
+    assert not placed and len(invocations) == 2
+    assert "DependencyIntegrityError: authenticated source tree drifted: axiom-corpus" in result.stderr
+
+
+def test_corpus_release_object_fetches_retry_and_still_verify() -> None:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    fetch = next(step for step in steps if step.get("name") == "Fetch pinned signed corpus release object")["run"]
+    assert ('retry=(--connect-timeout 30 --retry 5 --retry-all-errors --retry-delay "$retry_delay" '
+            '--retry-max-time 120)') in fetch
+    assert "retry_delay=$(( 3 + RANDOM % 5 ))" in fetch
+    curls = [line for line in fetch.splitlines() if line.strip().startswith("curl ")]
+    assert len(curls) == 2
+    for line in curls:
+        assert line.strip().startswith("curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \"${retry[@]}\"")
+    assert fetch.count('--output "$destination.tmp"') == 2
+    # Verification runs on the downloaded bytes, after every acquisition path.
+    assert fetch.index("content sha256 mismatch") > max(fetch.index(line) for line in curls)
+    assert fetch.index('path.replace(path.with_suffix(""))') > fetch.index("content sha256 mismatch")
+
+    preparation = next(step for step in steps if step.get("name") == BASE_CORPUS_PREPARATION_STEP)["run"]
+    command = preparation.split("\ncommand = [", 1)[1].split("]\n", 1)[0]
+    for flag in ('"--fail"', '"--connect-timeout", "30"', '"--retry", "5"', '"--retry-all-errors"',
+                 '"--retry-delay", str(random.randint(3, 7))', '"--retry-max-time", "120"'):
+        assert flag in command, flag
+    assert 'subprocess.run([*command, "--output", str(downloaded), url], check=True)' in preparation
+    assert "check_output([*command" not in preparation
+    assert preparation.index("protected-base corpus release digest mismatch") > preparation.index('"--output", str(downloaded)')
+
+
+def _release_fetch_shell(integrity: Path) -> str:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    run = next(step for step in steps if step.get("name") == "Fetch pinned signed corpus release object")["run"]
+    assert "retry_delay=$(( 3 + RANDOM % 5 ))" in run
+    # One-second waits keep the test short; the flags are otherwise unchanged.
+    return (
+        run.replace("retry_delay=$(( 3 + RANDOM % 5 ))", "retry_delay=1")
+        .replace("/opt/axiom-dependency-integrity/check.py", str(integrity))
+        .replace('sudo "$(command -v python)" -I', '"$(command -v python)" -I')
+    )
+
+
+def test_release_object_fetch_retries_transient_failures_and_still_verifies_over_https() -> None:
+    """Run the real step's curl against a local HTTPS server that fails as R2 did."""
+    import http.server
+    import ssl
+    import threading
+
+    name = "pinned-release"
+    content = {"artifacts": [], "git": {"commit": "a" * 40}}
+    sha = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    good = json.dumps({"release": name, "content": content, "content_sha256": sha}).encode()
+    wrong = json.dumps({"release": name, "content": {**content, "artifacts": ["x"]}, "content_sha256": sha}).encode()
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
+             "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", str(root / "key.pem"), "-out", str(root / "cert.pem")],
+            check=True, capture_output=True,
+        )
+        script: list = []
+        seen: list[tuple[str, str | None]] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                seen.append((self.path, self.headers.get("apikey")))
+                step = script.pop(0) if script else (404, b"")
+                status, body = step[0], step[1]
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if len(step) > 2:  # a transfer that breaks halfway
+                    self.wfile.write(body[: len(body) // 2])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    self.connection.shutdown(2)
+                    return
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(root / "cert.pem", root / "key.pem")
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        integrity = root / "integrity.py"
+        integrity.write_text("import sys\nassert sys.argv[1] in {'verify', 'refresh-corpus'}\n")
+        shell = _release_fetch_shell(integrity)
+        base = f"https://127.0.0.1:{server.server_address[1]}"
+        try:
+            for case, responses, registry, ok, requests in (
+                ("server errors then the object", [(500, b"x"), (503, b"x"), (200, good)], False, True, 3),
+                ("a broken transfer then the object", [(200, good, "break"), (200, good)], False, True, 2),
+                ("server error then wrong bytes", [(500, b"x"), (200, wrong)], False, False, 2),
+                ("missing every time", [], False, False, 6),
+                ("registry error then its row", [(502, b"x"), (200, json.dumps([{"release_object": json.loads(good)}]).encode())],
+                 True, True, 2),
+            ):
+                dependency_root = root / case
+                (dependency_root / "axiom-corpus").mkdir(parents=True)
+                temp = root / f"{case} temp"
+                temp.mkdir()
+                script[:] = list(responses)
+                seen.clear()
+                result = subprocess.run(
+                    ["bash", "-c", shell],
+                    env={**os.environ, "RUNNER_TEMP": str(temp), "AXIOM_DEPENDENCY_ROOT": str(dependency_root),
+                         "RELEASE_BASE_URL": base + "/objects", "RELEASE_REGISTRY_URL": base + "/registry" if registry else "",
+                         "RELEASE_REGISTRY_ANON_KEY": "fixture-anon-key", "RELEASE_NAME": name,
+                         "RELEASE_CONTENT_SHA256": sha, "CURL_CA_BUNDLE": str(root / "cert.pem")},
+                    capture_output=True, text=True, timeout=120,
+                )
+                placed = dependency_root / "axiom-corpus/releases" / name / f"{sha}.json"
+                assert (result.returncode == 0) == ok, (case, result.stderr)
+                assert len(seen) == requests, (case, seen)
+                if ok:
+                    assert json.loads(placed.read_text())["content_sha256"] == sha, case
+                    assert not placed.with_suffix(".json.tmp").exists()
+                else:
+                    assert not placed.exists(), case
+                if registry:
+                    assert all(key == "fixture-anon-key" for _path, key in seen)
+                    assert all(path.startswith("/registry/rest/v1/release_objects?") for path, _key in seen)
+                else:
+                    assert all(path == f"/objects/releases/{name}/{sha}.json" for path, _key in seen), seen
+                if case == "server error then wrong bytes":
+                    assert "content sha256 mismatch" in result.stderr
+        finally:
+            server.shutdown()
+
+
+def _shell_function(run: str, name: str) -> str:
+    return f"{name}() {{\n" + run.split(f"{name}() {{\n", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+
+def test_protected_base_placement_reruns_the_same_way_with_its_credentials() -> None:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    head = corpus_placement_step()["run"]
+    base = next(step for step in steps if step.get("name") == BASE_CORPUS_PREPARATION_STEP)["run"]
+    assert _shell_function(head, "place_with_retries") == _shell_function(base, "place_with_retries")
+    assert ("if place_with_retries checkpoint_base_corpus base_corpus_fetch_with_credentials corpus-fetch \\\n"
+            in base)
+    assert "refresh-base-corpus" in _shell_function(base, "checkpoint_base_corpus")
+    assert base.index("place_with_retries() {") > base.index("base_corpus_fetch() {")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        tools = root / "tools"
+        tools.mkdir()
+        (tools / "sleep").write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$SLEEP_CALLS"\n')
+        (tools / "sleep").chmod(0o755)
+        log, sleep_calls = root / "runs.txt", root / "sleeps.txt"
+        transient = "git: absent; git-lock: absent; r2: HTTP 503 for objects/sha256/00/0"
+        fixture = (
+            "set -euo pipefail\n"
+            "unset R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY\n"
+            "base_r2_access_key=base-fixture-key base_r2_secret_key=base-fixture-secret\n"
+            + _shell_function(base, "place_with_retries")
+            + _shell_function(base, "base_corpus_fetch_with_credentials")
+            + textwrap.dedent(f"""\
+                base_corpus_fetch() {{
+                  printf 'fetch %s %s %s\\n' "${{R2_ACCESS_KEY_ID:-}}" "${{R2_SECRET_ACCESS_KEY:-}}" "$*" >> {shlex.quote(str(log))}
+                  if [ "$(grep -c '^fetch' {shlex.quote(str(log))})" -lt 3 ]; then
+                    printf '%s\\n' '{{"release": "base", "failed": {{"{V1}": "{transient}"}}, "modified": {{}}, "skipped": {{}}}}'
+                    return 1
+                  fi
+                  printf '%s\\n' '{{"release": "base", "failed": {{}}, "modified": {{}}, "skipped": {{}}}}'
+                }}
+                checkpoint_base_corpus() {{
+                  printf 'checkpoint %s %s\\n' "${{R2_ACCESS_KEY_ID:-none}}" "${{R2_SECRET_ACCESS_KEY:-none}}" >> {shlex.quote(str(log))}
+                }}
+                if place_with_retries checkpoint_base_corpus base_corpus_fetch_with_credentials corpus-fetch --corpus-path 'base corpus'; then
+                  echo placed
+                else
+                  exit "$?"
+                fi
+                """)
+        )
+        result = subprocess.run(
+            ["bash", "-c", fixture],
+            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""), "SLEEP_CALLS": str(sleep_calls)},
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().endswith("placed")
+        # Both credentials reach the encoder; neither reaches the checkpoint,
+        # nor the step's output.
+        fetch = "fetch base-fixture-key base-fixture-secret corpus-fetch --corpus-path base corpus --json"
+        assert log.read_text().splitlines() == [fetch, "checkpoint none none", fetch, "checkpoint none none", fetch]
+        assert len(sleep_calls.read_text().split()) == 2
+        assert "base-fixture-key" not in result.stdout + result.stderr
+        assert "base-fixture-secret" not in result.stdout + result.stderr
 
 
 def git(root: Path, *args: str) -> str:
@@ -7154,7 +7625,16 @@ def main() -> None:
     test_post_switch_corpus_places_pinned_release_with_read_credentials()
     test_post_switch_corpus_accepts_local_artifacts_without_credentials()
     test_post_switch_corpus_fetch_failure_preserves_missing_artifact_diagnostic()
-    print("pinned corpus placement: 6 regression checks passed")
+    test_corpus_placement_reruns_after_transient_r2_failures()
+    test_corpus_placement_gives_up_after_three_transient_runs()
+    test_corpus_placement_never_reruns_a_failure_no_rerun_can_fix()
+    test_corpus_placement_checks_integrity_before_each_run_and_stops_on_a_failed_check()
+    test_corpus_placement_stops_when_its_checkpoint_fails()
+    test_corpus_placement_checkpoints_partial_placements_under_the_real_integrity_check()
+    test_corpus_release_object_fetches_retry_and_still_verify()
+    test_release_object_fetch_retries_transient_failures_and_still_verifies_over_https()
+    test_protected_base_placement_reruns_the_same_way_with_its_credentials()
+    print("pinned corpus placement: 15 regression checks passed")
     test_release_pin_companion_requires_strict_retirement()
     test_release_pin_companion_accepts_exact_staged_consumption()
     run_rollback_rewind_tests()
