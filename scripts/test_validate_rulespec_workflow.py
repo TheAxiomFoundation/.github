@@ -586,15 +586,17 @@ def test_release_object_fetch_bounds_agree_and_leave_room_for_every_retry() -> N
                           "--retry-all-errors", "--retry-delay", "--retry-max-time"}, shell
     speed_time, max_time = int(shell["--speed-time"]), int(shell["--max-time"])
     window, retries, longest_delay = int(shell["--retry-max-time"]), int(shell["--retry"]), 7
-    # curl averages speed over up to the last 5 s (CURR_TIME in lib/urldata.h),
-    # so a stall after a fast burst ends up to 5 s after `--speed-time` alone.
-    averaging = 5
+    # curl recomputes speed at most once a second, averaged over up to the last
+    # 5 s (CURR_TIME in lib/urldata.h), and re-checks it once a second
+    # (lib/speedcheck.c), so a stall after a fast burst can end about 5 s, plus
+    # a second or two, after `--speed-time`.
+    averaging, sampling = 5, 2
     assert int(shell["--speed-limit"]) > 0
     # A stalled try is abandoned well before the per-try cap, and even a try
     # that runs to the cap ends inside the retry window, so it leaves a retry.
     assert speed_time < max_time < window
     # Every retry still starts when each try stalls until the speed check ends it.
-    assert retries * (speed_time + averaging + longest_delay) < window
+    assert retries * (speed_time + averaging + sampling + longest_delay) < window
     # The whole acquisition stays bounded: the last retry starts within the
     # window (plus one delay) and runs at most one try's cap.
     assert window + longest_delay + max_time <= 15 * 60

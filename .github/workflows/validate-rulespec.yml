@@ -3884,18 +3884,18 @@ jobs:
           mkdir -p "$(dirname "$destination")"
           # Retry any failure (an HTTP error, a refused, dropped or stalled
           # connection) up to five times. Each try is bounded, so one stalled
-          # try cannot use up the retry window: curl abandons a try whose
-          # speed, averaged over up to the last 5 s, stays under 1 KiB/s for
-          # 30 s, and any try still running after 180 s. It starts a retry only while less than 600 s have
-          # passed since the first try; it checks before its wait, so a last try
-          # can start a few seconds after that and run to its own 180 s bound.
-          # It removes a failed partial --output file before it tries again.
-          # The delay between tries is 3-7 s, drawn per run, which spreads out
-          # the retries of parallel shards that failed together. curl also
-          # honours a Retry-After on HTTP 408, 429, 500, 502, 503 and 504, and
-          # stops retrying when that wait would pass the 600 s limit. --fail
-          # still turns an HTTP error into a failure, and the content sha256
-          # check below decides.
+          # try cannot use up the retry window: curl abandons a try whose speed,
+          # averaged over up to the last 5 s, stays under 1 KiB/s for 30 s, and
+          # any try still running after 180 s. It starts a retry only while less
+          # than 600 s have passed since the first try; it checks before its
+          # wait, so a last try can start a few seconds after that and run to
+          # its own 180 s bound. It removes a failed partial --output file
+          # before it tries again. The delay between tries is 3-7 s, drawn per
+          # run, which spreads out the retries of parallel shards that failed
+          # together. curl also honours a Retry-After on HTTP 408, 429, 500,
+          # 502, 503 and 504, and stops retrying when that wait would pass the
+          # 600 s limit. --fail still turns an HTTP error into a failure, and
+          # the content sha256 check below decides.
           retry_delay=$(( 3 + RANDOM % 5 ))
           retry=(--connect-timeout 30 --speed-limit 1024 --speed-time 30 --max-time 180 --retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time 600)
           if [ -n "$RELEASE_REGISTRY_URL" ]; then
