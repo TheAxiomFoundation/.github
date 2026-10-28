@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -515,8 +516,8 @@ def test_corpus_release_object_fetches_retry_and_still_verify() -> None:
 
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     fetch = next(step for step in steps if step.get("name") == "Fetch pinned signed corpus release object")["run"]
-    assert ('retry=(--connect-timeout 30 --retry 5 --retry-all-errors --retry-delay "$retry_delay" '
-            '--retry-max-time 120)') in fetch
+    assert ('retry=(--connect-timeout 30 --speed-limit 1024 --speed-time 30 --max-time 180 --retry 5 '
+            '--retry-all-errors --retry-delay "$retry_delay" --retry-max-time 600)') in fetch
     assert "retry_delay=$(( 3 + RANDOM % 5 ))" in fetch
     curls = [line for line in fetch.splitlines() if line.strip().startswith("curl ")]
     assert len(curls) == 2
@@ -529,26 +530,102 @@ def test_corpus_release_object_fetches_retry_and_still_verify() -> None:
 
     preparation = next(step for step in steps if step.get("name") == BASE_CORPUS_PREPARATION_STEP)["run"]
     command = preparation.split("\ncommand = [", 1)[1].split("]\n", 1)[0]
-    for flag in ('"--fail"', '"--connect-timeout", "30"', '"--retry", "5"', '"--retry-all-errors"',
-                 '"--retry-delay", str(random.randint(3, 7))', '"--retry-max-time", "120"'):
+    for flag in ('"--fail"', '"--connect-timeout", "30"', '"--speed-limit", "1024"', '"--speed-time", "30"',
+                 '"--max-time", "180"', '"--retry", "5"', '"--retry-all-errors"',
+                 '"--retry-delay", str(random.randint(3, 7))', '"--retry-max-time", "600"'):
         assert flag in command, flag
     assert 'subprocess.run([*command, "--output", str(downloaded), url], check=True)' in preparation
     assert "check_output([*command" not in preparation
     assert preparation.index("protected-base corpus release digest mismatch") > preparation.index('"--output", str(downloaded)')
 
 
-def _release_fetch_shell(integrity: Path) -> str:
+def _release_fetch_curl_bounds() -> tuple[dict[str, str], dict[str, str]]:
+    """The timing and retry flags of both release object fetches, as flag -> value."""
+    import ast
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    fetch = next(step for step in steps if step.get("name") == "Fetch pinned signed corpus release object")["run"]
+    array = fetch.split("\nretry=(", 1)[1].split(")\n", 1)[0]
+    preparation = next(step for step in steps if step.get("name") == BASE_CORPUS_PREPARATION_STEP)["run"]
+    listing = preparation.split("\ncommand = [", 1)[1].split("]\n", 1)[0]
+    # The Python delay is an expression, not a literal; compare its range instead.
+    listing = listing.replace("str(random.randint(3, 7))", '"3-7"')
+    python_flags = ast.literal_eval("[" + listing + "]")
+    shell_flags = [("3-7" if token == "$retry_delay" else token) for token in shlex.split(array)]
+
+    def pairs(flags: list[str]) -> dict[str, str]:
+        valued = {"--connect-timeout", "--speed-limit", "--speed-time", "--max-time", "--retry", "--retry-delay",
+                  "--retry-max-time"}
+        result: dict[str, str] = {}
+        index = 0
+        while index < len(flags):
+            flag = flags[index]
+            if flag in valued:
+                result[flag] = flags[index + 1]
+                index += 2
+            else:
+                if flag == "--retry-all-errors":
+                    result[flag] = ""
+                index += 1
+        return result
+
+    return pairs(shell_flags), pairs(python_flags)
+
+
+def test_release_object_fetch_bounds_agree_and_leave_room_for_every_retry() -> None:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    fetch = next(step for step in steps if step.get("name") == "Fetch pinned signed corpus release object")["run"]
+    assert "retry_delay=$(( 3 + RANDOM % 5 ))" in fetch, "the shell delay must be drawn from 3-7 s, as the Python one is"
+    shell, python = _release_fetch_curl_bounds()
+    # Both fetches use the same bounds.
+    assert shell == python, (shell, python)
+    assert set(shell) == {"--connect-timeout", "--speed-limit", "--speed-time", "--max-time", "--retry",
+                          "--retry-all-errors", "--retry-delay", "--retry-max-time"}, shell
+    speed_time, max_time = int(shell["--speed-time"]), int(shell["--max-time"])
+    window, retries, longest_delay = int(shell["--retry-max-time"]), int(shell["--retry"]), 7
+    assert int(shell["--speed-limit"]) > 0
+    # A stalled try is abandoned well before the per-try cap, and even a try
+    # that runs to the cap ends inside the retry window, so it leaves a retry.
+    assert speed_time < max_time < window
+    # Every retry still starts when each try stalls until the speed check ends it.
+    assert retries * (speed_time + longest_delay) < window
+    # The whole acquisition stays bounded: the last retry starts within the
+    # window (plus one delay) and runs at most one try's cap.
+    assert window + longest_delay + max_time <= 15 * 60
+
+
+def _release_fetch_shell(integrity: Path, timings: dict[str, str] | None = None, unbounded: bool = False) -> str:
     import yaml
 
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     run = next(step for step in steps if step.get("name") == "Fetch pinned signed corpus release object")["run"]
     assert "retry_delay=$(( 3 + RANDOM % 5 ))" in run
-    # One-second waits keep the test short; the flags are otherwise unchanged.
-    return (
+    # One-second waits keep the test short; the flags are otherwise unchanged,
+    # except that `timings` can scale the bounds down (flag -> value) and
+    # `unbounded` drops the per-try bounds as a control.
+    run = (
         run.replace("retry_delay=$(( 3 + RANDOM % 5 ))", "retry_delay=1")
         .replace("/opt/axiom-dependency-integrity/check.py", str(integrity))
         .replace('sudo "$(command -v python)" -I', '"$(command -v python)" -I')
     )
+    shell, _python = _release_fetch_curl_bounds()
+    for flag, value in (timings or {}).items():
+        run, count = re.subn(rf"{re.escape(flag)} {re.escape(shell[flag])}(?=[ )])", f"{flag} {value}", run)
+        assert count == 1, flag
+    if unbounded:
+        for flag in ("--speed-limit", "--speed-time", "--max-time"):
+            value = (timings or {}).get(flag, shell[flag])
+            run, count = re.subn(rf"{re.escape(flag)} {re.escape(value)} ", "", run)
+            assert count == 1, flag
+    return run
+
+
+# How long a scripted stall or trickle lasts before the server drops it: longer
+# than the scaled retry window, so a try that waits it out leaves no retry.
+STALL_SECONDS = 9
 
 
 def test_release_object_fetch_retries_transient_failures_and_still_verifies_over_https() -> None:
@@ -577,16 +654,32 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
                 seen.append((self.path, self.headers.get("apikey")))
                 step = script.pop(0) if script else (404, b"")
                 status, body = step[0], step[1]
+                mode = step[2] if len(step) > 2 else None
                 self.send_response(status)
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Length", str(10**9 if mode == "trickle" else len(body)))
                 self.end_headers()
-                if len(step) > 2:  # a transfer that breaks halfway
-                    self.wfile.write(body[: len(body) // 2])
-                    self.wfile.flush()
-                    self.close_connection = True
-                    self.connection.shutdown(2)
+                try:
+                    if mode == "trickle":  # bytes keep coming, too slowly to finish
+                        deadline = time.monotonic() + STALL_SECONDS
+                        while time.monotonic() < deadline:
+                            self.wfile.write(b" " * 512)
+                            self.wfile.flush()
+                            time.sleep(0.125)
+                    elif mode in ("break", "stall"):  # a transfer that breaks or stalls halfway
+                        self.wfile.write(body[: len(body) // 2])
+                        self.wfile.flush()
+                        if mode == "stall":  # nothing more arrives until the connection drops
+                            time.sleep(STALL_SECONDS)
+                    else:
+                        self.wfile.write(body)
+                        return
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
                     return
-                self.wfile.write(body)
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(2)
+                except OSError:
+                    pass
 
             def log_message(self, *_args: object) -> None:
                 pass
@@ -599,15 +692,34 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
         integrity = root / "integrity.py"
         integrity.write_text("import sys\nassert sys.argv[1] in {'verify', 'refresh-corpus'}\n")
         shell = _release_fetch_shell(integrity)
+        # Scaled-down bounds keep the order of the real ones (speed check <
+        # per-try cap < retry window < a stall) while keeping the test short.
+        scaled = {"--speed-time": "1", "--max-time": "3", "--retry-max-time": "6"}
+        shells = {
+            "default": shell,
+            "scaled": _release_fetch_shell(integrity, scaled),
+            "unbounded": _release_fetch_shell(integrity, scaled, unbounded=True),
+        }
         base = f"https://127.0.0.1:{server.server_address[1]}"
         try:
-            for case, responses, registry, ok, requests in (
-                ("server errors then the object", [(500, b"x"), (503, b"x"), (200, good)], False, True, 3),
-                ("a broken transfer then the object", [(200, good, "break"), (200, good)], False, True, 2),
-                ("server error then wrong bytes", [(500, b"x"), (200, wrong)], False, False, 2),
-                ("missing every time", [], False, False, 6),
+            for case, responses, registry, ok, requests, variant in (
+                ("server errors then the object", [(500, b"x"), (503, b"x"), (200, good)], False, True, 3, "default"),
+                ("a broken transfer then the object", [(200, good, "break"), (200, good)], False, True, 2, "default"),
+                ("server error then wrong bytes", [(500, b"x"), (200, wrong)], False, False, 2, "default"),
+                ("missing every time", [], False, False, 6, "default"),
                 ("registry error then its row", [(502, b"x"), (200, json.dumps([{"release_object": json.loads(good)}]).encode())],
-                 True, True, 2),
+                 True, True, 2, "default"),
+                # A stalled try is abandoned by the speed check and retried.
+                ("a stalled transfer then the object", [(200, good, "stall"), (200, good)], False, True, 2, "scaled"),
+                # A trickle beats the speed check; the per-try cap ends it.
+                ("a trickle then the object", [(200, good, "trickle"), (200, good)], False, True, 2, "scaled"),
+                ("registry stall then its row", [(200, json.dumps([{"release_object": json.loads(good)}]).encode(), "stall"),
+                                                 (200, json.dumps([{"release_object": json.loads(good)}]).encode())],
+                 True, True, 2, "scaled"),
+                # Controls: without the per-try bounds, the one stalled or
+                # trickling try outlasts the retry window and nothing retries.
+                ("unbounded stall", [(200, good, "stall"), (200, good)], False, False, 1, "unbounded"),
+                ("unbounded trickle", [(200, good, "trickle"), (200, good)], False, False, 1, "unbounded"),
             ):
                 dependency_root = root / case
                 (dependency_root / "axiom-corpus").mkdir(parents=True)
@@ -616,7 +728,7 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
                 script[:] = list(responses)
                 seen.clear()
                 result = subprocess.run(
-                    ["bash", "-c", shell],
+                    ["bash", "-c", shells[variant]],
                     env={**os.environ, "RUNNER_TEMP": str(temp), "AXIOM_DEPENDENCY_ROOT": str(dependency_root),
                          "RELEASE_BASE_URL": base + "/objects", "RELEASE_REGISTRY_URL": base + "/registry" if registry else "",
                          "RELEASE_REGISTRY_ANON_KEY": "fixture-anon-key", "RELEASE_NAME": name,
@@ -7632,6 +7744,7 @@ def main() -> None:
     test_corpus_placement_stops_when_its_checkpoint_fails()
     test_corpus_placement_checkpoints_partial_placements_under_the_real_integrity_check()
     test_corpus_release_object_fetches_retry_and_still_verify()
+    test_release_object_fetch_bounds_agree_and_leave_room_for_every_retry()
     test_release_object_fetch_retries_transient_failures_and_still_verifies_over_https()
     test_protected_base_placement_reruns_the_same_way_with_its_credentials()
     print("pinned corpus placement: 15 regression checks passed")
