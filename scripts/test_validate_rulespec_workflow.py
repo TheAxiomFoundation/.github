@@ -597,7 +597,7 @@ def test_release_object_fetch_bounds_agree_and_leave_room_for_every_retry() -> N
     assert window + longest_delay + max_time <= 15 * 60
 
 
-def _release_fetch_shell(integrity: Path, timings: dict[str, str] | None = None, unbounded: bool = False) -> str:
+def _release_fetch_shell(integrity: Path, timings: dict[str, str] | None = None, drop: tuple[str, ...] = ()) -> str:
     import yaml
 
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
@@ -605,7 +605,7 @@ def _release_fetch_shell(integrity: Path, timings: dict[str, str] | None = None,
     assert "retry_delay=$(( 3 + RANDOM % 5 ))" in run
     # One-second waits keep the test short; the flags are otherwise unchanged,
     # except that `timings` can scale the bounds down (flag -> value) and
-    # `unbounded` drops the per-try bounds as a control.
+    # `drop` removes per-try bounds, to isolate one bound or as a control.
     run = (
         run.replace("retry_delay=$(( 3 + RANDOM % 5 ))", "retry_delay=1")
         .replace("/opt/axiom-dependency-integrity/check.py", str(integrity))
@@ -615,11 +615,10 @@ def _release_fetch_shell(integrity: Path, timings: dict[str, str] | None = None,
     for flag, value in (timings or {}).items():
         run, count = re.subn(rf"{re.escape(flag)} {re.escape(shell[flag])}(?=[ )])", f"{flag} {value}", run)
         assert count == 1, flag
-    if unbounded:
-        for flag in ("--speed-limit", "--speed-time", "--max-time"):
-            value = (timings or {}).get(flag, shell[flag])
-            run, count = re.subn(rf"{re.escape(flag)} {re.escape(value)} ", "", run)
-            assert count == 1, flag
+    for flag in drop:
+        value = (timings or {}).get(flag, shell[flag])
+        run, count = re.subn(rf"{re.escape(flag)} {re.escape(value)} ", "", run)
+        assert count == 1, flag
     return run
 
 
@@ -695,10 +694,22 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
         # Scaled-down bounds keep the order of the real ones (speed check <
         # per-try cap < retry window < a stall) while keeping the test short.
         scaled = {"--speed-time": "1", "--max-time": "3", "--retry-max-time": "6"}
+        speed_check, cap = ("--speed-limit", "--speed-time"), ("--max-time",)
         shells = {
             "default": shell,
             "scaled": _release_fetch_shell(integrity, scaled),
-            "unbounded": _release_fetch_shell(integrity, scaled, unbounded=True),
+            # Each bound alone, so a case shows which one ended the try.
+            "speed check only": _release_fetch_shell(integrity, scaled, drop=cap),
+            "cap only": _release_fetch_shell(integrity, scaled, drop=speed_check),
+            "unbounded": _release_fetch_shell(integrity, scaled, drop=speed_check + cap),
+        }
+        row = json.dumps([{"release_object": json.loads(good)}]).encode()
+        # curl reports each abandoned try on stderr, even when a retry succeeds.
+        diagnostics = {
+            "a stalled transfer then the object": "Operation too slow",
+            "a trickle then the object": "Operation timed out",
+            "registry stall then its row": "Operation too slow",
+            "registry trickle then its row": "Operation timed out",
         }
         base = f"https://127.0.0.1:{server.server_address[1]}"
         try:
@@ -709,13 +720,14 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
                 ("missing every time", [], False, False, 6, "default"),
                 ("registry error then its row", [(502, b"x"), (200, json.dumps([{"release_object": json.loads(good)}]).encode())],
                  True, True, 2, "default"),
-                # A stalled try is abandoned by the speed check and retried.
-                ("a stalled transfer then the object", [(200, good, "stall"), (200, good)], False, True, 2, "scaled"),
-                # A trickle beats the speed check; the per-try cap ends it.
-                ("a trickle then the object", [(200, good, "trickle"), (200, good)], False, True, 2, "scaled"),
-                ("registry stall then its row", [(200, json.dumps([{"release_object": json.loads(good)}]).encode(), "stall"),
-                                                 (200, json.dumps([{"release_object": json.loads(good)}]).encode())],
-                 True, True, 2, "scaled"),
+                # The speed check alone abandons a stalled try, and it is retried.
+                ("a stalled transfer then the object", [(200, good, "stall"), (200, good)], False, True, 2,
+                 "speed check only"),
+                # A trickle beats the speed check; the per-try cap alone ends it.
+                ("a trickle then the object", [(200, good, "trickle"), (200, good)], False, True, 2, "cap only"),
+                # Both bounds together, on the registry path.
+                ("registry stall then its row", [(200, row, "stall"), (200, row)], True, True, 2, "scaled"),
+                ("registry trickle then its row", [(200, row, "trickle"), (200, row)], True, True, 2, "scaled"),
                 # Controls: without the per-try bounds, the one stalled or
                 # trickling try outlasts the retry window and nothing retries.
                 ("unbounded stall", [(200, good, "stall"), (200, good)], False, False, 1, "unbounded"),
@@ -750,6 +762,8 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
                     assert all(path == f"/objects/releases/{name}/{sha}.json" for path, _key in seen), seen
                 if case == "server error then wrong bytes":
                     assert "content sha256 mismatch" in result.stderr
+                if case in diagnostics:
+                    assert diagnostics[case] in result.stderr, (case, result.stderr)
         finally:
             server.shutdown()
 
