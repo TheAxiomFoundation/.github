@@ -98,7 +98,8 @@ honours a server's `Retry-After` on HTTP 408, 429, 500, 502, 503 and 504, and
 stops retrying when that wait would pass the 600-second limit. It writes only
 with `--output`, so curl discards a failed partial transfer before it tries
 again, and the content-address check still decides. The protected-base audit
-fetches its release with the same flags. Provisions placement reads `corpus-fetch --json` and runs it again,
+fetches its release with the same flags. Provisions placement reads
+`corpus-fetch --json` and runs it again,
 at most three runs in all, only after exit 1 in which every artifact that
 failed has a transient R2 reason (HTTP 408, 429 or 5xx, a failed request, a
 broken read), none names bytes that do not match the release, and the report

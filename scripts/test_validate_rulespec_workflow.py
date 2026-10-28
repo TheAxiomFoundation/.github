@@ -692,7 +692,9 @@ def test_release_object_fetch_retries_transient_failures_and_still_verifies_over
         integrity.write_text("import sys\nassert sys.argv[1] in {'verify', 'refresh-corpus'}\n")
         shell = _release_fetch_shell(integrity)
         # Scaled-down bounds keep the order of the real ones (speed check <
-        # per-try cap < retry window < a stall) while keeping the test short.
+        # per-try cap < retry window) while keeping the test short. The stall
+        # and trickle outlast the window, as both CI stalls outlasted the old
+        # 120 s window, so the controls fail the way those runs did.
         scaled = {"--speed-time": "1", "--max-time": "3", "--retry-max-time": "6"}
         speed_check, cap = ("--speed-limit", "--speed-time"), ("--max-time",)
         shells = {
