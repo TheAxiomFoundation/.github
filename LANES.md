@@ -4,7 +4,8 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-28 — Merge pull request #501 from TheAxiomFoundation/waivers/stage-ssi-2012-319-14 | 39 | uk-rulespec-2026-10-25-pe-child-definitions | fa0da5e834214052cc8d9d381e25ff409dd1062f | queued |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-28 — Merge pull request #502 from TheAxiomFoundation/hub/retire-manifest-prohibition | 38 | uk-rulespec-2026-10-25-pe-child-definitions | fa0da5e834214052cc8d9d381e25ff409dd1062f | queued |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-28 — Merge pull request #1960 from TheAxiomFoundation/hub/repin-shared-workflow-882c5f1 | 44 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | in_progress |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-27 — Merge pull request #29 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-27 — Merge pull request #26 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-10-27 — Merge pull request #30 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
@@ -13,7 +14,6 @@
 | [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-27 — Merge pull request #43 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-27 — Merge pull request #23 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
 | [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-10-27 — Merge pull request #107 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-27 — Merge pull request #1937 from TheAxiomFoundation/hub/validator-adopt-59e48cf8 | 43 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | queued |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-10-26 — Merge pull request #139 from TheAxiomFoundation/repin/axiom-encode-fa0da5e8 | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-10-11 — Merge pull request #131 from TheAxiomFoundation/hub/encoder-guard-on | 2 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 179 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
