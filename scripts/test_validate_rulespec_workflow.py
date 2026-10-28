@@ -42,7 +42,8 @@ def test_corpus_placement_runs_before_supervised_gates_with_step_only_credential
     assert names[index + 1] == "Provision protected verification supervisor"
     install = steps[names.index("Install Python dependencies")]
     assert names.index("Install Python dependencies") < index
-    assert 'python -I -m pip --isolated install "$RUNNER_TEMP/axiom-encode-install"' in install["run"]
+    assert 'encoder="$RUNNER_TEMP/axiom-encode-install"' in install["run"]
+    assert 'uv pip install --python "$python_bin" --no-deps "$encoder"' in install["run"]
 
     step = steps[index]
     assert step["shell"] == "bash"
@@ -4935,8 +4936,8 @@ def test_import_selection_preserves_enforcement_wiring() -> None:
         assert steps[name]["env"]["VALIDATE_ROOTS"] == "${{ needs.shards.outputs.roots }}", name
     audit = steps["Enforce validation waiver ratchet"]
     assert first not in audit.get("if", "")
-    assert audit["timeout-minutes"] == 150
-    assert jobs["validate"]["timeout-minutes"] == 180
+    assert audit["timeout-minutes"] == 210
+    assert jobs["validate"]["timeout-minutes"] == 240
     assert '--partition-key "${{ matrix.shard }}"' in audit["run"]
     assert "--partition-keys-json '${{ needs.shards.outputs.matrix }}'" in audit["run"]
     complete = jobs["validate-complete"]
@@ -7099,11 +7100,15 @@ def test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix() -> 
     assert "needs.shards.outputs.first" not in audit_step
     assert '--partition-key "${{ matrix.shard }}"' in audit_step
     assert "--partition-keys-json '${{ needs.shards.outputs.matrix }}'" in audit_step
+    # rulespec-us names the worker count its legs run today (the encoder's
+    # default on 4-CPU runners); no leg is singled out, because round-robin
+    # partitions move the expensive tariff chapters between legs.
     assert (
         "AXIOM_ENCODE_WAIVER_AUDIT_WORKERS: "
         "${{ github.repository == 'TheAxiomFoundation/rulespec-us' "
-        "&& matrix.shard == 'us-wa' && '2' || '1' }}"
+        "&& '4' || '1' }}"
     ) in audit_step
+    assert "matrix.shard ==" not in audit_step.split("AXIOM_ENCODE_WAIVER_AUDIT_WORKERS:", 1)[1].split("\n", 1)[0]
 
 
 def test_lane_registry_regressions_run_from_shared_workflow_entrypoint() -> None:
@@ -7346,7 +7351,9 @@ def test_validation_jobs_are_bounded_in_time_and_parallelism() -> None:
 
         validate = jobs["validate"]
         strategy = validate["strategy"]
-        assert validate["timeout-minutes"] == 180, path.name
+        # Only the current workflow runs the partitioned waiver ratchet,
+        # whose 210-minute step sets its job limit.
+        assert validate["timeout-minutes"] == {WORKFLOW: 240, legacy: 180}[path], path.name
         assert strategy["fail-fast"] is False, path.name
         assert strategy["max-parallel"] == 20, path.name
         # Two concurrent runs of one repository must leave hosted runners for
@@ -7375,7 +7382,7 @@ def test_validation_jobs_are_bounded_in_time_and_parallelism() -> None:
         if step.get("name") == "Enforce validation waiver ratchet"
     ]
     assert len(ratchet) == 1
-    assert ratchet[0]["timeout-minutes"] == 150
+    assert ratchet[0]["timeout-minutes"] == 210
 
 
 def test_parallel_validation_workers_are_bounded_and_fail_closed() -> None:

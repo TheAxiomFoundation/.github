@@ -76,6 +76,36 @@ class DependencyIntegrityTests(unittest.TestCase):
             f"exec {shlex.quote(sys.executable)} \"$@\"\n"
         )
         python.chmod(0o755)
+        # The locked installers run through uv: stub only its network-facing
+        # commands, applying the same workspace and environment checks.
+        uv = tools / "uv"
+        uv.write_text(
+            "#!/bin/bash\n"
+            "test \"$PWD\" != \"$GITHUB_WORKSPACE\" || exit 91\n"
+            "test -z \"${PYTHONPATH:-}\" || exit 92\n"
+            "test \"${UV_NO_CONFIG:-}\" = 1 || exit 93\n"
+            "printf '%s\\n' \"$*\" >> \"$RUNNER_TEMP/installer-calls\"\n"
+            "case \"$1 ${2:-}\" in\n"
+            "  'export '*)\n"
+            "    for arg in \"$@\"; do\n"
+            "      if [ \"${previous:-}\" = --output-file ]; then\n"
+            "        printf 'pytest==9.0.2 \\\\\\n    --hash=sha256:%064d\\n' 0 > \"$arg\"\n"
+            "      fi\n"
+            "      previous=\"$arg\"\n"
+            "    done\n"
+            "    printf 'axiom-oracles @ git+https://github.com/TheAxiomFoundation/axiom-oracles@%040d\\n' 0 ;;\n"
+            "  'pip install')\n"
+            "    for arg in \"$@\"; do\n"
+            "      if [ \"${previous:-}\" = --target ]; then\n"
+            "        mkdir -p \"$arg\"\n"
+            "        printf 'trusted installed package\\n' > \"$arg/package.py\"\n"
+            "      fi\n"
+            "      previous=\"$arg\"\n"
+            "    done ;;\n"
+            "  'pip freeze') printf 'pyyaml==6.0.3\\n' ;;\n"
+            "esac\n"
+        )
+        uv.chmod(0o755)
         # Tests exercise the helper logic as the current user. Hosted runs also
         # protect the helper and baseline under root ownership.
         sudo = tools / "sudo"
@@ -252,7 +282,7 @@ class DependencyIntegrityTests(unittest.TestCase):
         self.assertIn('--content-sha256 "$base_release_sha256"', body)
         self.assertIn("/opt/axiom-base-verification/python/bin/python", body)
         self.assertLess(body.index("add base-verification-runtime"), body.index("base_corpus_fetch corpus-fetch --help"))
-        self.assertLess(body.index("unset R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY"), body.index("-m pip --isolated install"))
+        self.assertLess(body.index("unset R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY"), body.index("uv pip install"))
         self.assertEqual(preparation["env"].get("R2_ACCESS_KEY_ID"), "${{ secrets.R2_CORPUS_READ_ACCESS_KEY_ID }}")
         self.assertEqual(preparation["env"].get("R2_SECRET_ACCESS_KEY"), "${{ secrets.R2_CORPUS_READ_SECRET_ACCESS_KEY }}")
 

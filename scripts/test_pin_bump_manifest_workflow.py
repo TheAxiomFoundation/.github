@@ -28,6 +28,7 @@ HEAD = "b" * 40
 PROPOSED = "e" * 40
 MODULE = "uk/statutes/unchanged.yaml"
 MANIFEST = ".axiom/encoding-manifests/uk/statutes/unchanged.json"
+BASE_PREPARATION_STEP = "Prepare protected-base manifest audit"
 
 
 def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
@@ -209,6 +210,152 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
             "INTEGRITY_FAIL_AFTER": str(integrity_fail_after),
         }, capture_output=True, text=True, timeout=30)
         return result, [json.loads(line) for line in calls.read_text().splitlines()]
+
+
+OFFICIAL_ENCODER = "https://github.com/TheAxiomFoundation/axiom-encode"
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True,
+                          env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+                               "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@example.com",
+                               "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@example.com"}).stdout.strip()
+
+
+class BaseEncoderMainRecordTests(unittest.TestCase):
+    """The base audit's encoder clone gets the head checkout's official-main fetch record.
+
+    The guard proves a non-pin producer's ancestry against the encoder checkout's FETCH_HEAD (falling back to a
+    refs/heads/main the clone doesn't have either). Without the record the base audit can only report that ancestry
+    is unprovable, so the head audit's real verdict on an inherited manifest reads as a new issue.
+    """
+
+    def setUp(self):
+        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+        run = next(step["run"] for step in steps if step.get("name") == BASE_PREPARATION_STEP)
+        start, end = "# base-encoder-main-record-start\n", "# base-encoder-main-record-end\n"
+        self.assertEqual((run.count(start), run.count(end)), (1, 1))
+        self.fragment = run.split(start, 1)[1].split(end, 1)[0]
+        self.assertLess(run.index(end), run.index('add base-encoder "$base_dependencies/axiom-encode" repository'),
+                        "the record must be in place before the base encoder's integrity snapshot")
+        directory = tempfile.TemporaryDirectory(prefix="encoder-guard-main-record-", dir=TEMP_PARENT)
+        self.addCleanup(directory.cleanup)
+        self.root = root = Path(directory.name)
+        # Official main: an old producer, then the pin, then a newer producer.
+        self.origin = root / "origin"
+        git(root, "init", "-q", "-b", "main", str(self.origin))
+        commits = []
+        for message in ("old producer", "pin", "newer producer"):
+            git(self.origin, "commit", "-q", "--allow-empty", "-m", message)
+            commits.append(git(self.origin, "rev-parse", "HEAD"))
+        self.old, self.pin, self.newer = commits
+        # The head checkout as the workflow leaves it: detached at the pin after the authenticated fetch of main.
+        self.dependencies = root / "dependencies"
+        self.head = self.dependencies / "axiom-encode"
+        self.head.mkdir(parents=True)
+        git(self.head, "init", "-q")
+        git(self.head, "fetch", "-q", "--no-tags", str(self.origin), "+refs/heads/main:refs/remotes/origin/main")
+        git(self.head, "checkout", "-q", "--detach", self.pin)
+        self.head_record = self.head / ".git/FETCH_HEAD"
+        # A local fetch records the local path; the runner's fetch records the official URL.
+        written = self.head_record.read_text()
+        self.assertTrue(written.startswith(f"{self.newer}\t\tbranch 'main' of "), written)
+        self.official = f"{self.newer}\t\tbranch 'main' of {OFFICIAL_ENCODER}\n"
+        self.head_record.write_text(self.official)
+        # The base clone exactly as the loop above the fragment makes it.
+        self.base_dependencies = root / "base-dependencies"
+        self.base_dependencies.mkdir()
+        self.base = self.base_dependencies / "axiom-encode"
+        git(root, "-c", "core.hooksPath=/dev/null", "clone", "-q", "--shared", "--no-checkout", str(self.head),
+            str(self.base))
+        git(self.base, "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", self.pin)
+        self.base_record = self.base / ".git/FETCH_HEAD"
+        self.tools = root / "tools"
+        self.tools.mkdir()
+        (self.tools / "python").symlink_to(sys.executable)
+
+    def run_fragment(self):
+        return subprocess.run(["bash", "-c", "set -euo pipefail\n" + self.fragment], cwd=self.root, env={
+            **os.environ, "PATH": str(self.tools) + os.pathsep + os.environ.get("PATH", ""),
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            "AXIOM_DEPENDENCY_ROOT": str(self.dependencies), "base_dependencies": str(self.base_dependencies),
+        }, capture_output=True, text=True, timeout=30)
+
+    def first_parent_main(self, repo, record):
+        commit = record.read_text().split("\t", 1)[0]
+        return git(repo, "rev-list", "--first-parent", commit).splitlines()
+
+    def test_a_local_clone_has_no_main_record_of_its_own(self):
+        self.assertFalse(self.base_record.exists())
+        self.assertNotEqual(subprocess.run(["git", "-C", str(self.base), "show-ref", "--verify", "--hash",
+                                            "refs/heads/main"], capture_output=True).returncode, 0)
+
+    def test_the_base_clone_judges_producers_against_the_same_main(self):
+        result = self.run_fragment()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.base_record.read_bytes(), self.head_record.read_bytes())
+        self.assertEqual(self.first_parent_main(self.base, self.base_record),
+                         self.first_parent_main(self.head, self.head_record))
+        for producer, is_descendant in ((self.old, False), (self.pin, True), (self.newer, True)):
+            for repo in (self.head, self.base):
+                with self.subTest(producer=producer, repo=repo.parent.name):
+                    ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", self.pin,
+                                               producer], capture_output=True)
+                    self.assertEqual(ancestry.returncode, 0 if is_descendant else 1)
+        self.assertEqual(git(self.base, "rev-parse", "HEAD"), self.pin)
+        self.assertEqual(git(self.base, "status", "--porcelain", "--untracked-files=all", "--ignored"), "")
+
+    def test_the_record_may_carry_a_git_suffix_or_not_for_merge(self):
+        for line in (f"{self.newer}\t\tbranch 'main' of {OFFICIAL_ENCODER}.git\n",
+                     f"{self.newer}\tnot-for-merge\tbranch 'main' of {OFFICIAL_ENCODER}/\n"):
+            with self.subTest(line=line):
+                self.base_record.unlink(missing_ok=True)
+                self.head_record.write_text(line)
+                result = self.run_fragment()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.base_record.read_text(), line)
+
+    def test_anything_but_the_authenticated_official_main_record_is_refused(self):
+        other = self.root / "elsewhere"
+        other.write_text(self.official)
+        cases = {
+            "missing": lambda: self.head_record.unlink(),
+            "symlink": lambda: (self.head_record.unlink(), self.head_record.symlink_to(other)),
+            "another repository": lambda: self.head_record.write_text(
+                self.official.replace("axiom-encode", "axiom-encode-fork")),
+            "another branch": lambda: self.head_record.write_text(self.official.replace("'main'", "'release'")),
+            "not the fetched main commit": lambda: self.head_record.write_text(
+                self.official.replace(self.newer, self.old)),
+            "two records": lambda: self.head_record.write_text(self.official * 2),
+            "oversized": lambda: self.head_record.write_text(self.official + " " * 5000),
+        }
+        for name, corrupt in cases.items():
+            with self.subTest(case=name):
+                self.base_record.unlink(missing_ok=True)
+                if self.head_record.is_symlink() or not self.head_record.exists():
+                    self.head_record.unlink(missing_ok=True)
+                self.head_record.write_text(self.official)
+                corrupt()
+                result = self.run_fragment()
+                self.assertNotEqual(result.returncode, 0, name)
+                self.assertIn("ManifestAuditError", result.stderr)
+                self.assertFalse(self.base_record.exists() or self.base_record.is_symlink())
+
+    def test_a_record_the_clone_already_has_is_never_overwritten_or_followed(self):
+        for name in ("file", "symlink"):
+            with self.subTest(existing=name):
+                self.base_record.unlink(missing_ok=True)
+                target = self.root / "target"
+                target.write_text("untouched\n")
+                if name == "file":
+                    self.base_record.write_text("untouched\n")
+                else:
+                    self.base_record.symlink_to(target)
+                result = self.run_fragment()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(target.read_text(), "untouched\n")
+                if name == "file":
+                    self.assertEqual(self.base_record.read_text(), "untouched\n")
 
 
 class PinBumpManifestTests(unittest.TestCase):
@@ -478,7 +625,7 @@ class PinBumpManifestTests(unittest.TestCase):
         self.assertEqual(preparation["env"]["BASE_CORPUS_REF"], "${{ needs.shards.outputs.base_axiom_corpus_ref }}")
         source = preparation["run"]
         for fragment in ('checkout --detach "$BASE_SHA"', 'axiom-encode:$BASE_ENCODER_REF',
-                         'axiom-corpus:$BASE_CORPUS_REF', 'pip --isolated install --no-cache-dir',
+                         'axiom-corpus:$BASE_CORPUS_REF', '--require-hashes --no-deps -r "$locked"',
                          'base-encoder "$base_dependencies/axiom-encode" repository',
                          'base-corpus "$base_dependencies/axiom-corpus" repository',
                          'base-verification-runtime /opt/axiom-base-verification runtime'):
