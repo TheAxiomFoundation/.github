@@ -4,8 +4,8 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-28 — Merge pull request #502 from TheAxiomFoundation/hub/retire-manifest-prohibition | 38 | uk-rulespec-2026-10-25-pe-child-definitions | fa0da5e834214052cc8d9d381e25ff409dd1062f | queued |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-28 — Merge pull request #1960 from TheAxiomFoundation/hub/repin-shared-workflow-882c5f1 | 44 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | in_progress |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-10-29 — Merge pull request #1963 from TheAxiomFoundation/hub/compose-fix-aktn | 42 | us-rulespec-2026-10-25-mt-separate-filing | ${{ | queued |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-29 — Merge pull request #504 from TheAxiomFoundation/hub/readme-toolchain-authority | 37 | uk-rulespec-2026-10-25-pe-child-definitions | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-27 — Merge pull request #29 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-27 — Merge pull request #26 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-10-27 — Merge pull request #30 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
