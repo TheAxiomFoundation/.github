@@ -999,14 +999,19 @@ jobs:
           # This step runs in the first job, before any of that, and it is also
           # where `run-generated-guard: false` stops being a free opt-out.
           #
-          # On the atomic roots, what this step rejects is a strict SUBSET of
-          # what the supervised guard rejects, so it can only ever fail a
-          # change the supervised guard would also fail: the supervised guard
-          # requires coverage by a manifest CHANGED in the same diff, this one
-          # accepts coverage by any tracked manifest whose `applied_files`
-          # records the path. It is a cheap provenance pre-check, not a
-          # replacement -- it verifies neither manifest signatures nor the
-          # manual-exception gate.
+          # On the atomic roots, what this step rejects in an ordinary change
+          # is a strict SUBSET of what the supervised guard rejects, so it
+          # only fails a change the supervised guard would also fail: the
+          # supervised guard requires coverage by a manifest CHANGED in the
+          # same diff, this one accepts coverage by any tracked manifest whose
+          # `applied_files` records the path. Two cases fall outside that. This
+          # step runs without the rollback proof, so it fails a proved rollback
+          # to a recorded stale digest that the guard, comparing from the
+          # proved base, accepts. It also diffs a non-fast-forward push from
+          # the merge base where the guard diffs the endpoints, so it can judge
+          # a module the guard does not. It is a cheap provenance pre-check,
+          # not a replacement -- it verifies neither manifest signatures nor
+          # the manual-exception gate.
           #
           # `programs/` is the exception, because the supervised guard never
           # looks at it (see ROOTS below). By default this step is the only
@@ -1515,6 +1520,19 @@ jobs:
               return recorded
 
 
+          def restores_earlier_tree(base: str, head: str) -> bool:
+              """Whether `head` has the exact tree of `base` or a recent ancestor.
+
+              The ancestors are the 20 first-parent commits the rollback proof
+              searches. This step runs without that proof, so it repeats only
+              the tree search; a head that passes adds no content of its own,
+              and the supervised guard decides whether the restoration stands.
+              """
+              trees = git("log", "--first-parent", "-n", "21", "--format=%T", base, check=False)
+              tree = git("log", "-n", "1", "--format=%T", head, check=False)
+              return bool(trees and tree) and tree[0].strip() in trees[0].split()
+
+
           tracked = git("ls-files", "-z") or []
           tracked_set = set(tracked)
           guard_input = os.environ.get("RUN_GENERATED_GUARD", "true").strip().lower()
@@ -1597,11 +1615,11 @@ jobs:
               ]
               base = os.environ["BASE_SHA"]
               head = os.environ["GITHUB_SHA"]
-              # Three-dot (merge-base) is what `axiom-encode guard-generated`
-              # diffs, and it is the only form that excludes base-branch commits
-              # landed after the pull request was opened. Two-dot is the
-              # fallback for unrelated histories, exactly as _git_changed_files
-              # falls back.
+              # Three-dot (merge-base) is the only form that excludes
+              # base-branch commits landed after the pull request was opened.
+              # Two-dot is the fallback for unrelated histories. `axiom-encode
+              # guard-generated` diffs the endpoints, which selects the same
+              # paths whenever the base is an ancestor of the head.
               changed = git(*diff, f"{base}...{head}", check=False)
               if changed is None:
                   changed = git(*diff, base, head) or []
@@ -1642,6 +1660,9 @@ jobs:
               raise SystemExit(0)
 
           recorded = recorded_hashes(tracked)
+          restored = scan_mode == "diff" and restores_earlier_tree(
+              os.environ["BASE_SHA"], os.environ["GITHUB_SHA"]
+          )
           offending: list[tuple[str, str]] = []
           for path in guarded_paths:
               digests = recorded.get(path)
@@ -1651,11 +1672,12 @@ jobs:
                       for candidate in manifest_candidates(path)
                       if candidate in tracked_set
                   ]
-                  # Only the legacy `programs/` check takes a mirrored manifest
-                  # at its word. On the atomic roots a manifest at the mirrored
-                  # path proves nothing until it records this path: some list
-                  # only the companion test.
-                  if present and program_spec_path(path):
+                  # A manifest at the mirrored path proves nothing until it
+                  # records this path: some list only the companion test. Two
+                  # cases still take one at its word: the legacy `programs/`
+                  # check, and an exact restoration of an earlier tree, which
+                  # would otherwise block a rollback the guard admits.
+                  if present and (restored or program_spec_path(path)):
                       continue
                   offending.append(
                       (

@@ -161,6 +161,12 @@ expired waivers still fail in callers' pinned supervised audit. The shared CI
 expiry regression is skipped without an encoder loader; setting
 `AXIOM_ENCODE_SOURCE` to the pinned encoder's loader enables that regression.
 
+The local precheck also keeps the ordinary base, because it runs without the
+proof. It repeats only the tree search: when the head's tree exactly matches the
+base or one of those 20 first-parent ancestors, a manifest at the mirrored path
+covers a module it does not list, and the supervised guard decides the rollback.
+A stale digest still fails the precheck, even in a rollback the proof admits.
+
 Ledger parses are cached by immutable blob ID within each proof run. The proof
 job has a 15-minute timeout: the review's 20-PR merge window with 80 transitions
 took 110.5 seconds before caching, so this budget allows over eight times that

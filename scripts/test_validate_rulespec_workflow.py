@@ -7259,6 +7259,8 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
             (f"{root}/{{}}.yaml", f".axiom/encoding-manifests/{root}/{{}}.json", f"{root}/{{}}.yaml"),
             (f"us-xx/{root}/{{}}.yaml", f".axiom/encoding-manifests/us-xx/{root}/{{}}.json", f"us-xx/{root}/{{}}.yaml"),
             (f"us-yy/{root}/{{}}.yaml", f"us-yy/.axiom/encoding-manifests/{root}/{{}}.json", f"{root}/{{}}.yaml"),
+            # A `programs` directory inside an atomic root stays atomic.
+            (f"{root}/programs/{{}}.yaml", f".axiom/encoding-manifests/{root}/programs/{{}}.json", f"{root}/programs/{{}}.yaml"),
         )
     ]
     programs = [
@@ -7293,8 +7295,9 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
                 write(path, module)
                 write(manifest, applied((record, sha(module))))
             write(".axiom/encoding-manifests/statutes/bundled.json", applied(("statutes/bundled.test.yaml", sha(module))))
-            for path, manifest, record in locations:
-                content = program if "programs/" in path else module
+            for location in locations:
+                path, manifest, record = location
+                content = program if location in programs else module
                 for state, (body, _) in states.items():
                     write(path.format(state), content)
                     if body is not None:
@@ -7350,6 +7353,141 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
         for path, _, _ in programs
         for state, reason in (("stale-digest", stale), ("absent", no_manifest))
     })
+
+
+def test_unmanifested_precheck_leaves_restored_trees_to_the_supervised_guard() -> None:
+    import yaml
+
+    step = next(
+        step
+        for job in yaml.safe_load(WORKFLOW.read_text())["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == "Reject unmanifested RuleSpec content"
+    )
+    module = RollbackRewindFixture.module
+    manifest = RollbackRewindFixture.manifest
+
+    def body(*applied: dict[str, str]) -> str:
+        return json.dumps({"signature": {"key_id": "key-one"}, "applied_files": list(applied)}) + "\n"
+
+    companion_only = body({"path": module.removesuffix(".yaml") + ".test.yaml", "sha256": "1" * 64})
+    stale = body({"path": module, "sha256": "0" * 64})
+
+    def records(content: str) -> str:
+        return body({"path": module, "sha256": hashlib.sha256(content.encode()).hexdigest()})
+
+    def verdict(root: Path, base: str, head: str, event: str = "pull_request") -> subprocess.CompletedProcess:
+        git(root, "checkout", "-q", "--detach", head)
+        return subprocess.run(
+            ["bash", "-c", step["run"]],
+            cwd=root,
+            env={
+                **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+                "BASE_SHA": base,
+                "GITHUB_SHA": head,
+                "GITHUB_REPOSITORY": "example/rulespec",
+                "EVENT_NAME": event,
+                "RUN_GENERATED_GUARD": "true",
+                "GUARD_PROGRAMS_ROOT": "false",
+            },
+            capture_output=True,
+            text=True,
+        )
+
+    def write(root: Path, relative: str, content: str) -> None:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+    # Repairing a module its manifest omits, then rolling the repair back, is
+    # a rollback the real proof admits, so the step must not block it. A stale
+    # digest stays the step's finding.
+    for state, passes in ((companion_only, True), (stale, False)):
+        with RollbackRewindFixture() as fixture:
+            fixture.write(manifest, state)
+            fixture.x = commit(fixture.root, "landed module its manifest omits")
+            fixture.base = fixture.x
+            fixture.api_response.write_text(json.dumps([{
+                "merge_commit_sha": fixture.x,
+                "merged_at": "2026-10-01T00:00:00Z",
+                "base": {"ref": "main", "repo": {"full_name": "example/rulespec"}},
+            }]))
+            repaired = "module: synthetic scratch fixture\nvalue: repaired\n"
+            fixture.write(module, repaired)
+            fixture.write(manifest, records(repaired))
+            fixture.base = commit(fixture.root, "landed repair")
+            fixture.retirements.append(fixture.base)
+            fixture.revert()
+            assert fixture.run()[0] == fixture.x
+            result = verdict(fixture.root, fixture.base, fixture.head)
+            assert (result.returncode == 0) == passes, result.stderr
+            if not passes:
+                assert f"{module} content matches no sha256" in result.stderr
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        write(root, "README.md", "history\n")
+        write(root, module, "value: landed\n")
+        write(root, manifest, companion_only)
+        landed = commit(root, "module its manifest omits")
+
+        def repair(content: str) -> str:
+            write(root, module, content)
+            write(root, manifest, records(content))
+            return commit(root, f"repair to {content}")
+
+        def restore(from_commit: str) -> str:
+            git(root, "checkout", "-q", "--detach", from_commit)
+            git(root, "read-tree", "-u", "--reset", landed)
+            git(root, "commit", "-qm", "restore the landed tree")
+            return git(root, "rev-parse", "HEAD")
+
+        # The window ends at the rollback proof's twentieth first-parent commit.
+        tips = [landed]
+        for number in range(1, 22):
+            tips.append(repair(f"value: {number}\n"))
+        assert verdict(root, tips[20], restore(tips[20])).returncode == 0, "twentieth ancestor"
+        result = verdict(root, tips[21], restore(tips[21]))
+        assert result.returncode != 0, "twenty-first ancestor"
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
+
+        # A head with any other tree gets no allowance, even when the module
+        # and its manifest match the landed tree byte for byte.
+        restore(tips[1])
+        write(root, "README.md", "edited with the restoration\n")
+        result = verdict(root, tips[1], commit(root, "partial restoration"))
+        assert result.returncode != 0
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
+
+        # The search follows first parents, as the proof does: a tree that
+        # only ever sat on a merged side branch restores nothing.
+        git(root, "checkout", "-q", "-b", "side", landed)
+        write(root, "side.txt", "side\n")
+        side = commit(root, "side-branch tree")
+        git(root, "checkout", "-q", "-b", "trunk", landed)
+        repair("value: trunk\n")
+        git(root, "merge", "-q", "--no-edit", side)
+        merged = git(root, "rev-parse", "HEAD")
+        git(root, "read-tree", "-u", "--reset", side)
+        git(root, "commit", "-qm", "restore the side-branch tree")
+        result = verdict(root, merged, git(root, "rev-parse", "HEAD"))
+        assert result.returncode != 0
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
+
+        # A non-fast-forward push between identical trees changes nothing at
+        # the endpoints, even though the merge-base diff selects the module.
+        git(root, "checkout", "-q", "--detach", tips[1])
+        git(root, "read-tree", "-u", "--reset", landed)
+        write(root, module, "value: divergent\n")
+        git(root, "add", "-A")
+        tree = git(root, "write-tree")
+        first = git(root, "commit-tree", tree, "-p", tips[1], "-m", "first divergent tip")
+        second = git(root, "commit-tree", tree, "-p", tips[1], "-m", "second divergent tip")
+        result = verdict(root, first, second, "push")
+        assert result.returncode == 0, result.stderr
 
 
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
@@ -7923,6 +8061,7 @@ def main() -> None:
     test_generated_guard_resolves_scheduled_base_to_exact_commit()
     test_unmanifested_precheck_guards_programs_only_on_opt_in()
     test_unmanifested_precheck_requires_a_manifest_record()
+    test_unmanifested_precheck_leaves_restored_trees_to_the_supervised_guard()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_validation_jobs_are_bounded_in_time_and_parallelism()
     test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix()
