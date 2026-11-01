@@ -7346,8 +7346,9 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
         "(.axiom/encoding-manifests/statutes/companion-only.json does not list it)"
     )
 
-    # Only the legacy `programs/` check takes a mirrored manifest at its word.
-    # It still requires one, and still compares any digest a manifest records.
+    # In an ordinary change, only the legacy `programs/` check takes a mirrored
+    # manifest at its word. It still requires one, and still compares any digest
+    # a manifest records.
     assert_exactly(findings("true", atomic + programs), expected | {
         path.format(state): reason
         for path, _, _ in programs
@@ -7399,30 +7400,62 @@ def test_unmanifested_precheck_leaves_restored_trees_to_the_supervised_guard() -
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
 
-    # Repairing a module its manifest omits, then rolling the repair back, is
-    # a rollback the real proof admits, so the step must not block it. A stale
-    # digest stays the step's finding.
-    for state, passes in ((companion_only, True), (stale, False)):
+    def proved_rollback(landed: dict[str, str], repair: dict[str, str]) -> subprocess.CompletedProcess:
+        """Run the step on a rollback of `repair` that the real proof admits."""
         with RollbackRewindFixture() as fixture:
-            fixture.write(manifest, state)
-            fixture.x = commit(fixture.root, "landed module its manifest omits")
+            if manifest not in landed:
+                (fixture.root / manifest).unlink()
+            for path, content in landed.items():
+                fixture.write(path, content)
+            fixture.x = commit(fixture.root, "landed module")
             fixture.base = fixture.x
             fixture.api_response.write_text(json.dumps([{
                 "merge_commit_sha": fixture.x,
                 "merged_at": "2026-10-01T00:00:00Z",
                 "base": {"ref": "main", "repo": {"full_name": "example/rulespec"}},
             }]))
-            repaired = "module: synthetic scratch fixture\nvalue: repaired\n"
-            fixture.write(module, repaired)
-            fixture.write(manifest, records(repaired))
+            for path, content in repair.items():
+                fixture.write(path, content)
             fixture.base = commit(fixture.root, "landed repair")
             fixture.retirements.append(fixture.base)
             fixture.revert()
             assert fixture.run()[0] == fixture.x
-            result = verdict(fixture.root, fixture.base, fixture.head)
-            assert (result.returncode == 0) == passes, result.stderr
-            if not passes:
-                assert f"{module} content matches no sha256" in result.stderr
+            return verdict(fixture.root, fixture.base, fixture.head)
+
+    repaired = "module: synthetic scratch fixture\nvalue: repaired\n"
+    in_place = {module: repaired, manifest: records(repaired)}
+    bundle = ".axiom/encoding-manifests/bundle.json"
+    other = {"path": "us/statutes/26/other.yaml", "sha256": "3" * 64}
+
+    def in_bundle(path: str) -> dict[str, str]:
+        digest = hashlib.sha256(repaired.encode()).hexdigest()
+        return {path: repaired, bundle: body(other, {"path": path, "sha256": digest})}
+
+    # Repairing a module its manifest omits, then rolling the repair back, is
+    # a rollback the real proof admits, so the step must not block it.
+    result = proved_rollback({manifest: companion_only}, in_place)
+    assert result.returncode == 0, result.stderr
+
+    # The same goes for a manifest beside the jurisdiction's own roots.
+    nested = "us-yy/statutes/4.yaml"
+    result = proved_rollback(
+        {
+            nested: "value: landed\n",
+            "us-yy/.axiom/encoding-manifests/statutes/4.json": body({"path": "statutes/4.test.yaml", "sha256": "1" * 64}),
+            bundle: body(other),
+        },
+        in_bundle(nested),
+    )
+    assert result.returncode == 0, result.stderr
+
+    # A stale digest stays the step's finding, and so does a module with no
+    # manifest, which the proof admits when a bundle recorded the repair.
+    result = proved_rollback({manifest: stale}, in_place)
+    assert result.returncode != 0
+    assert f"{module} content matches no sha256" in result.stderr
+    result = proved_rollback({bundle: body(other)}, in_bundle(module))
+    assert result.returncode != 0
+    assert f"{module} has no tracked encoder apply manifest" in result.stderr
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -7502,6 +7535,15 @@ def test_unmanifested_precheck_leaves_restored_trees_to_the_supervised_guard() -
         result = verdict(root, changed, git(root, "rev-parse", "HEAD"))
         assert result.returncode != 0
         assert f"{module} has no tracked encoder apply manifest" in result.stderr
+
+        # A root commit has no earlier tree to restore, so a push of one takes
+        # the whole tree as its change set with no allowance.
+        git(root, "checkout", "-q", "--orphan", "fresh", landed)
+        git(root, "commit", "-qm", "root commit")
+        result = verdict(root, "0" * 40, git(root, "rev-parse", "HEAD"), "push")
+        assert result.returncode != 0
+        assert "scan=tree)" in result.stderr
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
 
 
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:

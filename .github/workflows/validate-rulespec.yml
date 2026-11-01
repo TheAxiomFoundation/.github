@@ -1006,12 +1006,12 @@ jobs:
           # same diff, this one accepts coverage by any tracked manifest whose
           # `applied_files` records the path. Two cases fall outside that. This
           # step runs without the rollback proof, so it fails a proved rollback
-          # to a recorded stale digest that the guard, comparing from the
-          # proved base, accepts. It also diffs a non-fast-forward push from
-          # the merge base where the guard diffs the endpoints, so it can judge
-          # a module the guard does not. It is a cheap provenance pre-check,
-          # not a replacement -- it verifies neither manifest signatures nor
-          # the manual-exception gate.
+          # to a recorded stale digest or to a module with no manifest, which
+          # the guard, comparing from the proved base, accepts. It also diffs a
+          # non-fast-forward push from the merge base where the guard diffs the
+          # endpoints, so it can judge a module the guard does not. It is a
+          # cheap provenance pre-check, not a replacement -- it verifies neither
+          # manifest signatures nor the manual-exception gate.
           #
           # `programs/` is the exception, because the supervised guard never
           # looks at it (see ROOTS below). By default this step is the only
@@ -1022,9 +1022,10 @@ jobs:
           # not a proof of their absence (see the ProgramSpec shape notes
           # below). A caller that sets `guard-programs-root: true` also gets
           # the legacy manifest check on `programs/`. That check verifies no
-          # signature (a tracked manifest at the mirrored path suffices,
-          # whatever it records), and this repository supplies no ProgramSpec
-          # manifest producer.
+          # signature (a tracked manifest at the mirrored path suffices even
+          # when it does not list the file, though any digest a manifest lists
+          # must match), and this repository supplies no ProgramSpec manifest
+          # producer.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -1615,11 +1616,11 @@ jobs:
               ]
               base = os.environ["BASE_SHA"]
               head = os.environ["GITHUB_SHA"]
-              # Three-dot (merge-base) is the only form that excludes
-              # base-branch commits landed after the pull request was opened.
-              # Two-dot is the fallback for unrelated histories. `axiom-encode
-              # guard-generated` diffs the endpoints, which selects the same
-              # paths whenever the base is an ancestor of the head.
+              # Three-dot (merge-base) leaves out commits only the base
+              # carries, as after a non-fast-forward push. Two-dot is the
+              # fallback for unrelated histories. `axiom-encode guard-generated`
+              # diffs the endpoints, which compares the same two trees whenever
+              # the base is an ancestor of the head.
               changed = git(*diff, f"{base}...{head}", check=False)
               if changed is None:
                   changed = git(*diff, base, head) or []
