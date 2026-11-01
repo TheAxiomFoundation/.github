@@ -7237,10 +7237,13 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
     stale = "content matches no sha256"
     # What a mirrored manifest can say about the file beside it, and the reason
     # the atomic roots then report (None passes). A body of None writes no
-    # manifest.
+    # manifest. The pinned encoders write `deleted-entry`, which carries no
+    # digest; only the `deleted-marker` shape skips the compare.
     states = {
         "records": (lambda path, content: applied((path, sha(content))), None),
-        "records-deletion": (lambda path, content: applied((path, "deleted")), None),
+        "one-digest-matches": (lambda path, content: applied((path, "0" * 64), (path, sha(content))), None),
+        "deleted-marker": (lambda path, content: applied((path, "deleted")), None),
+        "deleted-entry": (lambda path, content: json.dumps({"applied_files": [{"path": path, "deleted": True}]}), stale),
         "stale-digest": (lambda path, content: applied((path, "0" * 64)), stale),
         "companion-only": (lambda path, content: applied((path.removesuffix(".yaml") + ".test.yaml", sha(content))), no_record),
         "other-module": (lambda path, content: applied(("statutes/other.yaml", sha(content))), no_record),
@@ -7345,6 +7348,10 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
         "is recorded by no encoder apply manifest "
         "(.axiom/encoding-manifests/statutes/companion-only.json does not list it)"
     )
+    assert reported["us-yy/statutes/companion-only.yaml"] == (
+        "is recorded by no encoder apply manifest "
+        "(us-yy/.axiom/encoding-manifests/statutes/companion-only.json does not list it)"
+    )
 
     # In an ordinary change, only the legacy `programs/` check takes a mirrored
     # manifest at its word. It still requires one, and still compares any digest
@@ -7352,7 +7359,7 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
     assert_exactly(findings("true", atomic + programs), expected | {
         path.format(state): reason
         for path, _, _ in programs
-        for state, reason in (("stale-digest", stale), ("absent", no_manifest))
+        for state, reason in (("deleted-entry", stale), ("stale-digest", stale), ("absent", no_manifest))
     })
 
 

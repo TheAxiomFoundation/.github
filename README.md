@@ -463,10 +463,10 @@ amount, but arithmetic on the allowed literals is not prevented, so review
 still owns ProgramSpec formulas. Setting `guard-programs-root: true` also
 requires a tracked encoding manifest for each changed `programs/` file.
 That legacy check verifies no signature. A manifest at the mirrored path
-suffices even when it does not list the file, though any digest a manifest lists
-must match. This repository supplies no ProgramSpec manifest producer. Confirm
-an external producer's supported inputs and audited revision before enabling
-that optional check.
+suffices when no manifest lists the file. Once one does, the content must match
+a digest listed for it, unless one of those reads `deleted`. This repository
+supplies no ProgramSpec manifest producer. Confirm an external producer's
+supported inputs and audited revision before enabling that optional check.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it

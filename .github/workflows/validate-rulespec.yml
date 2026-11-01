@@ -1022,10 +1022,10 @@ jobs:
           # not a proof of their absence (see the ProgramSpec shape notes
           # below). A caller that sets `guard-programs-root: true` also gets
           # the legacy manifest check on `programs/`. That check verifies no
-          # signature (a tracked manifest at the mirrored path suffices even
-          # when it does not list the file, though any digest a manifest lists
-          # must match), and this repository supplies no ProgramSpec manifest
-          # producer.
+          # signature: a tracked manifest at the mirrored path suffices when no
+          # manifest lists the file. Once one does, the content must match a
+          # digest listed for it, unless one of those reads `deleted`. This
+          # repository supplies no ProgramSpec manifest producer.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -1141,9 +1141,11 @@ jobs:
           JURISDICTION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*")
           MANIFEST_DIR = ".axiom/encoding-manifests"
           MANIFEST_PARTS = MANIFEST_DIR.split("/")
-          # axiom-encode records a removed module with this marker in place of
-          # a sha256; a file the manifest calls deleted is the supervised
-          # guard's business, not this pre-check's.
+          # A `sha256` of this marker skips the digest compare, leaving the
+          # file to the supervised guard. The pinned encoders record a removed
+          # module with `"deleted": true` and no sha256 instead, so a file such
+          # an entry lists that the tree still holds fails the digest compare,
+          # as it fails the supervised guard.
           DELETED_MARKER = "deleted"
           EXCEPTION_PATH = ".axiom/generated-guard-exception.md"
           EXCEPTION_URL = re.compile(
