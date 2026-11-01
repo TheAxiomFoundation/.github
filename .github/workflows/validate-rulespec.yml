@@ -1141,11 +1141,12 @@ jobs:
           JURISDICTION = re.compile(r"[a-z]{2}(?:-[a-z0-9_]+)*")
           MANIFEST_DIR = ".axiom/encoding-manifests"
           MANIFEST_PARTS = MANIFEST_DIR.split("/")
-          # A `sha256` of this marker skips the digest compare, leaving the
-          # file to the supervised guard. The pinned encoders record a removed
-          # module with `"deleted": true` and no sha256 instead, so a file such
-          # an entry lists that the tree still holds fails the digest compare,
-          # as it fails the supervised guard.
+          # A `sha256` of this marker skips the digest compare. The pinned
+          # encoders record a removed module with `"deleted": true` and no
+          # sha256 instead, which gives the compare no digest: a file the tree
+          # still holds and no other manifest entry covers fails it. In an
+          # ordinary change on the atomic roots, the supervised guard rejects
+          # that file too.
           DELETED_MARKER = "deleted"
           EXCEPTION_PATH = ".axiom/generated-guard-exception.md"
           EXCEPTION_URL = re.compile(
@@ -1698,8 +1699,8 @@ jobs:
               try:
                   current = hashlib.sha256(Path(path).read_bytes()).hexdigest()
               except OSError:
-                  # Not in the worktree (a merge-base diff can name a path the
-                  # head does not carry); the supervised guard adjudicates it.
+                  # Unreadable, such as a dangling symlink; the supervised
+                  # guard adjudicates it.
                   continue
               if current in digests:
                   continue

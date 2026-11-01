@@ -7243,6 +7243,7 @@ def test_unmanifested_precheck_requires_a_manifest_record() -> None:
         "records": (lambda path, content: applied((path, sha(content))), None),
         "one-digest-matches": (lambda path, content: applied((path, "0" * 64), (path, sha(content))), None),
         "deleted-marker": (lambda path, content: applied((path, "deleted")), None),
+        "deleted-marker-and-stale": (lambda path, content: applied((path, "0" * 64), (path, "deleted")), None),
         "deleted-entry": (lambda path, content: json.dumps({"applied_files": [{"path": path, "deleted": True}]}), stale),
         "stale-digest": (lambda path, content: applied((path, "0" * 64)), stale),
         "companion-only": (lambda path, content: applied((path.removesuffix(".yaml") + ".test.yaml", sha(content))), no_record),
