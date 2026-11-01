@@ -7489,6 +7489,20 @@ def test_unmanifested_precheck_leaves_restored_trees_to_the_supervised_guard() -
         result = verdict(root, first, second, "push")
         assert result.returncode == 0, result.stderr
 
+        # The allowance needs a manifest to take at its word: restoring a
+        # module that has none still fails.
+        git(root, "checkout", "-q", "--detach", tips[1])
+        (root / manifest).unlink()
+        write(root, module, "value: no manifest\n")
+        bare = commit(root, "module with no manifest")
+        write(root, module, "value: changed\n")
+        changed = commit(root, "changed module")
+        git(root, "read-tree", "-u", "--reset", bare)
+        git(root, "commit", "-qm", "restore the module with no manifest")
+        result = verdict(root, changed, git(root, "rev-parse", "HEAD"))
+        assert result.returncode != 0
+        assert f"{module} has no tracked encoder apply manifest" in result.stderr
+
 
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
     workflow = WORKFLOW.read_text()
