@@ -161,6 +161,13 @@ expired waivers still fail in callers' pinned supervised audit. The shared CI
 expiry regression is skipped without an encoder loader; setting
 `AXIOM_ENCODE_SOURCE` to the pinned encoder's loader enables that regression.
 
+The local precheck also keeps the ordinary base, because it runs without the
+proof. It repeats only the tree search: when the head's tree exactly matches the
+base or one of those 20 first-parent ancestors, a manifest at the mirrored path
+covers a module it does not list, and the supervised guard decides the rollback.
+A stale digest or a module with no manifest still fails the precheck, even in a
+rollback the proof admits.
+
 Ledger parses are cached by immutable blob ID within each proof run. The proof
 job has a 15-minute timeout: the review's 20-PR merge window with 80 transitions
 took 110.5 seconds before caching, so this budget allows over eight times that
@@ -419,8 +426,11 @@ validation comparison and verify that the complete `shards` job fits its
 10-minute timeout.
 
 The workflow checks repository layout and runs the pinned encoder's generated
-content and PolicyEngine oracle-coverage gates. The local precheck requires
-manifest presence for changed atomic modules in its roots. Manifest signatures,
+content and PolicyEngine oracle-coverage gates. The local precheck requires a
+tracked manifest's `applied_files` to record each changed atomic module in its
+roots. A manifest at the mirrored path that does not list the module gives it no
+coverage, except in the exact restoration of an earlier tree that
+[Exact rollback rewind](#exact-rollback-rewind) describes. Manifest signatures,
 manual exceptions and oracle classifications depend on the external encoder's
 implementation and must be audited at the adopted pin.
 
@@ -452,9 +462,11 @@ This is a lexical tripwire. It catches a hand-written module or a literal
 amount, but arithmetic on the allowed literals is not prevented, so review
 still owns ProgramSpec formulas. Setting `guard-programs-root: true` also
 requires a tracked encoding manifest for each changed `programs/` file.
-That check verifies no signature. This repository supplies no ProgramSpec
-manifest producer. Confirm an external producer's supported inputs and audited
-revision before enabling that optional check.
+That legacy check verifies no signature. A manifest at the mirrored path
+suffices when no manifest lists the file. Once one does, the content must match
+a digest listed for it, unless one of those reads `deleted`. This repository
+supplies no ProgramSpec manifest producer. Confirm an external producer's
+supported inputs and audited revision before enabling that optional check.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it

@@ -7209,6 +7209,351 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         assert "every one carries an encoder apply manifest" in result.stdout
 
 
+def test_unmanifested_precheck_requires_a_manifest_record() -> None:
+    import yaml
+
+    step = next(
+        step
+        for job in yaml.safe_load(WORKFLOW.read_text())["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == "Reject unmanifested RuleSpec content"
+    )
+
+    def sha(content: str) -> str:
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def applied(*entries: tuple[str, str]) -> str:
+        return json.dumps({"applied_files": [{"path": path, "sha256": digest} for path, digest in entries]})
+
+    module = "format: rulespec/v1\nrules: []\n"
+    program = (
+        "program: us-xx/tanf\nperiod: 2026-01\noutputs:\n  - eligible\n"
+        "scope:\n  federal:\n    - statutes/imported\n"
+        "transformations:\n  - pattern: derived_formula\n    name: eligible\n"
+        "    effective_from: '2026-01-01'\n    formula: imported_eligible\n"
+    )
+    no_record = "is recorded by no encoder apply manifest"
+    no_manifest = "has no tracked encoder apply manifest"
+    stale = "content matches no sha256"
+    # What a mirrored manifest can say about the file beside it, and the reason
+    # the atomic roots then report (None passes). A body of None writes no
+    # manifest. The pinned encoders write `deleted-entry`, which carries no
+    # digest; only the `deleted-marker` shape skips the compare.
+    states = {
+        "records": (lambda path, content: applied((path, sha(content))), None),
+        "one-digest-matches": (lambda path, content: applied((path, "0" * 64), (path, sha(content))), None),
+        "deleted-marker": (lambda path, content: applied((path, "deleted")), None),
+        "deleted-marker-and-stale": (lambda path, content: applied((path, "0" * 64), (path, "deleted")), None),
+        "deleted-entry": (lambda path, content: json.dumps({"applied_files": [{"path": path, "deleted": True}]}), stale),
+        "stale-digest": (lambda path, content: applied((path, "0" * 64)), stale),
+        "companion-only": (lambda path, content: applied((path.removesuffix(".yaml") + ".test.yaml", sha(content))), no_record),
+        "other-module": (lambda path, content: applied(("statutes/other.yaml", sha(content))), no_record),
+        "empty": (lambda path, content: applied(), no_record),
+        "no-applied-files": (lambda path, content: "{}", no_record),
+        "not-a-mapping": (lambda path, content: "[]", no_record),
+        "malformed": (lambda path, content: "{", no_record),
+        "absent": (None, no_manifest),
+    }
+    # Each place the step looks: the file, its mirrored manifest, and the path
+    # that manifest records it under.
+    atomic = [
+        location
+        for root in ("statutes", "regulations", "policies")
+        for location in (
+            (f"{root}/{{}}.yaml", f".axiom/encoding-manifests/{root}/{{}}.json", f"{root}/{{}}.yaml"),
+            (f"us-xx/{root}/{{}}.yaml", f".axiom/encoding-manifests/us-xx/{root}/{{}}.json", f"us-xx/{root}/{{}}.yaml"),
+            (f"us-yy/{root}/{{}}.yaml", f"us-yy/.axiom/encoding-manifests/{root}/{{}}.json", f"{root}/{{}}.yaml"),
+            # A `programs` directory inside an atomic root stays atomic.
+            (f"{root}/programs/{{}}.yaml", f".axiom/encoding-manifests/{root}/programs/{{}}.json", f"{root}/programs/{{}}.yaml"),
+        )
+    ]
+    programs = [
+        ("programs/us-xx/{}.yaml", ".axiom/encoding-manifests/programs/us-xx/{}.json", "programs/us-xx/{}.yaml"),
+        ("us-yy/programs/{}.yaml", ".axiom/encoding-manifests/us-yy/programs/{}.json", "us-yy/programs/{}.yaml"),
+        ("us-zz/programs/{}.yaml", "us-zz/.axiom/encoding-manifests/programs/{}.json", "programs/{}.yaml"),
+    ]
+    # A manifest whose filename mirrors nothing still covers a module, even
+    # when the manifest at the mirrored path does not list it.
+    unmirrored = [
+        ("statutes/bundled.yaml", ".axiom/encoding-manifests/bundle.json", "statutes/bundled.yaml"),
+        ("us-xx/statutes/bundled.yaml", ".axiom/encoding-manifests/bundle-xx.json", "us-xx/statutes/bundled.yaml"),
+        ("us-yy/statutes/bundled.yaml", "us-yy/.axiom/encoding-manifests/bundle.json", "statutes/bundled.yaml"),
+    ]
+
+    def findings(guard_programs: str, locations: list[tuple[str, str, str]]) -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def write(relative: str, content: str) -> None:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.email", "workflow-test@example.com")
+            git(root, "config", "user.name", "Workflow Test")
+            write("statutes/imported.yaml", module)
+            write(".axiom/encoding-manifests/statutes/imported.json", applied(("statutes/imported.yaml", sha(module))))
+            base = commit(root, "manifested base")
+            for path, manifest, record in unmirrored:
+                write(path, module)
+                write(manifest, applied((record, sha(module))))
+            write(".axiom/encoding-manifests/statutes/bundled.json", applied(("statutes/bundled.test.yaml", sha(module))))
+            for location in locations:
+                path, manifest, record = location
+                content = program if location in programs else module
+                for state, (body, _) in states.items():
+                    write(path.format(state), content)
+                    if body is not None:
+                        write(manifest.format(state), body(record.format(state), content))
+            head = commit(root, "guarded head")
+            result = subprocess.run(
+                ["bash", "-c", step["run"]],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "BASE_SHA": base,
+                    "GITHUB_SHA": head,
+                    "GITHUB_REPOSITORY": "TheAxiomFoundation/rulespec-us",
+                    "EVENT_NAME": "pull_request",
+                    "RUN_GENERATED_GUARD": "true",
+                    "GUARD_PROGRAMS_ROOT": guard_programs,
+                },
+                capture_output=True,
+                text=True,
+            )
+        assert result.returncode != 0, result.stdout
+        total = len(locations) * len(states) + len(unmirrored)
+        assert f"of {total} guarded files, scan=diff)" in result.stderr, result.stderr
+        return {
+            line.split(" ", 3)[2]: line.split(" ", 3)[3]
+            for line in result.stderr.splitlines()
+            if line.startswith("  ")
+        }
+
+    def assert_exactly(reported: dict[str, str], expected: dict[str, str]) -> None:
+        assert reported.keys() == expected.keys(), sorted(reported.keys() ^ expected.keys())
+        for path, reason in expected.items():
+            assert reported[path].startswith(reason), (path, reported[path])
+
+    expected = {
+        path.format(state): reason
+        for path, _, _ in atomic
+        for state, (_, reason) in states.items()
+        if reason is not None
+    }
+    reported = findings("false", atomic)
+    assert_exactly(reported, expected)
+    # The reason names the manifest that exists without listing the module.
+    assert reported["statutes/companion-only.yaml"] == (
+        "is recorded by no encoder apply manifest "
+        "(.axiom/encoding-manifests/statutes/companion-only.json does not list it)"
+    )
+    assert reported["us-yy/statutes/companion-only.yaml"] == (
+        "is recorded by no encoder apply manifest "
+        "(us-yy/.axiom/encoding-manifests/statutes/companion-only.json does not list it)"
+    )
+
+    # In an ordinary change, only the legacy `programs/` check takes a mirrored
+    # manifest at its word. It still requires one, and still compares any digest
+    # a manifest records.
+    assert_exactly(findings("true", atomic + programs), expected | {
+        path.format(state): reason
+        for path, _, _ in programs
+        for state, reason in (("deleted-entry", stale), ("stale-digest", stale), ("absent", no_manifest))
+    })
+
+
+def test_unmanifested_precheck_leaves_restored_trees_to_the_supervised_guard() -> None:
+    import yaml
+
+    step = next(
+        step
+        for job in yaml.safe_load(WORKFLOW.read_text())["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == "Reject unmanifested RuleSpec content"
+    )
+    module = RollbackRewindFixture.module
+    manifest = RollbackRewindFixture.manifest
+
+    def body(*applied: dict[str, str]) -> str:
+        return json.dumps({"signature": {"key_id": "key-one"}, "applied_files": list(applied)}) + "\n"
+
+    companion_only = body({"path": module.removesuffix(".yaml") + ".test.yaml", "sha256": "1" * 64})
+    stale = body({"path": module, "sha256": "0" * 64})
+
+    def records(content: str) -> str:
+        return body({"path": module, "sha256": hashlib.sha256(content.encode()).hexdigest()})
+
+    def verdict(root: Path, base: str, head: str, event: str = "pull_request") -> subprocess.CompletedProcess:
+        git(root, "checkout", "-q", "--detach", head)
+        return subprocess.run(
+            ["bash", "-c", step["run"]],
+            cwd=root,
+            env={
+                **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+                "BASE_SHA": base,
+                "GITHUB_SHA": head,
+                "GITHUB_REPOSITORY": "example/rulespec",
+                "EVENT_NAME": event,
+                "RUN_GENERATED_GUARD": "true",
+                "GUARD_PROGRAMS_ROOT": "false",
+            },
+            capture_output=True,
+            text=True,
+        )
+
+    def write(root: Path, relative: str, content: str) -> None:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+    def proved_rollback(landed: dict[str, str], repair: dict[str, str]) -> subprocess.CompletedProcess:
+        """Run the step on a rollback of `repair` that the real proof admits."""
+        with RollbackRewindFixture() as fixture:
+            if manifest not in landed:
+                (fixture.root / manifest).unlink()
+            for path, content in landed.items():
+                fixture.write(path, content)
+            fixture.x = commit(fixture.root, "landed module")
+            fixture.base = fixture.x
+            fixture.api_response.write_text(json.dumps([{
+                "merge_commit_sha": fixture.x,
+                "merged_at": "2026-10-01T00:00:00Z",
+                "base": {"ref": "main", "repo": {"full_name": "example/rulespec"}},
+            }]))
+            for path, content in repair.items():
+                fixture.write(path, content)
+            fixture.base = commit(fixture.root, "landed repair")
+            fixture.retirements.append(fixture.base)
+            fixture.revert()
+            assert fixture.run()[0] == fixture.x
+            return verdict(fixture.root, fixture.base, fixture.head)
+
+    repaired = "module: synthetic scratch fixture\nvalue: repaired\n"
+    in_place = {module: repaired, manifest: records(repaired)}
+    bundle = ".axiom/encoding-manifests/bundle.json"
+    other = {"path": "us/statutes/26/other.yaml", "sha256": "3" * 64}
+
+    def in_bundle(path: str) -> dict[str, str]:
+        digest = hashlib.sha256(repaired.encode()).hexdigest()
+        return {path: repaired, bundle: body(other, {"path": path, "sha256": digest})}
+
+    # Repairing a module its manifest omits, then rolling the repair back, is
+    # a rollback the real proof admits, so the step must not block it.
+    result = proved_rollback({manifest: companion_only}, in_place)
+    assert result.returncode == 0, result.stderr
+
+    # The same goes for a manifest beside the jurisdiction's own roots.
+    nested = "us-yy/statutes/4.yaml"
+    result = proved_rollback(
+        {
+            nested: "value: landed\n",
+            "us-yy/.axiom/encoding-manifests/statutes/4.json": body({"path": "statutes/4.test.yaml", "sha256": "1" * 64}),
+            bundle: body(other),
+        },
+        in_bundle(nested),
+    )
+    assert result.returncode == 0, result.stderr
+
+    # A stale digest stays the step's finding, and so does a module with no
+    # manifest, which the proof admits when a bundle recorded the repair.
+    result = proved_rollback({manifest: stale}, in_place)
+    assert result.returncode != 0
+    assert f"{module} content matches no sha256" in result.stderr
+    result = proved_rollback({bundle: body(other)}, in_bundle(module))
+    assert result.returncode != 0
+    assert f"{module} has no tracked encoder apply manifest" in result.stderr
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        write(root, "README.md", "history\n")
+        write(root, module, "value: landed\n")
+        write(root, manifest, companion_only)
+        landed = commit(root, "module its manifest omits")
+
+        def repair(content: str) -> str:
+            write(root, module, content)
+            write(root, manifest, records(content))
+            return commit(root, f"repair to {content}")
+
+        def restore(from_commit: str) -> str:
+            git(root, "checkout", "-q", "--detach", from_commit)
+            git(root, "read-tree", "-u", "--reset", landed)
+            git(root, "commit", "-qm", "restore the landed tree")
+            return git(root, "rev-parse", "HEAD")
+
+        # The window ends at the rollback proof's twentieth first-parent commit.
+        tips = [landed]
+        for number in range(1, 22):
+            tips.append(repair(f"value: {number}\n"))
+        assert verdict(root, tips[20], restore(tips[20])).returncode == 0, "twentieth ancestor"
+        result = verdict(root, tips[21], restore(tips[21]))
+        assert result.returncode != 0, "twenty-first ancestor"
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
+
+        # A head with any other tree gets no allowance, even when the module
+        # and its manifest match the landed tree byte for byte.
+        restore(tips[1])
+        write(root, "README.md", "edited with the restoration\n")
+        result = verdict(root, tips[1], commit(root, "partial restoration"))
+        assert result.returncode != 0
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
+
+        # The search follows first parents, as the proof does: a tree that
+        # only ever sat on a merged side branch restores nothing.
+        git(root, "checkout", "-q", "-b", "side", landed)
+        write(root, "side.txt", "side\n")
+        side = commit(root, "side-branch tree")
+        git(root, "checkout", "-q", "-b", "trunk", landed)
+        repair("value: trunk\n")
+        git(root, "merge", "-q", "--no-edit", side)
+        merged = git(root, "rev-parse", "HEAD")
+        git(root, "read-tree", "-u", "--reset", side)
+        git(root, "commit", "-qm", "restore the side-branch tree")
+        result = verdict(root, merged, git(root, "rev-parse", "HEAD"))
+        assert result.returncode != 0
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
+
+        # A non-fast-forward push between identical trees changes nothing at
+        # the endpoints, even though the merge-base diff selects the module.
+        git(root, "checkout", "-q", "--detach", tips[1])
+        git(root, "read-tree", "-u", "--reset", landed)
+        write(root, module, "value: divergent\n")
+        git(root, "add", "-A")
+        tree = git(root, "write-tree")
+        first = git(root, "commit-tree", tree, "-p", tips[1], "-m", "first divergent tip")
+        second = git(root, "commit-tree", tree, "-p", tips[1], "-m", "second divergent tip")
+        result = verdict(root, first, second, "push")
+        assert result.returncode == 0, result.stderr
+
+        # The allowance needs a manifest to take at its word: restoring a
+        # module that has none still fails.
+        git(root, "checkout", "-q", "--detach", tips[1])
+        (root / manifest).unlink()
+        write(root, module, "value: no manifest\n")
+        bare = commit(root, "module with no manifest")
+        write(root, module, "value: changed\n")
+        changed = commit(root, "changed module")
+        git(root, "read-tree", "-u", "--reset", bare)
+        git(root, "commit", "-qm", "restore the module with no manifest")
+        result = verdict(root, changed, git(root, "rev-parse", "HEAD"))
+        assert result.returncode != 0
+        assert f"{module} has no tracked encoder apply manifest" in result.stderr
+
+        # A root commit has no earlier tree to restore, so a push of one takes
+        # the whole tree as its change set with no allowance.
+        git(root, "checkout", "-q", "--orphan", "fresh", landed)
+        git(root, "commit", "-qm", "root commit")
+        result = verdict(root, "0" * 40, git(root, "rev-parse", "HEAD"), "push")
+        assert result.returncode != 0
+        assert "scan=tree)" in result.stderr
+        assert f"{module} is recorded by no encoder apply manifest" in result.stderr
+
+
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Enforce validation waiver ratchet")
@@ -7779,6 +8124,8 @@ def main() -> None:
     run_rollback_rewind_tests()
     test_generated_guard_resolves_scheduled_base_to_exact_commit()
     test_unmanifested_precheck_guards_programs_only_on_opt_in()
+    test_unmanifested_precheck_requires_a_manifest_record()
+    test_unmanifested_precheck_leaves_restored_trees_to_the_supervised_guard()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_validation_jobs_are_bounded_in_time_and_parallelism()
     test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix()
