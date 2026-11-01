@@ -7209,6 +7209,149 @@ def test_unmanifested_precheck_guards_programs_only_on_opt_in() -> None:
         assert "every one carries an encoder apply manifest" in result.stdout
 
 
+def test_unmanifested_precheck_requires_a_manifest_record() -> None:
+    import yaml
+
+    step = next(
+        step
+        for job in yaml.safe_load(WORKFLOW.read_text())["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == "Reject unmanifested RuleSpec content"
+    )
+
+    def sha(content: str) -> str:
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def applied(*entries: tuple[str, str]) -> str:
+        return json.dumps({"applied_files": [{"path": path, "sha256": digest} for path, digest in entries]})
+
+    module = "format: rulespec/v1\nrules: []\n"
+    program = (
+        "program: us-xx/tanf\nperiod: 2026-01\noutputs:\n  - eligible\n"
+        "scope:\n  federal:\n    - statutes/imported\n"
+        "transformations:\n  - pattern: derived_formula\n    name: eligible\n"
+        "    effective_from: '2026-01-01'\n    formula: imported_eligible\n"
+    )
+    no_record = "is recorded by no encoder apply manifest"
+    no_manifest = "has no tracked encoder apply manifest"
+    stale = "content matches no sha256"
+    # What a mirrored manifest can say about the file beside it, and the reason
+    # the atomic roots then report (None passes). A body of None writes no
+    # manifest.
+    states = {
+        "records": (lambda path, content: applied((path, sha(content))), None),
+        "records-deletion": (lambda path, content: applied((path, "deleted")), None),
+        "stale-digest": (lambda path, content: applied((path, "0" * 64)), stale),
+        "companion-only": (lambda path, content: applied((path.removesuffix(".yaml") + ".test.yaml", sha(content))), no_record),
+        "other-module": (lambda path, content: applied(("statutes/other.yaml", sha(content))), no_record),
+        "empty": (lambda path, content: applied(), no_record),
+        "no-applied-files": (lambda path, content: "{}", no_record),
+        "not-a-mapping": (lambda path, content: "[]", no_record),
+        "malformed": (lambda path, content: "{", no_record),
+        "absent": (None, no_manifest),
+    }
+    # Each place the step looks: the file, its mirrored manifest, and the path
+    # that manifest records it under.
+    atomic = [
+        location
+        for root in ("statutes", "regulations", "policies")
+        for location in (
+            (f"{root}/{{}}.yaml", f".axiom/encoding-manifests/{root}/{{}}.json", f"{root}/{{}}.yaml"),
+            (f"us-xx/{root}/{{}}.yaml", f".axiom/encoding-manifests/us-xx/{root}/{{}}.json", f"us-xx/{root}/{{}}.yaml"),
+            (f"us-yy/{root}/{{}}.yaml", f"us-yy/.axiom/encoding-manifests/{root}/{{}}.json", f"{root}/{{}}.yaml"),
+        )
+    ]
+    programs = [
+        ("programs/us-xx/{}.yaml", ".axiom/encoding-manifests/programs/us-xx/{}.json", "programs/us-xx/{}.yaml"),
+        ("us-yy/programs/{}.yaml", ".axiom/encoding-manifests/us-yy/programs/{}.json", "us-yy/programs/{}.yaml"),
+        ("us-zz/programs/{}.yaml", "us-zz/.axiom/encoding-manifests/programs/{}.json", "programs/{}.yaml"),
+    ]
+    # A manifest whose filename mirrors nothing still covers a module, even
+    # when the manifest at the mirrored path does not list it.
+    unmirrored = [
+        ("statutes/bundled.yaml", ".axiom/encoding-manifests/bundle.json", "statutes/bundled.yaml"),
+        ("us-xx/statutes/bundled.yaml", ".axiom/encoding-manifests/bundle-xx.json", "us-xx/statutes/bundled.yaml"),
+        ("us-yy/statutes/bundled.yaml", "us-yy/.axiom/encoding-manifests/bundle.json", "statutes/bundled.yaml"),
+    ]
+
+    def findings(guard_programs: str, locations: list[tuple[str, str, str]]) -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def write(relative: str, content: str) -> None:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.email", "workflow-test@example.com")
+            git(root, "config", "user.name", "Workflow Test")
+            write("statutes/imported.yaml", module)
+            write(".axiom/encoding-manifests/statutes/imported.json", applied(("statutes/imported.yaml", sha(module))))
+            base = commit(root, "manifested base")
+            for path, manifest, record in unmirrored:
+                write(path, module)
+                write(manifest, applied((record, sha(module))))
+            write(".axiom/encoding-manifests/statutes/bundled.json", applied(("statutes/bundled.test.yaml", sha(module))))
+            for path, manifest, record in locations:
+                content = program if "programs/" in path else module
+                for state, (body, _) in states.items():
+                    write(path.format(state), content)
+                    if body is not None:
+                        write(manifest.format(state), body(record.format(state), content))
+            head = commit(root, "guarded head")
+            result = subprocess.run(
+                ["bash", "-c", step["run"]],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "BASE_SHA": base,
+                    "GITHUB_SHA": head,
+                    "GITHUB_REPOSITORY": "TheAxiomFoundation/rulespec-us",
+                    "EVENT_NAME": "pull_request",
+                    "RUN_GENERATED_GUARD": "true",
+                    "GUARD_PROGRAMS_ROOT": guard_programs,
+                },
+                capture_output=True,
+                text=True,
+            )
+        assert result.returncode != 0, result.stdout
+        total = len(locations) * len(states) + len(unmirrored)
+        assert f"of {total} guarded files, scan=diff)" in result.stderr, result.stderr
+        return {
+            line.split(" ", 3)[2]: line.split(" ", 3)[3]
+            for line in result.stderr.splitlines()
+            if line.startswith("  ")
+        }
+
+    def assert_exactly(reported: dict[str, str], expected: dict[str, str]) -> None:
+        assert reported.keys() == expected.keys(), sorted(reported.keys() ^ expected.keys())
+        for path, reason in expected.items():
+            assert reported[path].startswith(reason), (path, reported[path])
+
+    expected = {
+        path.format(state): reason
+        for path, _, _ in atomic
+        for state, (_, reason) in states.items()
+        if reason is not None
+    }
+    reported = findings("false", atomic)
+    assert_exactly(reported, expected)
+    # The reason names the manifest that exists without listing the module.
+    assert reported["statutes/companion-only.yaml"] == (
+        "is recorded by no encoder apply manifest "
+        "(.axiom/encoding-manifests/statutes/companion-only.json does not list it)"
+    )
+
+    # Only the legacy `programs/` check takes a mirrored manifest at its word.
+    # It still requires one, and still compares any digest a manifest records.
+    assert_exactly(findings("true", atomic + programs), expected | {
+        path.format(state): reason
+        for path, _, _ in programs
+        for state, reason in (("stale-digest", stale), ("absent", no_manifest))
+    })
+
+
 def test_waiver_bootstrap_uses_authenticated_head_toolchain() -> None:
     workflow = WORKFLOW.read_text()
     start = workflow.index("      - name: Enforce validation waiver ratchet")
@@ -7779,6 +7922,7 @@ def main() -> None:
     run_rollback_rewind_tests()
     test_generated_guard_resolves_scheduled_base_to_exact_commit()
     test_unmanifested_precheck_guards_programs_only_on_opt_in()
+    test_unmanifested_precheck_requires_a_manifest_record()
     test_parallel_validation_workers_are_bounded_and_fail_closed()
     test_validation_jobs_are_bounded_in_time_and_parallelism()
     test_validation_waiver_audit_is_exhaustively_partitioned_across_matrix()

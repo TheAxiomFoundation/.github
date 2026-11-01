@@ -419,10 +419,12 @@ validation comparison and verify that the complete `shards` job fits its
 10-minute timeout.
 
 The workflow checks repository layout and runs the pinned encoder's generated
-content and PolicyEngine oracle-coverage gates. The local precheck requires
-manifest presence for changed atomic modules in its roots. Manifest signatures,
-manual exceptions and oracle classifications depend on the external encoder's
-implementation and must be audited at the adopted pin.
+content and PolicyEngine oracle-coverage gates. The local precheck requires a
+tracked manifest's `applied_files` to record each changed atomic module in its
+roots; a manifest at the mirrored path that does not list the module gives it no
+coverage. Manifest signatures, manual exceptions and oracle classifications
+depend on the external encoder's implementation and must be audited at the
+adopted pin.
 
 The shared workflow invokes the pinned encoder's supervised `guard-generated`
 command. This checkout does not contain that encoder implementation, its
@@ -452,9 +454,10 @@ This is a lexical tripwire. It catches a hand-written module or a literal
 amount, but arithmetic on the allowed literals is not prevented, so review
 still owns ProgramSpec formulas. Setting `guard-programs-root: true` also
 requires a tracked encoding manifest for each changed `programs/` file.
-That check verifies no signature. This repository supplies no ProgramSpec
-manifest producer. Confirm an external producer's supported inputs and audited
-revision before enabling that optional check.
+That legacy check verifies no signature, and a manifest at the mirrored path
+suffices whatever it records. This repository supplies no ProgramSpec manifest
+producer. Confirm an external producer's supported inputs and audited revision
+before enabling that optional check.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it

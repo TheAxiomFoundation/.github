@@ -1003,9 +1003,10 @@ jobs:
           # what the supervised guard rejects, so it can only ever fail a
           # change the supervised guard would also fail: the supervised guard
           # requires coverage by a manifest CHANGED in the same diff, this one
-          # accepts coverage by any tracked manifest. It is a cheap provenance
-          # pre-check, not a replacement -- it verifies neither manifest
-          # signatures nor the manual-exception gate.
+          # accepts coverage by any tracked manifest whose `applied_files`
+          # records the path. It is a cheap provenance pre-check, not a
+          # replacement -- it verifies neither manifest signatures nor the
+          # manual-exception gate.
           #
           # `programs/` is the exception, because the supervised guard never
           # looks at it (see ROOTS below). By default this step is the only
@@ -1016,8 +1017,9 @@ jobs:
           # not a proof of their absence (see the ProgramSpec shape notes
           # below). A caller that sets `guard-programs-root: true` also gets
           # the legacy manifest check on `programs/`. That check verifies no
-          # signature (a tracked manifest at the mirrored path suffices), and
-          # this repository supplies no ProgramSpec manifest producer.
+          # signature (a tracked manifest at the mirrored path suffices,
+          # whatever it records), and this repository supplies no ProgramSpec
+          # manifest producer.
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -1644,15 +1646,24 @@ jobs:
           for path in guarded_paths:
               digests = recorded.get(path)
               if digests is None:
-                  if any(
-                      candidate in tracked_set
+                  present = [
+                      candidate
                       for candidate in manifest_candidates(path)
-                  ):
+                      if candidate in tracked_set
+                  ]
+                  # Only the legacy `programs/` check takes a mirrored manifest
+                  # at its word. On the atomic roots a manifest at the mirrored
+                  # path proves nothing until it records this path: some list
+                  # only the companion test.
+                  if present and program_spec_path(path):
                       continue
                   offending.append(
                       (
                           path,
-                          "has no tracked encoder apply manifest "
+                          "is recorded by no encoder apply manifest "
+                          f"({present[0]} does not list it)"
+                          if present
+                          else "has no tracked encoder apply manifest "
                           f"({manifest_candidates(path)[0]})",
                       )
                   )
