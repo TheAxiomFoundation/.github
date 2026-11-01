@@ -131,6 +131,16 @@ class LayoutTests(unittest.TestCase):
                     (workspace / '_axiom').mkdir(exist_ok=True)
                     self.assertNotEqual(run(name, {**env, 'AXIOM_DEPENDENCY_STAGE': bad}).returncode, 0, bad)
                     self.assertEqual(sorted(p.name for p in workspace.iterdir()), ['_axiom', 'caller-dir'], bad)
+                # A real empty directory passes every check but the name, so
+                # the name guard alone keeps each of these from rmdir.
+                for bad in ('.axiom-dependency-stage.bogus', '.axiom-dependency-stage.Ab3dE6f',
+                            '.axiom-dependency-stage.Ab3dE6f89', '.axiom-dependency-stage.Ab3dE6_8',
+                            '.axiom-dependency-stage.Ab3dE6f8\n', 'x.axiom-dependency-stage.Ab3dE6f8',
+                            'xaxiom-dependency-stage.Ab3dE6f8', '.axiom-dependency-stagexAb3dE6f8'):
+                    (workspace / bad).mkdir()
+                    self.assertNotEqual(run(name, {**env, 'AXIOM_DEPENDENCY_STAGE': bad}).returncode, 0, repr(bad))
+                    self.assertTrue((workspace / bad).is_dir(), repr(bad))
+                    (workspace / bad).rmdir()
 
     def test_staging_windows_close_before_repository_tests(self):
         windows, window_if, is_open = 0, None, False
