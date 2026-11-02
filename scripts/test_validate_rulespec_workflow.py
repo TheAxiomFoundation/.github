@@ -7357,7 +7357,9 @@ def precheck_definitions() -> dict:
         for step in job.get("steps", [])
         if step.get("name") == "Reject unmanifested RuleSpec content"
     )
-    source = step["run"].split("python3 <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    # The pre-check runs in isolated mode (-I); the marker carries the flag,
+    # so dropping it from the workflow fails this extraction.
+    source = step["run"].split("python3 -I <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     definitions, body, _ = textwrap.dedent(source).partition(
         '\ntracked = git("ls-files", "-z") or []\n'
     )
