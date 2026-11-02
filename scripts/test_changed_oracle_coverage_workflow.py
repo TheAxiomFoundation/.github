@@ -74,9 +74,11 @@ def heredoc_source(step: str, command: str) -> str:
 
 WORKFLOW_TEXT = WORKFLOW.read_text()
 GATE_STEP = step_source(WORKFLOW_TEXT, STEP, "Run repository tests")
+# The gate runs its filter in isolated mode (-I), so the extraction marker
+# carries the flag; dropping it from the workflow fails this test.
 GATE_SOURCE = heredoc_source(
     GATE_STEP,
-    '          python - "$coverage_json" "$RULESPEC_FILE_LIST" <<\'PY\'',
+    '          python -I - "$coverage_json" "$RULESPEC_FILE_LIST" <<\'PY\'',
 )
 GATE_CODE = compile(GATE_SOURCE, "<changed-oracle-coverage-gate>", "exec")
 
