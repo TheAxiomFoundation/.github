@@ -31,9 +31,14 @@ Jurisdiction rule repositories should keep a small local `validate` workflow tha
 calls the centralized reusable workflow in this repository:
 
 ```yaml
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   validate:
     uses: TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@<workflow-commit-sha>
+    secrets: inherit
     with:
       axiom-encode-ref: <40-character-commit-sha>
       axiom-rules-engine-ref: <40-character-commit-sha>
@@ -65,9 +70,53 @@ tables in it. Before running the encoder, the workflow downloads the exact
 signed object from
 `<corpus-release-base-url>/releases/<name>/<content_sha256>.json` into the
 corpus checkout's matching `releases/<name>/<content_sha256>.json` path. It
-checks the content address and release name immediately; the protected
-verification supervisor then verifies its Ed25519 signature and supplies all
-three public trust roots without exposing signing capability.
+checks the content address and release name immediately. It builds the pinned
+encoder's verification supervisor and provisions it with public trust roots.
+Audit that external implementation at the adopted encoder SHA for its signature
+verification and process-isolation behavior.
+
+After checking the release provenance commit's ancestry, the workflow checks for
+`.axiom/corpus-locks/` in the corpus checkout. When it is absent, the workflow
+logs a skip and preserves the existing behavior for pre-switch corpus pins.
+When it is present, the pinned encoder must include `axiom-encode corpus-fetch`.
+The workflow runs that command outside the protected supervisor to place the
+pinned release's provisions before provisioning the supervisor or running its
+gates. It supplies the release object already acquired above. Audit the pinned
+command for its release, scope-lock, size and SHA-256 checks before adoption.
+
+Every validate shard acquires the same release at the same time, and both
+acquisitions retry transient failures. The release object download retries any
+failure with `curl --retry 5 --retry-all-errors --retry-max-time 600`: up to
+five more tries while less than 600 seconds have passed since the first (curl
+checks before its wait, so a last try can start a few seconds later), with a
+delay of 3 to 7 seconds (drawn per run) between them. Each try is bounded so a
+stalled one cannot use up that window: `--speed-limit 1024 --speed-time 30`
+abandons a try whose speed, which curl averages over up to the last five
+seconds, stays under 1 KiB/s for 30 seconds, and `--max-time 180` ends any try
+after 180 seconds. A try that stalled until the connection reset after several
+minutes used to leave no retry. curl also honours a server's `Retry-After` on
+HTTP 408, 429, 500, 502, 503 and 504, and stops retrying when that wait would
+pass the 600-second limit. It writes only with `--output`, so curl discards a
+failed partial transfer before it tries again, and the content-address check
+still decides. The protected-base audit fetches its release with the same
+flags. Provisions placement reads `corpus-fetch --json` and runs it again, at
+most three runs in all, only after exit 1 in which every artifact that failed
+has a transient R2 reason (HTTP 408, 429 or 5xx, a failed request, a broken
+read), none names bytes that do not match the release, and the report lists no
+modified file (a report whose `failed`, `modified` or `skipped` is missing or
+not an object is final). A rerun places only what is still missing (a present
+file of the listed size counts as present) and verifies every byte it places.
+Before each rerun the step checkpoints what the failed run placed
+(`refresh-corpus`, or `refresh-base-corpus` for the protected base), because
+the source-integrity fingerprint covers `data/corpus`; a failed checkpoint or
+integrity check ends placement.
+
+For provisions available only in R2, configure read-only organization or
+repository secrets `R2_CORPUS_READ_ACCESS_KEY_ID` and
+`R2_CORPUS_READ_SECRET_ACCESS_KEY`, and pass them with `secrets: inherit` as in
+the example. The placement step exposes them as `R2_ACCESS_KEY_ID` and
+`R2_SECRET_ACCESS_KEY`. The external command determines supported retrieval
+sources and endpoints; verify its credential requirements at the adopted pin.
 
 Configure those protected roots as `AXIOM_ENCODE_APPLY_SIGNING_PUBLIC_KEY`,
 `AXIOM_ENCODE_EVAL_SIGNING_PUBLIC_KEY`, and
@@ -76,34 +125,348 @@ are deliberately not workflow-call inputs, so a caller change cannot replace
 its own verification roots.
 
 `known-validation-gaps.yaml` is mandatory and its exact bytes must hash to
-`validation_waiver_set_sha256`. On a pull request, the encoder's typed waiver
-audit compares it with the protected base revision and rejects any new or
-broadened waiver; entries may only be removed. A toolchain or caller-workflow
-change runs full RuleSpec validation so a release or waiver-set change cannot
-hide behind changed-file selection.
+`validation_waiver_set_sha256`. On a pull request, the workflow invokes the
+pinned encoder's typed waiver audit with the protected base revision. Audit
+that command for rejection of new or broadened waivers. Pin-only updates require
+full RuleSpec revalidation; the acceptance checklist specifies the hosted
+evidence to retain at the exact adopted validator SHA.
 
-The workflow rejects singular rule roots, separate parameter or test fixture
-files, YAML fixtures under `tests/`, non-RuleSpec YAML outside the approved
-roots, obsolete generated formula artifacts, manual RuleSpec YAML edits without
-an Ed25519-signed `axiom-encode --apply` manifest, and unclassified PolicyEngine
-oracle coverage. New executable outputs must either have
-an exact PolicyEngine mapping or a harness-side `not_comparable` classification
-with a rationale.
+### Exact rollback rewind
 
-The guard also rejects a `backend: manual` apply manifest that introduces a
-*new* rule file unless it declares `manual_exception: composition | repair |
-fixtures | <issue-ref>`. Net-new statutory encoding must come from an encoder
-run; hand-authoring stays legal only for composition/oracle plumbing,
-validator-driven repairs, and fixtures, and only by declaring itself. Attest
-encoder output committed outside the `--apply` flow with `axiom-encode
-sign-applied-files` (add `--manual-exception` for new files, or `--all` to
-backfill a corpus that has no manifests). `axiom-encode manifest-census`
-reports each repo's encoder-generated / manual / unmanifested coverage.
+For `pull_request`, `push`, `schedule`, and `workflow_dispatch`, the workflow can
+rewind its comparison base when the entire checked-out tree exactly returns to
+a merged PR landing on the default branch within the preceding 20 first-parent
+commits. Call the matching earlier commit X and the ordinary comparison base B.
+The reverted window must contain only modifications to RuleSpec modules, any
+`.json` under `.axiom/encoding-manifests/`, `known-validation-gaps.yaml`, and the
+waiver ledger digest in `.axiom/toolchain.toml`. Each added, removed, or changed
+ledger key must name a module changed in that same transition and, for the net
+diff, across X..B. Manifest signing-key equality is checked between X and B only.
 
-Set `guard-programs-root: true` on the caller to require manifests on the
-composed-pilot `programs/` root too (default `false`). Enable it per repo only
-after every existing `programs/` file has a manifest or manual attestation,
-otherwise the guard fails on the backlog.
+Partial reverts, extra edits, additions, deletions, renames, changes outside that
+allowlist, other toolchain changes, and unrelated waiver revocations keep the
+ordinary base. Unavailable history or PR metadata and unsupported events also
+keep the ordinary base. Callers must grant `pull-requests: read` alongside
+`contents: read`, as shown above, so the proof can verify the historical PR
+landing. If that lookup is denied, the proof keeps the ordinary base.
+
+Real revert windows touching companion `.test.yaml` files, test files, or file
+additions fall back to the ordinary base today. Admitting those windows is the
+planned next step.
+
+An admitted rewind changes only the freeze, waiver ratchets, supervised audit
+baseline, and generated guard comparisons. Selection and the audit's changed
+paths still use the ordinary base, so restored modules are revalidated and
+expired waivers still fail in callers' pinned supervised audit. The shared CI
+expiry regression is skipped without an encoder loader; setting
+`AXIOM_ENCODE_SOURCE` to the pinned encoder's loader enables that regression.
+
+The local precheck also keeps the ordinary base, because it runs without the
+proof. It repeats only the tree search: when the head's tree exactly matches the
+base or one of those 20 first-parent ancestors, a manifest at the mirrored path
+covers a module it does not list, and the supervised guard decides the rollback.
+A stale digest or a module with no manifest still fails the precheck, even in a
+rollback the proof admits.
+
+Ledger parses are cached by immutable blob ID within each proof run. The proof
+job has a 15-minute timeout: the review's 20-PR merge window with 80 transitions
+took 110.5 seconds before caching, so this budget allows over eight times that
+runtime for slower runners. Side-branch history can be larger, so this is an
+operational budget rather than a guaranteed runtime bound. A timeout never
+admits a rewind: it fails the proof job, skips dependent validation, and makes
+the aggregate check fail.
+
+### Import-aware PR selection
+
+The `import-aware-selection` input defaults to `false`. With automatic roots,
+opted-in pull requests select changed jurisdictions and transitive importers
+from both base and head trees. Import evidence on any encoder-supported proof
+kind (including `parameter`) creates the same dependency edge as `kind: import`.
+This includes self imports, companion tests and nested metadata; source evidence
+may coexist with import evidence. Null-valued floating-point mapping keys from
+unquoted commas in descriptive flow mappings name no dependency and are ignored;
+all mapping values are still scanned for import evidence.
+
+The selector also runs the pinned encoder's raw import matching logic on each
+original module blob. This preserves effective imports embedded in YAML scalar
+text, including summaries and proof evidence, sequence and mapping forms, and
+indentless sequences. Noncanonical references use the owning module's opacity
+fallback and retain its reverse consumers.
+
+Every ProgramSpec addition, edit, deletion or rename selects all legs with full
+atomic and companion targets. A dependency closure reaching an unchanged
+ProgramSpec does the same: validating a composition executes the whole owning
+program, including other scoped inputs reached through imports. The pinned
+composer loads all YAML modules in its configured roots before narrowing scope,
+so known composition modules are always seeded on nonempty diffs, together with
+their reverse consumers. Strictly unreadable modules already receive the same
+containment. These conservative rules cover ownership conflicts and unrelated
+corpus-load failures. Opted-in toolchain changes also select full targets,
+including corpus-only release changes that can alter source and proof grounding
+without an atomic module edit. Nested toolchain paths also require full targets:
+an added configuration can make unchanged modules fail ancestor admission.
+
+Source-relation targets also create edges, including `restates` records without
+imports, and every `basis.delegation` reference. All five relation types
+(`amends`, `delegates`, `implements`, `restates`, `sets`) retain their targets.
+Resolution follows the pinned encoder's canonical jurisdiction and atomic-root
+parser: trim outer whitespace/quotes and append `.yaml` unless already present.
+Unresolved or unsupported references are contained to their owning module.
+Scalar `derived_relation.source_relation` references also create direct edges.
+Absolute references in companion input/output/table keys and deferred-output
+`blocked_by` references also create edges. These compose transitively with imports.
+A bare proof-import symbol such as `reciprocal_japan_duty_rate` names no file;
+the encoder skips it in its hash check, so it creates no edge or opacity. The
+tariff overlay's active waiver continues to have its existing global effect
+when a change reaches that overlay.
+At selector ref `37eaac2af`, the builder-reported minimal bare-overlay regression
+selects just `us` for an unrelated federal tariff edit. Its real-tree changed-path
+probe at rulespec-us `d8511cca76b060e40fba90ae8af7f7643e6edf11` for the
+federal `china-301/list-1-9903-88-03` overlay selects 52 legs with full
+targets: another module, `us/regulations/42-cfr/457/344.yaml`, has the unresolved
+target `us:regulation/42/457/344` and is named by shared validation evidence.
+Its required containment causes global selection; the tariff overlay is no
+longer opaque. This probe substitutes a changed path against identical trees;
+it is separate from the exact-pair historical replay.
+
+Sibling dependencies cover additions, removals, renames and content edits.
+The encoder's section is wider than the immediate directory: statutes use
+title/section, CFR regulations use CFR-title/part/section, and other regulations
+use title/section, including all descendants and the section-root module.
+Immediate siblings also share exported-name checks, and child modules feed
+ancestor-module checks under every atomic root. Synthetic group nodes preserve
+these dependencies without building a quadratic graph. Statute membership
+changes additionally revalidate every local numeric-title statutory module:
+cross-section definition and placeholder checks can infer references from text
+and depend on the existence of a previously absent section. Executable rules
+with matching names create conservative upstream edges within a jurisdiction
+and from its ancestor jurisdictions, covering the encoder's duplicate-rule
+signature check.
+If strict parsing hides a provider's exported names, its containment also
+reaches every possible executable-name consumer in its jurisdiction and
+descendant jurisdictions. This covers duplicate-key documents that the
+encoder's permissive name index can still read.
+
+These rules mirror axiom-encode `5ddb5ea4`,
+`src/axiom_encode/harness/validator_pipeline.py`: source targets at 33645/33705,
+companion references at 34636, blockers at 35272, same-section boundaries at
+30164, sibling names at 30322, child checks at 30689/32399, descendant terms at
+38538, inferred section existence at 37909/38085/39805, executable-name
+indexing at 21087/21192, and bare proof imports at 26564. Delegation resolution
+uses the same target parser through `src/axiom_encode/cli.py:37548/37634`.
+
+Shared validation records also create dependencies. The keys under
+`known-validation-gaps.yaml:validate_failures` and the `modules` keys in
+`.axiom/pending-validation-fingerprints.json` and
+`.axiom/target-validation-passes.json` refer to atomic modules. References are
+unioned across base and head. A change to a referenced module, or a transitive
+provider of that module, requires every leg with full atomic targets. Changes
+to these shared files also require full targets. Missing, malformed or ambiguous
+shared references use the global fallback because their consumers cannot be
+attributed safely to one jurisdiction. These rules preserve historical
+whole-ledger checks and the compatibility audit for older encoders, even when
+the shared file itself is unchanged.
+
+The round-5 builder-reported census at selector ref `37eaac2af` and rulespec-us
+`d8511cca76b060e40fba90ae8af7f7643e6edf11` found 3,607 of 4,879 atomic modules
+(73.9%) directly named by the union of shared validation records. A change
+to any of them therefore requires all 52 legs with full targets; transitive
+dependencies can increase that cost. Per-leg partitioning is separate work.
+
+Repository tests and other first-leg gates run on the first selected leg; their
+coverage moves with that leg. Omitting their historical hosting leg does not
+omit those checks.
+
+Unchanged affected importers receive full atomic validation in their selected
+legs. Unknown proof kinds, unsupported dependency shapes, malformed YAML,
+duplicate keys, and unresolved imports inside a uniquely owned atomic module
+or its companion are contained to that module. The module is treated as
+depending on everything: every nonempty change selects its jurisdiction leg
+with full atomic targets, even when the opaque module itself changed. Its known
+reverse dependents are also selected transitively. Opacity and known edges are
+unioned across both trees, so a head-only repair cannot erase base-tree risk.
+Each distinct file/reason emits `contained=path: reason` once per selection.
+Once an opaque module is known to reach a shared validation consumer, analysis
+can stop with every leg and full targets. Contained diagnostics describe the
+inputs visited before that sufficient global witness was found.
+
+For module-owned import evidence, an unsupported shape hides dependencies of
+that importer. Selecting it on every change covers those dependencies. Seeding
+it into reverse traversal also preserves every known consumer; other opaque
+consumers are always seeded too. If closure reaches a shared validation record,
+selection expands to all legs with full targets.
+Ownership ambiguity, orphan companions, shared/root paths, toolchain and
+workflow changes, and failures that cannot be attributed to a single module
+retain global full selection. Graph-read and program-ownership failures still
+use full targets globally. Every shared/root fallback now expands atomic and
+companion targets as well as the matrix. Any nonregular tracked entry in either
+tree also requires full targets, including symlinks under derived index paths:
+the encoder's checkout admission reads beyond the module graph. Regular
+index-only metadata retains its existing target behavior.
+Mixed-country roots and non-UTF-8 tracked names also use full targets, covering
+the engine's country/name admission checks. The invalid-name fallback
+conservatively includes derived index paths.
+Revalidated importer legs also run the
+stricter changed-file oracle-coverage check over every atomic module in the
+leg.
+
+Full-matrix selections report specific reasons. The import-aware classifier logs
+`scope=full (...)` for uncontained graph failures, shared/root paths, toolchain or ledger
+changes, index-only diffs, and a modeled dependency closure covering every
+jurisdiction. Shared paths, ledger/digest and audit-manifest changes require all
+legs with full targets. This input remains disabled unless a caller opts in.
+The default selector remains unchanged; [TheAxiomFoundation/.github#140](https://github.com/TheAxiomFoundation/.github/issues/140)
+tracks the corresponding dependency gap in that path.
+
+Before a caller opts in, its waiver audit must not land wholesale on the
+selected validation legs. Incremental, change-scoped waiver audit work is tracked
+in [TheAxiomFoundation/axiom-encode#1867](https://github.com/TheAxiomFoundation/axiom-encode/pull/1867).
+Until the caller adopts it, selecting fewer legs can concentrate the entire
+audit on one leg. If audit work instead uses separate partitions, require
+exhaustive, disjoint coverage independent of the selected validation matrix and
+include every audit partition in the aggregate required `validate` check.
+
+A successful replay on that caller within the existing timeouts is required
+before opt-in. Compare selected and full validation on the same base/head
+revisions and pinned inputs; require that selection misses no deterministic
+validation failure and preserves global gates and exhaustive waiver coverage.
+Keep the input disabled until both the audit prerequisite and replay are met.
+Historical replays at round-4 ref `bcae0f3` and round-5 ref `37eaac2af` each
+executed all 53 exact pairs with no omitted recorded failures. These are
+builder-reported executions whose retained workflow hashes match those refs.
+Every pair selected all 52 legs with full targets: shared
+validation records and required containment cause global selection on this
+sample. It demonstrates no matrix reduction. Caller runtime and audit
+prerequisites remain necessary before opt-in.
+
+The round-5 scanner's conclusion that remaining summary references were always
+prose was refuted by the independent review at `37eaac2af`: the pinned encoder
+recognizes raw `imports:` blocks inside YAML scalars, including `module.summary`.
+That review also demonstrated a ProgramSpec ownership dependency omitted by
+the selector. Historical replay and scanner counts do not establish completeness
+over those accepted input shapes.
+
+The round-6 source audit uses encoder `5ddb5ea4`, engine `89571cc2` and the
+encoder's pinned composer (its exact ref is retained in the audit), with selector
+candidate workflow SHA-256
+`28dc0e91f5666abdc3354a3a1b32181e16e35ca846ad73199a33c7f1ac2d1cb3`
+(parent `37eaac2af`). It enumerates 207 distinct source locations in 84 reader
+rows: 61 modeled edges, 17 containment, 55 global handling and 74 explicit scope
+exclusions. Those historical buckets did not prove correct target attribution:
+the review of `912e51205` found differences in six rows covering 13 cited
+locations, plus an executable-index containment gap in one row covering two
+locations. The former “unhandled: 0” conclusion is withdrawn. Another 49 in-memory YAML parsing sites
+are listed separately. The audited command is deterministic
+`validate --skip-reviewers` without an oracle, together with the workflow's
+shared ledger gates and the actual composer/engine readers. Fixed protected
+runtime inputs and inactive command branches have explicit scope reasons.
+The newly covered classes are raw scalar imports, program ownership and
+composition inputs, eager composer corpus loading, corpus/toolchain changes,
+and checkout admission. This source audit does not establish hosted timing.
+
+At that round-6 candidate, all eight workflow suites pass: 97 selector functions,
+44 other validation guards, terminal assertions, 13 lane tests and the seven
+remaining CI entrypoints. All 22 new fixtures and the extended 20-case generated
+property pass, with assertion-guarded red results at `37eaac2af`. The same 53
+historical exact pairs each select all 52 legs with full atomic targets, with
+zero misses in every class and no compute errors or missing-object skips.
+The emitted reasons are 13 direct shared-record dependencies, 17 shared-record
+closures, 20 toolchain changes and three ProgramSpec changes. This sample
+demonstrates no matrix reduction. Default-off passes 34/34 comparisons against
+`9282a7f69cbc82e6e2b8e8c923a00ff513e29969`: 522 raw byte comparisons,
+13,002 bytes and zero differences. Changed-workflow and repository-wide
+actionlint pass with zero diagnostics. These are local fixture and selection
+measurements; selected-versus-full hosted validation and runtime adoption
+checks remain necessary.
+
+Round 7 attributes imports to both paths used by encoder `5ddb5ea4`: the
+declared jurisdiction for prefix-preserving readers, and the importing
+jurisdiction after `_normalize_rulespec_import_path_static` removes the prefix.
+The local lookup appends `.yaml` to the entire normalized reference, tries the
+jurisdiction root, then the importing file's parent. Both local and prefixed
+forms use this lookup; directory-valued file candidates contain the owner.
+Consumer section groups stem components once, while provider directory
+ancestors retain their literal spelling. Nested-statutes fallbacks contain
+their owner. The executable-index scanner walks tuples (`!!omap`, `!!pairs`),
+sets (`!!set`) and mapping keys, flags integers above 4,096 bits, and bounds
+the composed node graph before merge flattening; flagged providers reach every
+module of their jurisdiction and its descendants. A file with a byte-order
+mark after its first character is refused as unreadable: libyaml skips U+FEFF
+at the start of any line, while the encoder's pure-Python parser keeps it, so
+the same bytes can load as two different payloads. That can hide a hazard or a
+consumer's own import, companion key or waiver. A refused module gets the
+unreadable-module containment, and a refused ledger or ProgramSpec fails closed
+to a full selection.
+
+At the final round-7 candidate based on `912e51205828b526b9976d0fb50795c2408ce044`
+(workflow SHA-256 `972d79dcd1a9d66d6045ed75af911d48213f86a2bf838db02c9aa1076c650d1a`), which also contains executable
+providers whose formula-only versions normalize to commas (the encoder's
+`_numeric_rule_value` then raises), the executed encoder probes show
+0 misses among the index-hazard probes (9 at `912e51205`). The same 53 exact ordered pairs each select
+all 52 legs with full targets; misses are (a) 0, (b) 0, (c) 0 and unclassified
+0, with no compute errors or missing objects. Local selector time totals
+98.345 seconds. Rounds 8 and 9 add only the byte-order-mark rule above (round 9: workflow SHA-256 `da7246aff925b0abeb092109ef42f8b595100135807992bd84abc8256a0927b4`); a fourth independent review measured the encoder's call depth at its index parse at about 20 frames, well inside the property's 300-frame budget. The reasons are 13 direct shared-record dependencies,
+17 shared-record closures, 20 toolchain changes and 3 ProgramSpec changes.
+Default-off passes 34/34 comparisons with 0 differences, and actionlint reports zero
+diagnostics. This selection replay demonstrates no matrix reduction and does
+not execute hosted validators or establish runtime adoption results.
+
+Measure the real `Compute validation shards` step during that replay, including
+both git trees, with the timing harness (Python with PyYAML and Bash 4+ required):
+
+```sh
+python3 scripts/benchmark_rulespec_selector.py \
+  --repo ../rulespec-us --base BASE_SHA --head HEAD_SHA --bash bash \
+  -o .hub-scratch/rulespec-us-selector-timing.json
+```
+
+The harness leaves the target checkout untouched and records elapsed seconds,
+outputs, and fallback diagnostics. Retain its report alongside the selected/full
+validation comparison and verify that the complete `shards` job fits its
+10-minute timeout.
+
+The workflow checks repository layout and runs the pinned encoder's generated
+content and PolicyEngine oracle-coverage gates. The local precheck requires a
+tracked manifest's `applied_files` to record each changed atomic module in its
+roots. A manifest at the mirrored path that does not list the module gives it no
+coverage, except in the exact restoration of an earlier tree that
+[Exact rollback rewind](#exact-rollback-rewind) describes. Manifest signatures,
+manual exceptions and oracle classifications depend on the external encoder's
+implementation and must be audited at the adopted pin.
+
+The shared workflow invokes the pinned encoder's supervised `guard-generated`
+command. This checkout does not contain that encoder implementation, its
+manifest producer, or historical execution evidence. Before adoption, audit
+the exact encoder SHA for its manifest, signature, manual-exception and
+retirement behavior, and retain the code references and test results.
+
+`programs/` holds axiom-compose ProgramSpecs, which are assembled rather than
+encoded. The local validator's default precheck shape-checks them instead of
+requiring encoding manifests. Every changed `programs/` file, `.test.yaml`
+included, must have the ProgramSpec shape:
+
+- only ProgramSpec keys, and a `program` of `<jurisdiction>/<name>...`;
+- import scope keys `federal`, `state` or a jurisdiction, with at least one
+  import entry;
+- every import entry resolves using the local precheck's search order: the
+  checkout's own prefix at the root then under `<prefix>/`, any other prefix
+  under `rulespec-<prefix>/` then `<prefix>/`, to an existing regular-file
+  encoded module at the local precheck's allowed depth (`<root>/...` or
+  `<jurisdiction>/<root>/...`), with no symlink on the way. Callers on other
+  compose or engine pins must confirm their resolution order matches;
+- known compose patterns, and plain-identifier or date rule metadata;
+- no quotes or backslashes, and no numeric literals other than 0, 1 and 12,
+  in any other transformation value (`#` comments are ignored).
+
+This is a lexical tripwire. It catches a hand-written module or a literal
+amount, but arithmetic on the allowed literals is not prevented, so review
+still owns ProgramSpec formulas. Setting `guard-programs-root: true` also
+requires a tracked encoding manifest for each changed `programs/` file.
+That legacy check verifies no signature. A manifest at the mirrored path
+suffices when no manifest lists the file. Once one does, the content must match
+a digest listed for it, unless one of those reads `deleted`. This repository
+supplies no ProgramSpec manifest producer. Confirm an external producer's
+supported inputs and audited revision before enabling that optional check.
 
 Repos can opt into stricter structure checks by adding
 `.axiom/repository-structure.yaml`. When present, the reusable workflow treats it
@@ -139,6 +502,397 @@ path_rules:
   - patterns: ["tests/**"]
     allow_extensions: [".py"]
 ```
+
+### Base-anchored encoder guard
+
+The enforcement point is an **organization ruleset** using
+**Require workflows to pass before merging**, not a required status-check name. Adopt
+[rulesets/rulespec-encoder-guard.json](rulesets/rulespec-encoder-guard.json)
+after this workflow merges: replace its **40-zero release placeholder** in
+`sha` with the full 40-character commit SHA containing the reviewed workflow.
+The JSON records repository ID `1146671719`,
+`.github/workflows/encoder-guard.yml`, and that immutable source SHA. Adopters
+must verify the ID identifies the intended source repository and confirm its
+visibility and workflow access. The template sets enforcement to active, has
+no bypass actors, and targets the default branch of every
+`rulespec-*` repository except `rulespec-graph-viewer`. The placeholder cannot
+resolve; this file is an adoption definition, not evidence of an applied
+organization setting. Its `do_not_enforce_on_create: true` permits repository
+initialization before a required workflow can run. Complete the adoption
+checklist below before applying it. See GitHub's
+[required-workflow rule](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#require-workflows-to-pass-before-merging)
+and [ruleset API schema](https://docs.github.com/en/rest/orgs/rules#create-an-organization-repository-ruleset).
+
+A RuleSpec PR cannot edit, delete, or impersonate that pinned workflow through
+its own workflow files. GitHub records the required workflow's run conclusion
+in the target repository; the ruleset requires that workflow identity. A job
+named `encoder-guard / guard` is insufficient: required status checks do not
+identify their workflow or event. Keep the existing validator enabled for its
+additional checks. The [caller template](workflow-templates/encoder-guard-caller.yml)
+is optional and only provides local visibility. If installed, replace its
+separate release placeholder with the same full SHA. It is not an enforcement
+point. See GitHub's
+[status-check matching documentation](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules#troubleshooting-required-status-checks).
+
+**Branch freshness is a mandatory companion policy on every targeted repository.**
+Pair this workflow ruleset with branch protection that enables
+**Require branches to be up to date before merging** (strict required status
+checks), or require a merge queue whose actual **group head** this guard
+evaluates. A workflow pass records the event's base, so a pass against an
+older base must not authorize a later merge after that base advances.
+The workflow rule's JSON has no branch-freshness parameter; requiring this
+workflow alone does not supply strictness. Configure the companion policy
+separately. See GitHub's [strict branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)
+and [merge queue rule](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#require-merge-queue).
+
+The workflow declares `pull_request`, `pull_request_target`, and `merge_group`,
+without branch or path filters. PR activity types include `edited` for
+retargeting, along with `opened`, `synchronize`, `reopened`, and
+`ready_for_review`; merge groups use `checks_requested`. **GitHub currently
+ignores event filters, including `types`, for ruleset workflows** and runs
+only the default PR activities (`opened`, `synchronize`, `reopened`) and
+`merge_group.checks_requested`. Thus declaring `edited` enables ordinary
+workflow/caller runs but does not guarantee a fresh ruleset run after
+retargeting. After changing a PR's base, push/update its branch or close and
+reopen it to obtain a fresh required-workflow run against the current base.
+This operational step is not enforced by the ruleset JSON. A base-branch push
+also does not guarantee a PR `synchronize` event, which describes a head update.
+The hosted acceptance test below must verify merge acceptance after both
+retargeting and base advancement. Local tests verify payload handling, not
+GitHub's merge decision. See
+[supported ruleset events](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers).
+
+The check uses the event payload's exact PR `base.sha` / `head.sha`, or merge
+group's `base_sha` / `head_sha`. It ignores mutable refs, `GITHUB_SHA`, and the
+previous base in `changes` on an edited event. Manifest inventory comes from
+the proposed **merge result**, not the candidate head alone: use the event's
+test merge commit only when its parents are the exact base and head, or compute
+the merge in a scratch index from Git objects only. Merge groups use their
+actual group head and require the event base to be its ancestor. Conflicts
+fail the guard.
+
+The guard also protects the repository's validation pins. It reads regular Git
+blobs from that exact event base and proposed merge result. When
+`.axiom/workflow-toolchain.toml` is present, it parses the complete
+`[workflow_toolchain]` table, including the encoder and other validation pins.
+Otherwise it reads literal validation ref inputs, including `axiom-encode-ref`,
+from `.github/workflows/repository-checks.yml` or its `.yaml` counterpart. It
+compares the pin source, the full table, and the entire `.github/workflows/` Git
+tree, including each entry's mode, type and object ID. Every workflow addition,
+edit, move or deletion is therefore a configuration change, including another
+caller of the shared validator. Malformed or nonregular TOML and invalid literal
+pins fail closed. Candidate caller YAML is inspected as restricted data;
+workflow expressions and head code are never executed to discover callers.
+
+Every PR to a targeted repository must retain an operative shared-validator call in the canonical
+`repository-checks.yml` or `.yaml` caller, with all four binding inputs.
+The guard rejects a local stub, caller rename, conditional validation job,
+missing binding input, or disabled generated guard even in a configuration-only
+PR. A table cannot replace this operative call. A changed validator pin must
+advance along this source repository's first-parent `main` history: older
+commits and commits from merged side branches are rejected. The selected
+validator source must contain the isolated effective-input binding check.
+Adoption therefore requires a binding-capable shared validator on the protected
+base; the guard does not supply that check to old shared-validator revisions.
+Canonical caller updates preserve the protected caller's remaining bytes;
+only admitted validator and binding pin scalars may change. Admitted pin lines
+must contain printable ASCII and end with a newline; the validator applies the
+same strict caller loading rules. This prevents control characters or
+unrelated helper edits from disabling workflow loading.
+Adoption must start from a tested, valid canonical caller. Initial caller
+establishment uses the guard's supported minimal direct-call form.
+
+Native events in `TheAxiomFoundation/.github`, which the ruleset excludes,
+omit only this caller requirement when the complete proposed tree contains no
+validation content or provenance and no canonical caller or workflow-toolchain
+TOML exists now or anywhere in protected history. Manifest checks still run.
+
+The history scan includes merged branches; shallow or unreadable history fails
+closed. Once TOML has appeared, it must remain a regular blob. An isolated move
+between the canonical extensions is supported while retaining the operative
+call. An initial PR must establish that call; repository creation retains the
+ruleset's separate `do_not_enforce_on_create` behavior. Restore missing
+established sources on the protected branch before adoption.
+
+**Pin changes must be their own pull request.** A pin source, pin value, or
+workflow-tree change cannot share a PR with any changed content under
+`statutes/`, `regulations/`, `policies/`, `legislation/`, or `programs/`, at the
+top level or under a jurisdiction. This also covers encoding manifests and
+other provenance receipts: the guard conservatively protects all root or
+jurisdiction-root `.axiom/` metadata except `workflow-toolchain.toml` and
+`toolchain.toml`, plus `known-validation-gaps.yaml` evidence. Workflow entries are
+compared by exact object identity, so cosmetic workflow edits must also be isolated
+from these content changes. Pin-only PRs and module-only PRs with unchanged pins
+pass this isolation check, subject to the existing manifest checks. ProgramSpecs
+retain their manifest exemption below, but their content changes must still be
+separate from pin changes.
+
+The shared validator also checks the effective inputs before acquiring toolchain
+dependencies. Encoder, rules-engine, corpus and canonical RuleSpec dependency
+refs must equal the protected configuration, read from the exact PR or merge
+group base rather than candidate files. A caller script, reusable-workflow input
+default or environment pin cannot select a different SHA. Older tables may
+obtain missing dependency refs from unambiguous literal inputs in the trusted
+canonical caller. A nonempty composer input requires a matching protected TOML
+pin. When that pin is staged but inactive, omission requires the actual canonical
+caller to invoke the validator directly and omit composer in its protected YAML.
+Opaque reusable-workflow wrappers fail closed for that compatibility case.
+The caller identity comes from GitHub's inherited workflow context; retain
+hosted evidence that this context identifies the intended caller. See
+[reusable workflow context](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#github-context).
+Callers must pin a shared validator revision containing this check. It adds no
+encoder command requirement for older encoder pins.
+
+Content-free updates limited to the workflow-toolchain table, canonical
+caller and `.axiom/toolchain.toml` release/waiver metadata may supply either
+the base or proposed inputs. The shared validator
+reads the proposed configuration from the exact event commit's Git objects,
+checks the effective inputs, and passes the resolved proposed refs to dependency
+checkout and every later consumer. Content or helper changes retain exact
+protected-base binding when dependency refs are unchanged. Dependency-ref
+updates accompanied by docs, helpers or other files outside the admitted
+configuration paths are rejected even when they supply base inputs. A change
+to an encoder, engine, corpus, composer,
+RuleSpec dependency or shared-validator ref selects `full-toolchain-bump`,
+revalidating every module and companion at the proposed pins before merge.
+A workflow edit that changes no dependency ref keeps changed-file selection.
+Changes to the release or waiver-digest toolchain metadata may still require
+full module validation without enabling the whole-repository manifest audit.
+The whole-repository generated-content audit is a ratchet: run supervised
+`guard-generated --all` against the protected base with its pins and the
+proposed tree with its pins, reject issues present only at the proposed tree,
+and report inherited issues as information. Missing legacy manifests or stale
+waiver digests therefore do not alone block an unchanged-content validator
+adoption PR. The guard admits a producer other than the pin only by proving its
+ancestry on official main, read from the encoder checkout's fetch record, so the
+base encoder clone receives the proposed encoder checkout's record of the
+authenticated main fetch; without it the base audit reports every such
+producer as unprovable and an inherited producer issue reads as new at the
+proposed tree. This audit does not excuse a newly introduced issue or replace
+module validation. Staged inactive composer pins remain inactive for older
+encoder callers. Local fixtures exercise this comparison; they do not establish
+the external encoder's manifest-admission policy on complete live repositories.
+
+The Python/pip installation steps clear ambient Python import settings and use
+isolated imports and pip configuration. Encoder installation uses authenticated
+source copies outside the candidate checkout. The composer setup disables the
+setup-uv cache and uses the runner's temporary working directory; composer
+packages install without a cache. Integrity checks cover authenticated
+dependency sources, staged encoder packages, and both staged and copied
+composer runtime packages before consuming steps, including supervisor build
+and provisioning. A changed HEAD is not required
+to detect source drift. Local regressions test candidate `pip.py` exclusion,
+source and runtime drift rejection, and cache configuration. These checks do
+not provide filesystem isolation for every installer or later candidate test.
+
+Module selection compares the exact event base with the proposed merge result,
+so candidate edits are checked at their final paths after any base-side rename,
+and base-only changes are outside that diff. Three-dot comparison of base and
+candidate head separately selects manifest removals and same-change receipts.
+Added, modified, type-changed and renamed `.yaml` or `.yml` modules under
+`<jurisdiction>/(statutes|regulations|policies|legislation)/` require a regular
+manifest blob in that merge result; top-level module roots are covered too.
+For `us/statutes/title/foo.yaml`, any of these mirrors counts:
+
+- `.axiom/encoding-manifests/us/statutes/title/foo.json`
+- `.axiom/encoding-manifests/statutes/title/foo.json`
+- `us/.axiom/encoding-manifests/statutes/title/foo.json`
+
+Existing tracked manifests count as well as newly changed ones. This presence
+check exempts companion `.test.yaml` and `.test.yml` files and `/composed/`
+pipelines. ProgramSpecs are excluded from the supervised generated guard.
+The validator's separate ProgramSpec precheck includes companion files under
+`programs/`; it checks their shape too. As in its default precheck,
+shape-checked ProgramSpecs are assembled content outside the atomic RuleSpec
+manifest gate; no manifest is required by this guard. Keep that validator
+enabled to enforce the shape contract.
+
+A change that deletes or renames away a manifest whose atomic module still
+exists in the merge result is rejected. A retirement receipt cannot excuse a
+surviving module. Removing a manifest with its module requires that module to
+be deleted in the same candidate diff, absent from the merge result, and named
+in a changed regular JSON encoding manifest's `applied_files` with
+`sha256: "deleted"`. Receipt paths are relative to the checkout root or their
+jurisdiction-root manifest location. This presence check does not authenticate
+the receipt's signature or content. Checkout-root and jurisdiction-root
+`.axiom/` metadata is outside module roots. There is no exception file.
+This guard checks object presence and removal consistency; the existing
+validator invokes the external supervised `guard-generated` implementation.
+Audit that implementation at the pinned encoder revision for its signature,
+module-hash and retirement-receipt verification contract. This checkout alone
+does not establish its complete protected-root scope or the absence of an
+external ProgramSpec producer. See the existing
+[validator implementation](.github/workflows/validate-rulespec.yml).
+
+The guard and optional caller grant only `contents: read`, declare no secrets,
+and use no `secrets: inherit`. The ruleset pins the workflow source; checkout
+explicitly selects the target event's `github.repository` and validated base
+SHA, rather than this shared repository or a PR merge ref. The event's built-in
+`github.token` is limited to read-only repository contents; unspecified token
+permissions are disabled. A SHA-pinned checkout action checks out only the base
+commit and does not persist credentials. A transient authenticated fetch obtains the head Git
+objects, failing the guard if they are unavailable, and the event's merge commit
+best effort: an unavailable merge is treated as absent and the merge is computed. Actions reports the job conclusion without
+granting the job `checks: write`. Isolated Python and hardened Git object queries execute no
+head code or configuration and install no packages. See
+[checkout's repository/token defaults](https://github.com/actions/checkout#usage),
+[token permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions),
+and [event SHA/ref semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
+
+Merge-group payloads are supported regardless of current repository queue
+settings. Local fixtures test workflow code against Git objects and event
+payloads. They do not establish hosted merge enforcement, organization-wide
+settings, or external encoder behavior; record the audited revision and hosted
+acceptance evidence separately before adoption.
+
+#### ADOPTION CHECKLIST
+
+Complete and retain the evidence for every item **before the ruleset is applied
+to production repositories**. Settings inspection and hosted acceptance are
+adoption work; passing local fixtures does not complete these items.
+
+For an existing repository, open and merge these PRs in order before enabling
+the ruleset:
+
+1. If its protected base lacks a valid canonical caller or trusted pin source,
+   open a configuration-only prerequisite PR to establish or repair
+   `repository-checks.yml` (or `.yaml`) and any existing workflow-toolchain
+   TOML. Preserve the current dependency pins. Repositories with a valid caller
+   and trusted pins skip this PR.
+2. Open a configuration-only validator-adoption PR that changes the canonical
+   shared-validator `uses:` SHA to the reviewed, binding-capable release on
+   first-parent `main`, updating the TOML `shared_workflow_ref` mirror in the
+   same PR when present. Keep the encoder, engine, corpus, composer and RuleSpec
+   dependency pins unchanged. In particular, NZ and UK move from validator
+   `842c69d6` in this PR while retaining their current encoder pins. The
+   whole-repository audit compares base and proposed issues; inherited missing
+   manifests and stale waiver digests are informational. Merge only after the
+   validator and full module/companion checks pass.
+3. If local guard visibility is wanted, open a configuration-only PR adding
+   the optional guard caller pinned to the same reviewed release SHA. It does
+   not replace the organization ruleset. Skip this PR when no local caller is
+   wanted.
+
+After these PRs and the acceptance checks below, enable the pinned ruleset and
+its branch-freshness companion policy. Later dependency upgrades use their own
+configuration-only PRs. Manifest repairs and encoded content changes use
+separate content PRs after the relevant configuration PR has merged; an
+inherited audit issue is not a requirement to combine those repairs with the
+adoption PR.
+
+- [ ] Run a hosted acceptance test on a sandbox rulespec-style repository with
+  no caller workflow (caller-free). Pin the intended source workflow SHA and
+  confirm the required workflow runs and governs the merge decision. A module
+  change without a manifest must be blocked; a valid encoded change must pass.
+  Removing the optional guard caller and adding a counterfeit named job must
+  not bypass the pinned workflow identity. Separately replace the canonical
+  validator call with a successful named local job and attempt an older or
+  off-main validator pin; each configuration-only PR must be blocked. Repeat
+  a later manifested module/helper edit with each unsafe base in a disposable
+  sandbox and retain the hosted merge decisions.
+- [ ] Exercise the same-head retarget case in that sandbox: open against an
+  alternate base, retarget to the default branch, and verify that a prior pass
+  cannot authorize the newly guarded change. Confirm the supported head-update
+  or close/reopen step produces a required run bound to the new base. Do not
+  adopt if the retargeted PR can merge using its old result.
+- [ ] Exercise the base-advance case: let a candidate pass, independently
+  advance the base, and confirm the candidate cannot merge on the older pass.
+  Test deletion and rename of a manifest while its module survives, then rerun
+  the candidate against the new merge result and require rejection. Record
+  strict branch protection on every targeted repository, or the required
+  merge queue and a passing guard run on its actual group head.
+- [ ] Verify how the signed encoder workflows **create and update** RuleSpec
+  PRs, recording their workflow revision and credential type. Events created
+  with `GITHUB_TOKEN` **do not launch ruleset workflows**, so those PRs can
+  remain blocked without a required run. If needed, change the producer to a
+  narrowly scoped GitHub App installation token or suitable personal access
+  token for PR creation and updates, and repeat the sandbox acceptance test
+  with a real signed encoder PR. The producer workflows and credentials are
+  outside this checkout. See [ruleset workflow troubleshooting](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules#troubleshooting-ruleset-workflows).
+- [ ] Confirm source repository workflow access settings for cross-repository use,
+  including "Accessible from repositories" in this organization where
+  applicable, compatible source/target visibility, and target Actions policy
+  allowing the pinned actions. Confirm GitHub's cross-repository
+  `pull_request` prerequisite: a workflow conditional such as `if: true`, or
+  disabling the source workflow/Actions. Record which supported option was
+  tested. See [source-workflow prerequisites](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules#supported-directory)
+  and [workflow visibility/access](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#using-a-workflow-file).
+- [ ] Verify the template's repository ID against the intended source repository,
+  and retain its actual visibility and source workflow SHA. Establish regular
+  toolchain TOML or a supported literal canonical caller on the protected base
+  before upgrading validation; a candidate-only source cannot supply trusted
+  pins. Move every caller to an exact shared validator SHA implementing
+  protected-input binding before adopting the guard;
+  the guard alone cannot bind inputs passed to an older validator. Retain that
+  validator SHA. Audit the encoder at each adopted pin for its signature,
+  module-hash and retirement-receipt contract; local presence fixtures do not
+  establish those external checks.
+- [ ] Run a hosted effective-input rollback case with a manifested module edit:
+  leave the protected TOML and canonical caller unchanged, lower the supplied
+  encoder SHA through a helper script, a reusable-workflow input default, and
+  an environment pin, and require rejection for every route. Repeat for the
+  other protected toolchain inputs. Attempt a caller-only rename outside the
+  canonical paths without migrating to TOML and require rejection. Also test
+  an already-moved caller on the base followed by a PR that lowers its pin and
+  edits content; historical protection must reject that PR.
+  Retain both the required workflow and shared validator SHAs with the run
+  results and merge decisions.
+- [ ] Run an explicit pin-only full-revalidation case: change only a toolchain
+  pin while leaving unchanged modules and manifests in place. Exercise both a
+  literal caller update and a table-only update with base inputs. Confirm every
+  unchanged module and companion is selected at the proposed pin, and that
+  the whole-repository audit compares protected-base issues at base pins with
+  proposed-tree issues at proposed pins. Retain inherited missing-manifest and
+  stale-waiver-digest cases that pass, a jurisdiction-root-only manifest case,
+  and a newly introduced unmanifested module that fails. Also retain an
+  unchanged-content NZ/UK validator-adoption case with its encoder unchanged,
+  and a workflow edit with no changed dependency ref that keeps the ordinary
+  changed-file guard. After merge, confirm the full-push run uses the newly
+  protected pins and a later content PR retains protected-base binding.
+  Retain the exact validator SHA, selected target
+  inventories, issue reports and hosted outcomes.
+- [ ] Keep `do_not_enforce_on_create: true` and test repository initialization
+  in the sandbox; required workflows cannot run while a repository is being
+  initialized. Replace the zero-SHA placeholder only with the reviewed release
+  commit, refresh pre-existing PRs so their required workflows run, and retain
+  the acceptance results with that source SHA. See [creation behavior](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#targeting-specific-branches-with-your-ruleset-workflow).
+
+Run the Git fixture and workflow security tests with
+`python3 tests/test_encoder_guard_workflow.py`; they also run in the shared
+workflow test CI.
+
+### Run bounds
+
+Each `validate` matrix leg stops after 240 minutes. Within a leg, "Validate
+RuleSpec YAML" stops after 120 minutes, "Enforce validation waiver ratchet"
+after 210, and "Execute RuleSpec companion tests" after 60. One run starts
+at most 20 legs at a time. Check the organization's current concurrency limits
+before adoption. The legacy pending-safe workflow, which has no partitioned
+waiver ratchet, keeps a 180-minute leg limit.
+
+A leg that reaches a limit is stopped, and the aggregate `validate` check
+fails. Treat that as a hang to fix, not a limit to raise. The waiver ratchet
+is the one exception so far. Its run time depends on which leg the encoder's
+round-robin partition gives the expensive generated tariff chapters, and
+passing rulespec-us legs reached 149 minutes in October 2026. So its limit
+went from 150 to 210 minutes, and the leg's from 180 to 240, until the
+encoder hands audit modules to idle workers
+(TheAxiomFoundation/axiom-encode#2009). A caller gets these bounds only when
+it moves its pin to a workflow commit that has them.
+
+## Encoding lane registry
+
+The [live board](https://github.com/TheAxiomFoundation/.github/blob/lanes-registry/LANES.md)
+is generated every six hours on the `lanes-registry` branch. Edit the curated
+section of `LANES.md` on `main` by pull request. The registry workflow always
+reads its generator and curated content from `main`; a manual `workflow_dispatch`
+run creates the board branch if absent or updates it only when content changes.
+
+`python3 scripts/generate_lanes.py --check` validates the curated source and its
+preservation during rendering without fetching live data. To render a board
+locally, use `--output <board-path>`; add `--pending` for an offline seed board.
+Run `python3 scripts/test_generate_lanes.py` for the generator and publication
+tests (requires PyYAML, also run by the shared-workflow CI test script).
 
 ## Links
 
