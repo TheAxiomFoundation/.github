@@ -119,4 +119,4 @@ a repo is authoritative — current work lives in the repositories above.
 - https://axiom.org
 - hello@axiom.org
 
-**[Encoding lane registry](../LANES.md)** — live board of every jurisdiction lane: activity, release pins, owners, standing constraints. Auto-refreshed every 6h.
+**[Encoding lane registry](https://github.com/TheAxiomFoundation/.github/blob/lanes-registry/LANES.md)** — live board of every jurisdiction lane: activity, release pins, owners, standing constraints. Auto-refreshed every 6h.
