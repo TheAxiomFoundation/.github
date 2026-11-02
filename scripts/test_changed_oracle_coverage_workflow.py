@@ -26,6 +26,10 @@ Invariants checked for every generated scenario:
 * Push-gate parity (differential): when every module changed and every module
   was classified, the gate agrees with the whole-repository push gate
   (``--fail-on-unmapped --fail-on-untested-comparable``).
+* Legacy parity (differential): on the parent-workspace layout, where
+  validate-rulespec-legacy-pending-safe.yml keeps its ``<repo>/<path>`` keys,
+  the gate and the legacy filter pick the same items and reach the same
+  verdict for the statuses both handle alike.
 """
 
 from __future__ import annotations
@@ -82,6 +86,23 @@ GATE_SOURCE = heredoc_source(
 )
 GATE_CODE = compile(GATE_SOURCE, "<changed-oracle-coverage-gate>", "exec")
 
+# The legacy workflow keeps the parent-workspace root and its `<repo>/<path>`
+# keys. It is a second implementation of the same item attribution, so the
+# differential property below runs both on that layout.
+LEGACY_WORKFLOW = ROOT / ".github/workflows/validate-rulespec-legacy-pending-safe.yml"
+LEGACY_TEXT = LEGACY_WORKFLOW.read_text()
+LEGACY_STEP = LEGACY_TEXT[
+    LEGACY_TEXT.index(f"      - name: {STEP}\n") : LEGACY_TEXT.index("\n  validate-complete:")
+]
+LEGACY_CODE = compile(
+    heredoc_source(
+        LEGACY_STEP,
+        '          python - "$coverage_json" "$RULESPEC_FILE_LIST" <<\'PY\'',
+    ),
+    "<legacy-changed-oracle-coverage-filter>",
+    "exec",
+)
+
 
 @dataclass
 class Result:
@@ -128,6 +149,7 @@ def run_gate(
     root: Path | str | None,
     items: list[dict],
     changed: list[str],
+    code=GATE_CODE,
 ) -> Result:
     with tempfile.TemporaryDirectory() as scratch:
         coverage = Path(scratch) / "coverage.json"
@@ -145,7 +167,7 @@ def run_gate(
         status = 0
         try:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                exec(GATE_CODE, {"__name__": "__main__"})
+                exec(code, {"__name__": "__main__"})
         except SystemExit as exc:
             status = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
         finally:
@@ -471,6 +493,50 @@ def test_property_agrees_with_push_gate_when_everything_changed(scenario: dict) 
         workspace, root, items, changed = build(Path(temp), scenario, "exact")
         result = run_gate(workspace, root=root, items=items, changed=changed)
     assert (result.status == 1) == push_gate_fails(items), (scenario, result)
+
+
+# Statuses both filters treat alike: the legacy filter also refuses
+# pending_classification and incomplete_comparable, and it requires an item
+# for every changed file, so the generator keeps to the shared policy.
+SHARED_STATUSES = ("comparable", "unmapped", "known_not_comparable")
+shared_module_strategy = st.fixed_dictionaries(
+    {
+        "outputs": st.lists(
+            st.tuples(st.sampled_from(SHARED_STATUSES), st.booleans()), min_size=1, max_size=3
+        ),
+        "non_executable": st.integers(min_value=0, max_value=2),
+        "changed": st.booleans(),
+        "reported": st.just(True),
+    }
+)
+shared_scenario_strategy = st.fixed_dictionaries(
+    {
+        "modules": st.lists(shared_module_strategy, min_size=1, max_size=len(MODULE_POOL)),
+        "siblings": st.lists(output_strategy, max_size=3),
+    }
+)
+
+
+def test_legacy_filter_wiring_is_the_parent_root_layout() -> None:
+    assert '--root "$GITHUB_WORKSPACE/.."' in LEGACY_STEP
+    assert 'f"{repo}/{line.strip()}"' in LEGACY_STEP
+
+
+@settings(max_examples=100, deadline=None, database=None)
+@given(shared_scenario_strategy)
+def test_property_differential_against_the_legacy_parent_root_filter(scenario: dict) -> None:
+    """On the parent-root layout both filters pick the same items and verdict."""
+    with tempfile.TemporaryDirectory() as temp:
+        workspace, root, items, changed = build(Path(temp), scenario, "parent")
+        current = run_gate(workspace, root=root, items=items, changed=changed)
+        legacy = run_gate(workspace, root=root, items=items, changed=changed, code=LEGACY_CODE)
+    assert current.status == legacy.status, (scenario, current, legacy)
+    assert passed_outputs(current) == passed_outputs(legacy), (scenario, current, legacy)
+    assert sorted(current.stderr.splitlines()) == sorted(legacy.stderr.splitlines()), (
+        scenario,
+        current,
+        legacy,
+    )
 
 
 def main() -> None:
