@@ -465,9 +465,9 @@ included, must have the ProgramSpec shape:
   `12.0`, `1_2` and `0x1` are refused, in formula text and as YAML numbers (a
   YAML number counts only as a plain scalar). The one exception is the
   structural integers `arity`, `minimum_index` and `maximum_index`, which must
-  be positive and spelled in plain decimal. Compose writes the
-  `table_lookup_with_extension` bounds into that pattern's formula, so their
-  size is left to review.
+  be positive and spelled in plain decimal. The precheck leaves their size to
+  review; audit how the pinned composer writes the
+  `table_lookup_with_extension` bounds.
 
 This is a lexical tripwire. It catches a hand-written module or a literal
 amount, but arithmetic on the allowed literals is not prevented, so review
