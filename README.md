@@ -644,8 +644,17 @@ Callers must pin a shared validator revision containing this check. It adds no
 encoder command requirement for older encoder pins.
 
 Content-free updates limited to the workflow-toolchain table, canonical
-caller and `.axiom/toolchain.toml` release/waiver metadata may supply either
-the base or proposed inputs. The shared validator
+caller, `.axiom/toolchain.toml` release/waiver metadata and the
+`known-validation-gaps.yaml` waiver ledger may supply either the base or
+proposed inputs. The ledger belongs in that set because a pin move can make a
+module fail that a protected-base `pending` record staged, or make a module
+pass that an `active` record waives. The pinned encoder's waiver audit refuses
+an active record whose module passes, a pending record whose module fails, and
+the retirement of a record whose module still fails, so neither ledger edit can
+land before or after the move; it has to travel with it. The waiver ratchet
+limits that edit to exact consumption of protected-base pending records and
+retirements, and staging a pending record still takes a waiver-only PR.
+The shared validator
 reads the proposed configuration from the exact event commit's Git objects,
 checks the effective inputs, and passes the resolved proposed refs to dependency
 checkout and every later consumer. Content or helper changes retain exact

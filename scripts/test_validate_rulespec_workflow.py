@@ -5331,6 +5331,73 @@ def test_pin_changes_with_other_files_cannot_skip_proposed_pin_audit() -> None:
                 assert "dependency pin changes require a configuration-only change" in result.stderr, result.stderr
 
 
+WAIVER_LEDGER = "known-validation-gaps.yaml"
+# Every path a dependency pin change may touch; any other path must fail.
+PIN_CHANGE_PATHS = frozenset({WORKFLOW_TOOLCHAIN, VALIDATION_CALLER, ".axiom/toolchain.toml", WAIVER_LEDGER})
+
+
+def test_pin_change_may_carry_the_waiver_ledger() -> None:
+    """A re-pin consumes or retires the waivers that its own move affects."""
+    proposed = {**WORKFLOW_INPUT_PINS, "axiom_rules_engine_ref": "e" * 40}
+    for literal in (False, True):
+        for supplied in (proposed, WORKFLOW_INPUT_PINS):
+            with WorkflowInputFixture(
+                table=workflow_toolchain(WORKFLOW_INPUT_PINS),
+                caller=literal_pin_caller(WORKFLOW_INPUT_PINS),
+            ) as fixture, tempfile.TemporaryDirectory() as directory:
+                fixture.write(".axiom/toolchain.toml", SELECTOR_TOOLCHAIN)
+                fixture.write(WAIVER_LEDGER, "validate_failures:\n  us/statutes/item.yaml:\n    pending: staged\n")
+                fixture.base = commit(fixture.root, "base with a staged waiver")
+                fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain(proposed))
+                if literal:
+                    fixture.write(VALIDATION_CALLER, literal_pin_caller(proposed))
+                fixture.write(".axiom/toolchain.toml", SELECTOR_TOOLCHAIN.replace("b" * 64, "c" * 64))
+                fixture.write(WAIVER_LEDGER, "validate_failures:\n  us/statutes/item.yaml:\n    active: staged\n")
+                head = commit(fixture.root, "pin change that consumes the staged waiver")
+                output = Path(directory) / "binding-output"
+                result = run_workflow_inputs(fixture.root, fixture.base, pins=supplied, head=head, output=output)
+                assert result.returncode == 0, (literal, supplied, result.stderr)
+                # Either supplied input set binds the proposed pins.
+                bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                assert all(bound[key] == value for key, value in proposed.items()), bound
+                assert bound["dependency_pins_changed"] == "true", bound
+
+
+def test_pin_change_admission_is_exactly_the_configuration_paths() -> None:
+    """Admit a pin change iff every changed path is in PIN_CHANGE_PATHS (seeded sample)."""
+    others = (
+        "README.md", "scripts/read_pin.py", ".github/workflows/bulk-encode.yml",
+        "us/statutes/item.yaml", "us/statutes/item.test.yaml",
+        ".axiom/encoding-manifests/us/statutes/item.json", "programs/us/item.yaml",
+        "known-missing-money-atoms.yaml", ".axiom/pending-validation-fingerprints.json",
+        # Near misses of the admitted names stay outside the set.
+        "known-validation-gaps.yml", "uk/known-validation-gaps.yaml", "uk/.axiom/toolchain.toml",
+    )
+    pool = (VALIDATION_CALLER, ".axiom/toolchain.toml", WAIVER_LEDGER, *others)
+    proposed = {**WORKFLOW_INPUT_PINS, "axiom_rules_engine_ref": "e" * 40}
+    generator = random.Random(20261103)
+    samples = [frozenset()] + [frozenset({path}) for path in pool] + [
+        frozenset(generator.sample(pool, generator.randint(2, 4))) for _ in range(16)
+    ]
+    with WorkflowInputFixture(
+        table=workflow_toolchain(WORKFLOW_INPUT_PINS),
+        caller=literal_pin_caller(WORKFLOW_INPUT_PINS),
+    ) as fixture:
+        for sample in samples:
+            git(fixture.root, "checkout", "-q", "--detach", fixture.base)
+            fixture.write(WORKFLOW_TOOLCHAIN, workflow_toolchain(proposed))
+            for path in sample:
+                fixture.write(path, literal_pin_caller(proposed) if path == VALIDATION_CALLER else "candidate\n")
+            head = commit(fixture.root, "pin change with " + ", ".join(sorted(sample)))
+            result = run_workflow_inputs(fixture.root, fixture.base, pins=WORKFLOW_INPUT_PINS, head=head)
+            if sample <= PIN_CHANGE_PATHS:
+                assert result.returncode == 0, (sorted(sample), result.stderr)
+            else:
+                assert result.returncode != 0, sorted(sample)
+                assert "dependency pin changes require a configuration-only change" in result.stderr, (
+                    sorted(sample), result.stderr)
+
+
 def authorization_source() -> str:
     workflow = WORKFLOW.read_text()
     start = workflow.index("# reviewed-migration-authorization-start")
@@ -5709,6 +5776,40 @@ def test_release_pin_companion_accepts_exact_staged_consumption() -> None:
     rejected(consumed, release="old-release", release_sha="a" * 64, extra="# x\n")
     rejected(consumed, release="../unsigned")
     rejected(consumed, release_sha="invalid")
+
+
+def test_dependency_pin_ledger_edit_only_consumes_or_retires() -> None:
+    """The ratchet still bounds the ledger edit that admission lets a pin change carry."""
+    old, new, other = waiver_record("a"), waiver_record("b"), waiver_record("c")
+    base = {
+        "us/staged.yaml": {"pending": new},
+        "us/fixed.yaml": {"active": old},
+        "us/kept.yaml": {"active": other},
+    }
+    changed = "".join(path + "\n" for path in sorted(PIN_CHANGE_PATHS))
+
+    def run(head: dict) -> tuple[subprocess.CompletedProcess[str], str]:
+        # An unchanged release leaves the toolchain edit digest-only.
+        return run_release_repin(base, head, changed=changed, release="old-release", release_sha="a" * 64)
+
+    for head in (
+        {"us/staged.yaml": {"active": new}, "us/fixed.yaml": {"active": old}, "us/kept.yaml": {"active": other}},
+        {"us/staged.yaml": {"active": new}, "us/kept.yaml": {"active": other}},
+        {"us/fixed.yaml": {"active": old}, "us/kept.yaml": {"active": other}},
+    ):
+        result, audit = run(head)
+        assert result.returncode == 0, (head, result.stderr)
+        # The signed audit sees the whole pin change, not the ledger alone.
+        assert audit == changed
+    for head in (
+        {**base, "us/new.yaml": {"active": new}},
+        {**base, "us/kept.yaml": {"active": other, "pending": new}},
+        {**base, "us/kept.yaml": {"active": new}},
+        {**base, "us/staged.yaml": {"active": other}},
+    ):
+        result, _ = run(head)
+        assert result.returncode != 0, head
+        assert "ValidationWaiverRatchetGrowth" in result.stderr, (head, result.stderr)
 
 
 def guard_base_ref_source() -> str:

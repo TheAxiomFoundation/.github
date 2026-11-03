@@ -871,8 +871,14 @@ jobs:
           configuration = base
           # Only a content-free update of the canonical configuration can test
           # proposed pins. Every other path keeps exact protected-base binding.
-          # Release/waiver toolchain metadata may accompany that configuration;
-          # it remains data consumed separately at each audit's own revision.
+          # Release/waiver toolchain metadata and the waiver ledger may accompany
+          # that configuration; they remain data consumed separately at each
+          # audit's own revision. A pin move can fail a module that a protected
+          # pending record staged or pass one that an active record waives, and
+          # the ledger edit cannot land on either side of the move: the audit
+          # refuses a stale active record and a pending record whose module
+          # fails. The waiver ratchet still limits a pin change's ledger edit
+          # to exact consumption and retirement.
           # Git objects describe the checked-out event merge, never working files.
           if event in ("pull_request", "pull_request_target", "merge_group"):
               candidate = os.environ["CURRENT_SHA"]
@@ -881,7 +887,9 @@ jobs:
               changed = {os.fsdecode(path) for path in git(
                   "diff", "--name-only", "-z", "--no-renames", base, candidate,
               ).split(b"\0") if path}
-              if changed and changed <= {TABLE_PATH, *CALLER_PATHS, ".axiom/toolchain.toml"}:
+              if changed and changed <= {
+                  TABLE_PATH, *CALLER_PATHS, ".axiom/toolchain.toml", "known-validation-gaps.yaml",
+              }:
                   git("merge-base", "--is-ancestor", base, candidate)
                   configuration = candidate
                   protected_pin, pins, caller_values, direct_caller, opaque_caller = configuration_pins(configuration)
