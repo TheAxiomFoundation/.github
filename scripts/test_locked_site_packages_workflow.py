@@ -609,22 +609,48 @@ _ENCODER_TREE = [
     _uv_install(*_TARGET, "--no-deps", "$encoder"),
 ]
 
+PARSER = "Install the rollback ledger parser"
+# PyPI's sha256 for each PyYAML 6.0.3 CPython wheel a glibc x86_64 runner can
+# install, cp38 through cp314, in that order
+# (https://pypi.org/pypi/PyYAML/6.0.3/json, the
+# manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64 wheels).
+PYYAML_WHEEL_SHA256 = {
+    "cp38": "22ba7cfcad58ef3ecddc7ed1db3409af68d023b7f940da23c6c2a1890976eda6",
+    "cp39": "0150219816b6a1fa26fb4699fb7daa9caf09eb1999f3b70fb6e786805e80375a",
+    "cp310": "9c7708761fccb9397fe64bbc0395abcae8c4bf7b0eac081e12b809bf47700d0b",
+    "cp311": "b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d",
+    "cp312": "ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc",
+    "cp313": "0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6",
+    "cp314": "c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5",
+}
+# The rollback ledger parser, line for line: the job's own interpreter,
+# isolated, wheels only, no resolution, from a requirements file the step
+# writes with those digests.
+PARSER_INSTALL = ("python", "-I", "-m", "pip", "--isolated", "install",
+                  "--disable-pip-version-check", "--only-binary=:all:", "--no-deps",
+                  "--require-hashes", "-r", "$requirements")
+PARSER_RUN = (
+    "set -euo pipefail\n"
+    "unset PYTHONPATH PYTHONHOME PYTHONSTARTUP\n"
+    'requirements="$(mktemp "$RUNNER_TEMP/rollback-ledger-parser-requirements.XXXXXXXX")"\n'
+    "cat > \"$requirements\" <<'REQUIREMENTS'\n"
+    "pyyaml==6.0.3 \\\n"
+    + " \\\n".join(f"    --hash=sha256:{digest}" for digest in PYYAML_WHEEL_SHA256.values())
+    + "\nREQUIREMENTS\n"
+    "python -I -m pip --isolated install --disable-pip-version-check \\\n"
+    '  --only-binary=:all: --no-deps --require-hashes -r "$requirements"\n'
+)
+
 # Every installer command in validate-rulespec.yml, by job and step, exactly.
 # Shell quoting is removed, so `"--target=$x"` and `--target "$x"` both appear
 # here as parsed arguments; any other installer anywhere fails the test.
 INSTALLERS = {
-    ("rollback-proof", "Install the rollback ledger parser"): [
-        ("python", "-I", "-m", "pip", "--isolated", "install",
-         "--disable-pip-version-check", "--only-binary=:all:", "pyyaml==6.0.3"),
-    ],
+    ("rollback-proof", PARSER): [PARSER_INSTALL],
     ("shards", "Install the ProgramSpec shape-check parser"): [
         ("python", "-I", "-m", "pip", "--isolated", "install",
          "--disable-pip-version-check", "pyyaml==6.0.3"),
     ],
-    ("validate", "Install the rollback ledger parser"): [
-        ("python", "-I", "-m", "pip", "--isolated", "install",
-         "--disable-pip-version-check", "--only-binary=:all:", "pyyaml==6.0.3"),
-    ],
+    ("validate", PARSER): [PARSER_INSTALL],
     ("validate", HEAD): [
         _ENCODER_SYNC,
         *_ENCODER_TREE,
@@ -850,12 +876,8 @@ class LockedSitePackagesTests(unittest.TestCase):
         workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
         for job in ("rollback-proof", "validate"):
             steps = workflow["jobs"].setdefault(job, {}).setdefault("steps", [])
-            if not any(item.get("name") == "Install the rollback ledger parser" for item in steps):
-                steps.insert(0, {
-                    "name": "Install the rollback ledger parser",
-                    "run": "python -I -m pip --isolated install --disable-pip-version-check "
-                           "--only-binary=:all: pyyaml==6.0.3",
-                })
+            if not any(item.get("name") == PARSER for item in steps):
+                steps.insert(0, {"name": PARSER, "run": PARSER_RUN})
         return workflow
 
     def test_rollback_parser_installs_are_allowed_in_both_jobs(self):
@@ -869,8 +891,12 @@ class LockedSitePackagesTests(unittest.TestCase):
             "pip isolation": ("--isolated ", ""),
             "version check": ("--disable-pip-version-check ", ""),
             "wheels only": ("--only-binary=:all: ", ""),
-            "package pin": ("pyyaml==6.0.3", "pyyaml"),
-            "extra package": ("pyyaml==6.0.3", "pyyaml==6.0.3 hostile-pkg"),
+            "dependency resolution": ("--no-deps ", ""),
+            "hash checking": ("--require-hashes ", ""),
+            # The requirement's pin and digests are checked by
+            # RollbackParserHashPinTests; here, the argv must keep the file.
+            "requirement by name": ('-r "$requirements"', "pyyaml==6.0.3"),
+            "extra package": ('-r "$requirements"', '-r "$requirements" hostile-pkg'),
         }
         for job in ("rollback-proof", "validate"):
             for label, (old, new) in mutations.items():
@@ -1379,22 +1405,8 @@ class LockedSitePackagesTests(unittest.TestCase):
         self.assertGreater(len(candidates) - len(accepted_by_grep), 350)
 
 
-PARSER = "Install the rollback ledger parser"
-# PyPI's sha256 for each PyYAML 6.0.3 CPython wheel a glibc x86_64 runner can
-# install, cp38 through cp314, in that order
-# (https://pypi.org/pypi/PyYAML/6.0.3/json, the
-# manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64 wheels).
-PYYAML_WHEEL_SHA256 = {
-    "cp38": "22ba7cfcad58ef3ecddc7ed1db3409af68d023b7f940da23c6c2a1890976eda6",
-    "cp39": "0150219816b6a1fa26fb4699fb7daa9caf09eb1999f3b70fb6e786805e80375a",
-    "cp310": "9c7708761fccb9397fe64bbc0395abcae8c4bf7b0eac081e12b809bf47700d0b",
-    "cp311": "b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d",
-    "cp312": "ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc",
-    "cp313": "0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6",
-    "cp314": "c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5",
-}
-PARSER_ARGV = ["-I", "-m", "pip", "--isolated", "install", "--disable-pip-version-check",
-               "--only-binary=:all:", "--no-deps", "--require-hashes", "-r"]
+# The parser's argv after the program name, up to its requirements file.
+PARSER_ARGV = list(PARSER_INSTALL[1:-1])
 FAKE_PYTHON = r'''
 import json, os, sys
 
@@ -1413,7 +1425,8 @@ def parser_step(job: str, text: str | None = None) -> dict:
     return next(item for item in workflow["jobs"][job]["steps"] if item.get("name") == PARSER)
 
 
-def run_parser(job: str, temp: Path) -> tuple[subprocess.CompletedProcess[str], list[dict], Path]:
+def run_parser(job: str, temp: Path,
+               text: str | None = None) -> tuple[subprocess.CompletedProcess[str], list[dict], Path]:
     """Run a job's parser step against a fake `python` under temp; return its calls."""
     runner_temp, bindir = temp / "runner-temp", temp / "bin"
     runner_temp.mkdir()
@@ -1426,7 +1439,7 @@ def run_parser(job: str, temp: Path) -> tuple[subprocess.CompletedProcess[str], 
     env = {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "RUNNER_TEMP": str(runner_temp),
            "FAKE_PYTHON_LOG": str(log), "HOME": str(temp)}
     script = temp / "parser.sh"
-    script.write_text(parser_step(job)["run"], encoding="utf-8")
+    script.write_text(parser_step(job, text)["run"], encoding="utf-8")
     done = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
                           cwd=runner_temp, env=env, capture_output=True, text=True, check=False)
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
@@ -1445,6 +1458,33 @@ def requirement_entries(text: str) -> list[tuple[str, tuple[str, ...], tuple[str
         other = tuple(token for token in tokens[1:] if not token.startswith("--hash="))
         entries.append((tokens[0], hashes, other))
     return entries
+
+
+def parser_violations(text: str) -> list[str]:
+    """Every way the two parser steps differ from the hash-pinned install."""
+    problems = []
+    runs = {job: parser_step(job, text)["run"] for job in ("rollback-proof", "validate")}
+    if runs["rollback-proof"] != runs["validate"]:
+        problems.append("the jobs run different parser scripts")
+    expected = [("pyyaml==6.0.3",
+                 tuple(f"sha256:{digest}" for digest in PYYAML_WHEEL_SHA256.values()), ())]
+    for job, run in runs.items():
+        if logical_lines(run) != logical_lines(PARSER_RUN):
+            problems.append(f"{job}: the script is not PARSER_RUN")
+        with tempfile.TemporaryDirectory(dir=TEMP_PARENT) as temp:
+            done, calls, runner_temp = run_parser(job, Path(temp), text)
+        if done.returncode != 0:
+            problems.append(f"{job}: the step failed: {done.stderr.strip()}")
+            continue
+        if len(calls) != 1:
+            problems.append(f"{job}: {len(calls)} python calls")
+            continue
+        argv = calls[0]["argv"]
+        if argv[:-1] != PARSER_ARGV or Path(argv[-1]).parent != runner_temp:
+            problems.append(f"{job}: argv {argv}")
+        if requirement_entries(calls[0].get("requirements", "")) != expected:
+            problems.append(f"{job}: requirements {calls[0].get('requirements')!r}")
+    return problems
 
 
 def fake_pyyaml_wheel(directory: Path) -> Path:
@@ -1506,23 +1546,30 @@ def hash_violations(text: str) -> tuple[list[str], int]:
 
 class RollbackParserHashPinTests(unittest.TestCase):
     def test_rollback_parser_installs_only_hash_pinned_wheels(self):
-        # Both jobs run one script, the anchor and its alias.
-        self.assertEqual(parser_step("rollback-proof")["run"], parser_step("validate")["run"])
-        for job in ("rollback-proof", "validate"):
-            with self.subTest(job=job), tempfile.TemporaryDirectory(dir=TEMP_PARENT) as temp:
-                done, calls, runner_temp = run_parser(job, Path(temp))
-                self.assertEqual(done.returncode, 0, done.stderr)
-                self.assertEqual(len(calls), 1, calls)
-                argv = calls[0]["argv"]
-                # The job's own interpreter, isolated, wheels only, no
-                # resolution, every byte checked against a pinned digest.
-                self.assertEqual(argv[:-1], PARSER_ARGV)
-                self.assertEqual(Path(argv[-1]).parent, runner_temp)
-                self.assertEqual(
-                    requirement_entries(calls[0].get("requirements", "")),
-                    [("pyyaml==6.0.3",
-                      tuple(f"sha256:{digest}" for digest in PYYAML_WHEEL_SHA256.values()), ())],
-                )
+        # Both jobs run one script, the anchor and its alias, line for line,
+        # and running it hands pip exactly the pinned requirement.
+        self.assertEqual(parser_violations(WORKFLOW.read_text(encoding="utf-8")), [])
+
+    def test_rollback_parser_requirement_rejects_drift(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(parser_violations(text), [])
+        digests = list(PYYAML_WHEEL_SHA256.values())
+        first, last = digests[0], digests[-1]
+        mutations = {
+            "other version": ("pyyaml==6.0.3 \\\n", "pyyaml==6.0.2 \\\n"),
+            "no version": ("pyyaml==6.0.3 \\\n", "pyyaml \\\n"),
+            "dropped digest": (f"--hash=sha256:{first} \\\n", ""),
+            "altered digest": (first, first[:-1] + ("1" if first[-1] == "0" else "0")),
+            "extra digest": (f"--hash=sha256:{last}\n", f"--hash=sha256:{last} --hash=sha256:{'0' * 64}\n"),
+            "extra requirement": ("          REQUIREMENTS\n",
+                                  f"          hostile-pkg==1.0 --hash=sha256:{'0' * 64}\n"
+                                  "          REQUIREMENTS\n"),
+            "expanding heredoc": ("<<'REQUIREMENTS'", "<<REQUIREMENTS"),
+        }
+        for label, (old, new) in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertEqual(text.count(old), 1, label)
+                self.assertNotEqual(parser_violations(text.replace(old, new)), [], label)
 
     def test_pinned_parser_requirement_refuses_other_bytes(self):
         with tempfile.TemporaryDirectory(dir=TEMP_PARENT) as temp:
@@ -1561,9 +1608,10 @@ class RollbackParserHashPinTests(unittest.TestCase):
         text = WORKFLOW.read_text(encoding="utf-8")
         violations, checked = hash_violations(text)
         self.assertEqual(violations, [])
-        # Non-vacuity: both parser installs, and the head, protected-base and
-        # composer installs that precede the last protected consumer.
-        self.assertGreaterEqual(checked, 20)
+        # Non-vacuity: the rollback-proof parser, then in validate its parser
+        # and the 8 head, 4 protected-base and 3 composer installs that precede
+        # the last protected consumer.
+        self.assertEqual(checked, 17)
 
         # The check has teeth beyond the parser, and stops at the last consumer.
         locked = '--require-hashes --no-deps -r "$locked"'
