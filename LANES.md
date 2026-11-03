@@ -6,8 +6,8 @@
 | --- | --- | ---: | --- | --- | --- |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-03 — Merge pull request #143 from TheAxiomFoundation/nzhub/tracks-link-test-hardening | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-11-03 — Merge pull request #133 from TheAxiomFoundation/hub/be-workflow-toolchain | 4 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-02 — Merge pull request #1975 from TheAxiomFoundation/chore/waiver-issue-open-check | 46 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | queued |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-29 — Merge pull request #504 from TheAxiomFoundation/hub/readme-toolchain-authority | 38 | uk-rulespec-2026-10-25-pe-child-definitions | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-02 — Merge pull request #1975 from TheAxiomFoundation/chore/waiver-issue-open-check | 46 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | failure |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-10-29 — Merge pull request #504 from TheAxiomFoundation/hub/readme-toolchain-authority | 38 | uk-rulespec-2026-10-25-pe-child-definitions | fa0da5e834214052cc8d9d381e25ff409dd1062f | failure |
 | [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-27 — Merge pull request #29 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-27 — Merge pull request #26 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-10-27 — Merge pull request #30 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
