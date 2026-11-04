@@ -6,38 +6,63 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: lanes-registry
+  cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      PUBLISH_REF: refs/heads/lanes-registry
     steps:
-      - name: Check out repository
+      - name: Check out curated content and generator from main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+
+      - name: Check curated registry source
+        run: python3 scripts/generate_lanes.py --check
 
       - name: Generate registry
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/generate_lanes.py
+        run: python3 scripts/generate_lanes.py --output "$RUNNER_TEMP/LANES.md"
 
-      - name: Commit registry when changed
+      - name: Publish registry only to lanes-registry when changed
         shell: bash
         run: |
-          if git diff --quiet -- LANES.md; then
-            exit 0
+          set -euo pipefail
+          if [[ "$PUBLISH_REF" != "refs/heads/lanes-registry" ]]; then
+            echo "::error::Refusing to push to any target other than refs/heads/lanes-registry"
+            exit 1
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add LANES.md
-          git commit -m "chore: update encoding lane registry"
-          git push
 
-      # Optional push-sync to Slack: uncomment after adding the SLACK_LANES_WEBHOOK secret.
-      # - name: Notify Slack on change
-      #   if: steps.commit.outputs.changed == 'true'
-      #   run: |
-      #     curl -s -X POST -H 'Content-type: application/json' \
-      #       --data '{"text":"LANES.md updated: https://github.com/TheAxiomFoundation/.github/blob/main/LANES.md"}' \
-      #       "$SLACK_LANES_WEBHOOK"
-      #   env:
-      #     SLACK_LANES_WEBHOOK: ${{ secrets.SLACK_LANES_WEBHOOK }}
+          if git ls-remote --exit-code --heads origin "$PUBLISH_REF" > /dev/null; then
+            git fetch --no-tags origin "$PUBLISH_REF"
+            git checkout --detach FETCH_HEAD
+          else
+            status=$?
+            if [[ "$status" -ne 2 ]]; then
+              exit "$status"
+            fi
+            # Start a board-only history; never publish main's workflow files.
+            git checkout --orphan lanes-registry
+            git rm -rf -- .
+          fi
+
+          cp "$RUNNER_TEMP/LANES.md" LANES.md
+          git add -- LANES.md
+          if git diff --cached --quiet -- LANES.md; then
+            echo "Lane registry is unchanged"
+            exit 0
+          fi
+          git commit -m "chore: update encoding lane registry"
+          git push origin "HEAD:$PUBLISH_REF"
