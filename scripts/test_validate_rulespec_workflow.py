@@ -6698,6 +6698,18 @@ def test_rollback_rewind_keeps_pyyaml_separate_from_authenticated_lookup() -> No
             if step.get("id") == "rollback_metadata":
                 continue
             assert "GH_TOKEN" not in step.get("env", {}), step.get("name")
+            if step.get("name") == "Reject manual RuleSpec changes":
+                # Notary admission needs a read credential, unlike the ledger
+                # parser. Remove it from the environment before any Python
+                # process, and hand it only to the protected notary boundary.
+                assert step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+                run = step["run"]
+                assert run.index("unset GITHUB_TOKEN") < run.index("python -I")
+                assert 'chmod 600 "$token_file"' in run
+                assert '--github-token-file "$token_file"' in run
+                assert "axiom-encode-signing-supervisor" in run
+                assert 'axiom-encode notary-guard' in run
+                continue
             assert "github.token" not in json.dumps(step.get("env", {})), step.get("name")
         parser = next(step for step in job["steps"] if step.get("name") == "Install the rollback ledger parser")
         resolver = next(step for step in job["steps"] if step.get("id") == "rollback_rewind")

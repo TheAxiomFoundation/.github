@@ -21,6 +21,7 @@ def main():
         stub = root / 'supervisor'
         stub.write_text('''#!/bin/bash
 set -euo pipefail
+test -z "${GITHUB_TOKEN+x}"
 printf '%s\\n' "$*" >> "$CALL_LOG"
 if [[ " $* " == *" notary-guard "* ]]; then
   exit "$NOTARY_STATUS"
