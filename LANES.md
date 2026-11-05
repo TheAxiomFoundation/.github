@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-04 — Re-pin the corpus to uk-rulespec-2026-11-02-uc-retirement-pension-income (#538) | 37 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | in_progress |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-05 — Point the UK CTR README at the release #538 bound (#539) | 37 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-11-04 — Admit the encoder's v5 manifests and check the workflow-toolchain mirror (#135) | 3 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-03 — Merge pull request #143 from TheAxiomFoundation/nzhub/tracks-link-test-hardening | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-02 — Merge pull request #1975 from TheAxiomFoundation/chore/waiver-issue-open-check | 48 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | success |
