@@ -867,7 +867,12 @@ class Pre1883ManifestBridgeTests(unittest.TestCase):
                 self.assertNotIn("Manifest audit ratchet passed", result.stdout)
 
     def test_identity_or_attestation_failure_in_retry_fails_closed(self):
-        for issue in (PRE1883_IDENTITY_ISSUE, "runtime attestation is unreadable", "ATTESTATION package hash mismatch"):
+        unavailable = "running axiom-encode checkout identity is unavailable: "
+        attestation = ("Cannot apply generated RuleSpec: the trusted-runtime marker is set "
+                       "but the runtime attestation is unreadable at /opt/x/runtime-attestation.json: denied")
+        for issue in (PRE1883_IDENTITY_ISSUE,
+                      "Cannot verify the running pinned encoder identity: " + unavailable + attestation,
+                      ".axiom/encoding-manifests/us/a.json cannot verify pinned encoder identity: " + unavailable + attestation):
             with self.subTest(issue=issue):
                 # Even an identical head issue must never bless a failed retry.
                 result, _ = run_guard(base_ancestry=1, head_ancestry=0,
@@ -876,6 +881,32 @@ class Pre1883ManifestBridgeTests(unittest.TestCase):
                 self.assertIn("ManifestAuditError", result.stderr)
                 self.assertIn("identity or attestation failure", result.stderr)
                 self.assertNotIn("Inherited manifest audit issues", result.stdout)
+
+    # These issues name identity or attestation in a filename or a field, and each describes a manifest rather than the
+    # running encoder.
+    ORDINARY_ISSUES_NAMING_IDENTITY = (
+        ".axiom/encoding-manifests/identity-cards.json is not an encoder apply manifest",
+        ".axiom/encoding-manifests/attestation.json is not an encoder apply manifest",
+        ".axiom/encoding-manifests/us/a.json replacement receipt identity is stale",
+        ".axiom/encoding-manifests/us/a.json has invalid source_attestation: bad root",
+    )
+
+    def test_inherited_manifest_issue_naming_identity_or_attestation_stays_inherited(self):
+        for issue in self.ORDINARY_ISSUES_NAMING_IDENTITY:
+            with self.subTest(issue=issue):
+                result, _ = run_guard(base_ancestry=1, head_ancestry=0,
+                                      audit_results=self.reports(bridge=[issue], head=[issue]))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Inherited manifest audit issues", result.stdout)
+                self.assertNotIn("identity or attestation failure", result.stderr)
+
+    def test_new_head_issue_naming_identity_or_attestation_still_fails(self):
+        for issue in self.ORDINARY_ISSUES_NAMING_IDENTITY:
+            with self.subTest(issue=issue):
+                result, _ = run_guard(base_ancestry=1, head_ancestry=0,
+                                      audit_results=self.reports(bridge=[], head=[issue]))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("New manifest audit issues", result.stdout + result.stderr)
 
     def test_ordinary_mode_never_checks_ancestry_or_uses_bridge(self):
         result, calls = run_guard(mode="changed", base_ancestry=128, head_ancestry=128,

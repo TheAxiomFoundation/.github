@@ -5616,7 +5616,6 @@ jobs:
             python -I - "$RUNNER_TEMP/generated-guard-base.json" <<'PYBRIDGEIDENTITY'
           import json
           from pathlib import Path
-          import re
           import sys
 
           try:
@@ -5625,8 +5624,13 @@ jobs:
               raise SystemExit("ManifestAuditError: bridged base guard must return valid JSON")
           # The unchanged issue_set below validates the complete JSON/status
           # contract. Identity failures must never become inherited issue keys.
+          # The encoder words them these two ways, and a bad runtime attestation
+          # reaches the run-level form through identity resolution. Ordinary
+          # issues can name identity or attestation, in a filename or a field.
+          RUN_LEVEL = "Cannot verify the running pinned encoder identity:"
+          MANIFEST_LEVEL = " cannot verify pinned encoder identity:"
           if isinstance(payload, dict) and isinstance(payload.get("issues"), list):
-              if any(isinstance(issue, str) and re.search(r"\b(?:identity|attestation)\b", issue, re.IGNORECASE)
+              if any(isinstance(issue, str) and (issue.startswith(RUN_LEVEL) or MANIFEST_LEVEL in issue)
                      for issue in payload["issues"]):
                   raise SystemExit("ManifestAuditError: bridged base guard still reports an identity or attestation failure")
           PYBRIDGEIDENTITY

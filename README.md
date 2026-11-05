@@ -695,10 +695,11 @@ version-bump history. It also exports the encoder package from that commit,
 installs it in the runtime and records the package's tree hash in the
 attestation. The bridge changes only where the base issue set comes from: issue
 keys and the ratchet comparison stay the same, and the proposed runtime and the
-ordinary audit path don't change. Invalid results, or an identity or
-attestation issue in the repeated audit, fail the step. Remove the bridge once
-no RuleSpec caller pins an encoder in that range; today only `rulespec-il`
-does, at `630aa739`.
+ordinary audit path don't change. Invalid results fail the step, and so does an
+encoder identity failure in the repeated audit, whether the encoder reports it
+for the run or for one manifest; a bad runtime attestation reaches the audit as
+an identity failure. Remove the bridge once no RuleSpec caller pins an encoder
+in that range.
 
 The Python/pip installation steps clear ambient Python import settings and use
 isolated imports and pip configuration. Encoder installation uses authenticated
