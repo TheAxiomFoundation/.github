@@ -29,11 +29,37 @@ PROPOSED = "e" * 40
 MODULE = "uk/statutes/unchanged.yaml"
 MANIFEST = ".axiom/encoding-manifests/uk/statutes/unchanged.json"
 BASE_PREPARATION_STEP = "Prepare protected-base manifest audit"
+PRE1883_FIX = "b5e85ab4135be6ed4acaf2b2cd2b783648af2f6e"
+PRE1883_BUG = "630aa73931e5aa87c51d25fe448e38dbcfaed50f"
+PRE1883_IDENTITY_ISSUE = (
+    "Cannot verify the running pinned encoder identity: "
+    "encoder Git metadata is unavailable: git rev-parse failed"
+)
+
+
+def workflow_steps():
+    return yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+
+
+def step_source(name):
+    return next(step["run"] for step in workflow_steps() if step.get("name") == name)
+
+
+def marked_source(source, name):
+    start, end = f"# {name}-start\n", f"# {name}-end\n"
+    assert (source.count(start), source.count(end)) == (1, 1), name
+    return source.split(start, 1)[1].split(end, 1)[0]
+
+
+def heredoc(source, label):
+    return source.split(f"<<'{label}'", 1)[1].split("\n", 1)[1].split("\n" + label, 1)[0]
 
 
 def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
               inherited=False, scenario="manifest", base_pin="a" * 40,
-              integrity_fail_after=0, event="pull_request"):
+              integrity_fail_after=0, event="pull_request", base_ancestry=0, head_ancestry=0,
+              base_bug_ancestry=0,
+              audit_results=None, bridge_predicate_status=0):
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     shell = next(step["run"] for step in steps if step.get("name") == "Reject manual RuleSpec changes")
     with tempfile.TemporaryDirectory(prefix="encoder-guard-pin-manifest-", dir=TEMP_PARENT) as directory:
@@ -77,17 +103,45 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
         protected.mkdir()
         tools = root / "tools"
         tools.mkdir()
-        (tools / "python").symlink_to(sys.executable)
-        if event == "merge_group":
-            # A queue's first parent need not be the protected group base.
-            # Supply a valid distinct commit so fallback cannot mask that fact.
-            git = tools / "git"
-            git.write_text(f"#!{sys.executable} -I\n" + textwrap.dedent("""\
+        if bridge_predicate_status:
+            python = tools / "python"
+            python.write_text(f"#!{sys.executable} -I\n" + textwrap.dedent("""\
+                import os
                 import sys
-                assert sys.argv[1:] == ['rev-parse', '--verify', 'HEAD~1^{commit}']
-                print('c' * 40)
+                args = sys.argv[1:]
+                if args[:2] == ['-I', '-']:
+                    source = sys.stdin.read()
+                    if 'expected = "Cannot verify the running pinned encoder identity:' in source:
+                        sys.exit(int(os.environ['BRIDGE_PREDICATE_STATUS']))
+                    sys.argv = ['-', *args[2:]]
+                    exec(compile(source, '<stdin>', 'exec'), {'__name__': '__main__'})
+                else:
+                    os.execv(sys.executable, [sys.executable, *args])
                 """))
-            git.chmod(0o755)
+            python.chmod(0o755)
+        else:
+            (tools / "python").symlink_to(sys.executable)
+        git_command = tools / "git"
+        git_command.write_text(f"#!{sys.executable} -I\n" + textwrap.dedent("""\
+            import os
+            import sys
+            args = sys.argv[1:]
+            if args == ['rev-parse', '--verify', 'HEAD~1^{commit}']:
+                # The protected queue base must win over this unrelated parent.
+                print('c' * 40)
+            else:
+                assert args[0] == '-C', args
+                is_base = args[1] == os.environ['BASE_DEPENDENCY_ROOT'] + '/axiom-encode'
+                expected = os.environ['BASE_ENCODER_REF' if is_base else 'HEAD_ENCODER_REF']
+                # Only the base checks for the #1859 commit; both sides check #1883.
+                commits = [os.environ['PRE1883_FIX']] + ([os.environ['PRE1883_BUG']] if is_base else [])
+                assert args[2:4] == ['merge-base', '--is-ancestor'] and args[4] in commits, args
+                assert args[5:] == [expected], args
+                if args[4] == os.environ['PRE1883_BUG']:
+                    sys.exit(int(os.environ['BASE_BUG_ANCESTRY']))
+                sys.exit(int(os.environ['BASE_ANCESTRY' if is_base else 'HEAD_ANCESTRY']))
+            """))
+        git_command.chmod(0o755)
         integrity = root / "integrity"
         integrity.mkdir()
         (integrity / "check.py").write_text(textwrap.dedent("""\
@@ -137,20 +191,34 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
             argv = sys.argv[1:]
             assert argv[0] == 'guard-generated'
             parser = argparse.ArgumentParser()
-            for name in ('repo', 'base-ref', 'head-ref', 'corpus-path', 'expected-encoder-checkout'):
+            for name in ('repo', 'base-ref', 'head-ref', 'corpus-path'):
                 parser.add_argument('--' + name, required=True)
+            parser.add_argument('--expected-encoder-checkout')
             parser.add_argument('--all', action='store_true')
             parser.add_argument('--json', action='store_true')
             args = parser.parse_args(argv[1:])
             assert args.base_ref == os.environ['EXPECTED_BASE']
             is_base = args.repo == os.environ['BASE_RULESPEC_ROOT']
             assert args.head_ref == (os.environ['EXPECTED_BASE'] if is_base else os.environ['GITHUB_SHA'])
-            pin = (Path(args.expected_encoder_checkout) / 'pin').read_text()
+            dependency_root = os.environ['BASE_DEPENDENCY_ROOT' if is_base else 'AXIOM_DEPENDENCY_ROOT']
+            expected_checkout = dependency_root + '/axiom-encode'
+            if args.expected_encoder_checkout is None:
+                assert is_base, 'the head audit must always use its checkout identity'
+                assert os.environ['AUDIT_RESULTS'] != 'null', 'unexpected attestation bridge'
+            else:
+                assert args.expected_encoder_checkout == expected_checkout
+            pin = (Path(expected_checkout) / 'pin').read_text()
             assert pin == os.environ['BASE_ENCODER' if is_base else 'PROPOSED_ENCODER']
             assert args.corpus_path == os.environ['BASE_DEPENDENCY_ROOT' if is_base else 'AXIOM_DEPENDENCY_ROOT'] + '/axiom-corpus'
             with open(os.environ['GUARD_CALLS'], 'a') as log:
                 log.write(json.dumps({'cli': argv, 'encoder_ref': pin,
                                       'encoder_fixture': os.environ['ENCODER_FIXTURE']}) + '\\n')
+            fixture = json.loads(os.environ['AUDIT_RESULTS'])
+            if fixture is not None:
+                phase = ('bridge' if args.expected_encoder_checkout is None else 'base') if is_base else 'head'
+                report = fixture[phase]
+                print(report['raw'] if 'raw' in report else json.dumps(report['payload']))
+                sys.exit(report['status'])
             # Model the observed --all/default selection distinction. This is
             # a strict fixture gate, not external signature authentication.
             issues = []
@@ -206,9 +274,13 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
             "MODULE": MODULE, "MANIFEST": MANIFEST,
             "DEPENDENCY_PINS_CHANGED": "true" if mode == "full-toolchain-bump" else "false",
             "BASE_RULESPEC_ROOT": str(base_workspace), "BASE_DEPENDENCY_ROOT": str(base_dependencies),
-            "BASE_ENCODER": base_pin,
+            "BASE_ENCODER": base_pin, "BASE_ENCODER_REF": base_pin, "HEAD_ENCODER_REF": PROPOSED,
+            "PRE1883_FIX": PRE1883_FIX, "BASE_ANCESTRY": str(base_ancestry),
+            "PRE1883_BUG": PRE1883_BUG, "BASE_BUG_ANCESTRY": str(base_bug_ancestry),
+            "HEAD_ANCESTRY": str(head_ancestry), "AUDIT_RESULTS": json.dumps(audit_results),
+            "BRIDGE_PREDICATE_STATUS": str(bridge_predicate_status),
             "INTEGRITY_FAIL_AFTER": str(integrity_fail_after),
-        }, capture_output=True, text=True, timeout=30)
+        }, capture_output=True, text=True, timeout=120)
         return result, [json.loads(line) for line in calls.read_text().splitlines()]
 
 
@@ -497,12 +569,16 @@ class PinBumpManifestTests(unittest.TestCase):
             (tools / "python").symlink_to(sys.executable)
             source = source.replace("/opt/axiom-dependency-integrity", str(integrity))
             source = source.replace("/opt/axiom-base-verification", str(root / "runtime"))
-            source = source.replace("${{ inputs.python-version }}", "3.13")
+            # The step passes the Python version through env, so its script
+            # carries no expression.
+            self.assertEqual(preparation["env"]["PYTHON_VERSION"], "${{ inputs.python-version }}")
+            self.assertNotIn("${{", source)
             for invocation in ("if base_corpus_fetch corpus-fetch; then exit 0; else exit $?; fi",
                                "if ! base_corpus_fetch corpus-fetch --help; then exit 1; fi"):
                 with self.subTest(invocation=invocation):
                     result = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n" + invocation],
-                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                                                 "PYTHON_VERSION": "3.13"},
                                             capture_output=True, text=True, timeout=10)
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn("DependencyIntegrityError", result.stderr)
@@ -567,7 +643,10 @@ class PinBumpManifestTests(unittest.TestCase):
             (tools / "python").symlink_to(sys.executable)
             source = source.replace("/opt/axiom-dependency-integrity", str(integrity))
             source = source.replace("/opt/axiom-base-verification", str(root / "runtime"))
-            source = source.replace("${{ inputs.python-version }}", "3.13")
+            # The step passes the Python version through env, so its script
+            # carries no expression.
+            self.assertEqual(preparation["env"]["PYTHON_VERSION"], "${{ inputs.python-version }}")
+            self.assertNotIn("${{", source)
             for invocation, status in (
                 ("base_corpus_fetch corpus-fetch --help", 0),
                 ("base_corpus_fetch corpus-fetch --corpus-path corpus --fixture-status 0", 0),
@@ -576,13 +655,15 @@ class PinBumpManifestTests(unittest.TestCase):
             ):
                 with self.subTest(invocation=invocation):
                     result = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n" + invocation],
-                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                                                 "PYTHON_VERSION": "3.13"},
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
             # The protected-base step's capability probe passes for such an encoder.
             probe = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n"
                                     "if ! base_corpus_fetch corpus-fetch --help >/dev/null 2>&1; then exit 1; fi"],
-                                   env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                   env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                                        "PYTHON_VERSION": "3.13"},
                                    capture_output=True, text=True, timeout=10)
             self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
 
@@ -668,6 +749,382 @@ class PinBumpManifestTests(unittest.TestCase):
                                     (accepted, "2"), (accepted, "1")):
                 self.assertNotEqual(check(invalid, accepted, base_status=status), 0)
                 self.assertNotEqual(check(accepted, invalid, head_status=status), 0)
+
+
+def audit_report(issues, *, status=None):
+    return {"payload": {"passed": not issues, "issues": issues},
+            "status": int(bool(issues)) if status is None else status}
+
+
+class Pre1883ManifestBridgeTests(unittest.TestCase):
+    """The old encoder supplies base verdicts; only the normal ratchet admits them."""
+
+    @staticmethod
+    def reports(base=None, bridge=None, head=None):
+        return {"base": audit_report([PRE1883_IDENTITY_ISSUE] if base is None else base),
+                "bridge": audit_report([] if bridge is None else bridge),
+                "head": audit_report([] if head is None else head)}
+
+    def test_live_shape_inherits_all_18_v1_manifest_issues(self):
+        issues = [f".axiom/encoding-manifests/il/statutes/bootstrap-{i}.json is not an encoder apply manifest"
+                  for i in range(18)]
+        result, calls = run_guard(base_ancestry=1, head_ancestry=0,
+                                  audit_results=self.reports(bridge=issues, head=issues))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Inherited manifest audit issues: 18", result.stdout)
+        self.assertIn("Manifest audit ratchet passed: no new issues.", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("used the pre-#1883 attestation bridge"), 1)
+        commands = [call["cli"] for call in calls if "cli" in call]
+        self.assertEqual(len(commands), 3)
+        original, retry, head = commands
+        expected_index = original.index("--expected-encoder-checkout")
+        self.assertEqual(retry, original[:expected_index] + original[expected_index + 2:])
+        self.assertIn("--expected-encoder-checkout", head)
+        supervisors = [call["supervisor"] for call in calls if "supervisor" in call]
+        self.assertEqual(supervisors[0][:supervisors[0].index("--") + 2],
+                         supervisors[1][:supervisors[1].index("--") + 2])
+
+    def test_only_pre_base_to_post_head_may_bridge(self):
+        # Both-pre is the validator-only repin that passes today on the inherited
+        # identity key. Both-post and post-to-pre must preserve that same path.
+        for base, head in ((1, 1), (0, 0), (0, 1)):
+            with self.subTest(base_contains=base, head_contains=head):
+                result, calls = run_guard(base_ancestry=base, head_ancestry=head,
+                                          base_pin=PROPOSED if base == head == 1 else BASE,
+                                          audit_results=self.reports(head=[PRE1883_IDENTITY_ISSUE]))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Inherited manifest audit issues: 1", result.stdout)
+                self.assertNotIn("attestation bridge", result.stdout)
+                commands = [call["cli"] for call in calls if "cli" in call]
+                self.assertEqual(len(commands), 2)
+                self.assertTrue(all("--expected-encoder-checkout" in command for command in commands))
+
+    def test_base_before_1859_never_bridges(self):
+        # An encoder pinned before #1859 has no encoder Git metadata check, so its
+        # base audit and provisioner keep the existing path even when the head
+        # encoder contains the fix.
+        for base, head in ((1, 0), (1, 1), (0, 0), (0, 1)):
+            with self.subTest(base_contains_fix=base, head_contains_fix=head):
+                result, calls = run_guard(base_bug_ancestry=1, base_ancestry=base, head_ancestry=head,
+                                          audit_results=self.reports(head=[PRE1883_IDENTITY_ISSUE]))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Inherited manifest audit issues: 1", result.stdout)
+                self.assertNotIn("attestation bridge", result.stdout)
+                commands = [call["cli"] for call in calls if "cli" in call]
+                self.assertEqual(len(commands), 2)
+                self.assertTrue(all("--expected-encoder-checkout" in command for command in commands))
+
+    def test_ancestry_errors_fail_before_either_audit(self):
+        for bug, base, head in ((0, 2, 0), (0, 128, 0), (0, 1, 2), (0, 0, 128), (2, 1, 0), (128, 1, 0)):
+            with self.subTest(bug_status=bug, base_status=base, head_status=head):
+                result, calls = run_guard(base_bug_ancestry=bug, base_ancestry=base, head_ancestry=head)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("ManifestAuditError", result.stderr)
+                self.assertIn("ancestry check failed", result.stderr)
+                self.assertEqual(calls, [])
+
+    def test_bridge_predicate_execution_failure_fails_closed(self):
+        result, calls = run_guard(base_ancestry=1, head_ancestry=0,
+                                  audit_results=self.reports(), bridge_predicate_status=2)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ManifestAuditError: base bridge predicate failed", result.stderr)
+        self.assertEqual(len([call for call in calls if "cli" in call]), 1)
+        self.assertNotIn("Manifest audit ratchet passed", result.stdout)
+
+    def test_retry_rechecks_dependency_integrity_before_consuming_base(self):
+        result, calls = run_guard(base_ancestry=1, head_ancestry=0,
+                                  audit_results=self.reports(), integrity_fail_after=3)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("DependencyIntegrityError", result.stderr)
+        self.assertIn("ManifestAuditError", result.stderr)
+        self.assertEqual(len([call for call in calls if "cli" in call]), 1)
+        self.assertNotIn("Manifest audit ratchet passed", result.stdout)
+
+    def test_other_single_base_issue_does_not_bridge(self):
+        result, calls = run_guard(base_ancestry=1, head_ancestry=0,
+                                  audit_results=self.reports(base=["another base issue"], head=["head-only issue"]))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("New manifest audit issues: 1", result.stderr)
+        self.assertNotIn("attestation bridge", result.stdout)
+        self.assertEqual(len([call for call in calls if "cli" in call]), 2)
+
+    def test_invalid_or_inconsistent_retry_fails_with_manifest_audit_error(self):
+        invalid = [
+            {"raw": "not JSON", "status": 1},
+            {"payload": {"passed": True, "issues": []}, "status": 1},
+            {"payload": {"passed": False, "issues": ["inherited"]}, "status": 0},
+            {"payload": {"passed": True, "issues": []}, "status": 2},
+            {"payload": {"passed": False, "issues": [42]}, "status": 1},
+        ]
+        for retry in invalid:
+            with self.subTest(retry=retry):
+                reports = self.reports()
+                reports["bridge"] = retry
+                result, _ = run_guard(base_ancestry=1, head_ancestry=0, audit_results=reports)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("ManifestAuditError", result.stderr)
+                self.assertNotIn("Manifest audit ratchet passed", result.stdout)
+
+    def test_identity_or_attestation_failure_in_retry_fails_closed(self):
+        unavailable = "running axiom-encode checkout identity is unavailable: "
+        attestation = ("Cannot apply generated RuleSpec: the trusted-runtime marker is set "
+                       "but the runtime attestation is unreadable at /opt/x/runtime-attestation.json: denied")
+        for issue in (PRE1883_IDENTITY_ISSUE,
+                      "Cannot verify the running pinned encoder identity: " + unavailable + attestation,
+                      ".axiom/encoding-manifests/us/a.json cannot verify pinned encoder identity: " + unavailable + attestation):
+            with self.subTest(issue=issue):
+                # Even an identical head issue must never bless a failed retry.
+                result, _ = run_guard(base_ancestry=1, head_ancestry=0,
+                                      audit_results=self.reports(bridge=[issue], head=[issue]))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("ManifestAuditError", result.stderr)
+                self.assertIn("identity or attestation failure", result.stderr)
+                self.assertNotIn("Inherited manifest audit issues", result.stdout)
+
+    # These issues name identity or attestation in a filename or a field, and each describes a manifest rather than the
+    # running encoder.
+    ORDINARY_ISSUES_NAMING_IDENTITY = (
+        ".axiom/encoding-manifests/identity-cards.json is not an encoder apply manifest",
+        ".axiom/encoding-manifests/attestation.json is not an encoder apply manifest",
+        ".axiom/encoding-manifests/us/a.json replacement receipt identity is stale",
+        ".axiom/encoding-manifests/us/a.json has invalid source_attestation: bad root",
+    )
+
+    def test_inherited_manifest_issue_naming_identity_or_attestation_stays_inherited(self):
+        for issue in self.ORDINARY_ISSUES_NAMING_IDENTITY:
+            with self.subTest(issue=issue):
+                result, _ = run_guard(base_ancestry=1, head_ancestry=0,
+                                      audit_results=self.reports(bridge=[issue], head=[issue]))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Inherited manifest audit issues", result.stdout)
+                self.assertNotIn("identity or attestation failure", result.stderr)
+
+    def test_new_head_issue_naming_identity_or_attestation_still_fails(self):
+        for issue in self.ORDINARY_ISSUES_NAMING_IDENTITY:
+            with self.subTest(issue=issue):
+                result, _ = run_guard(base_ancestry=1, head_ancestry=0,
+                                      audit_results=self.reports(bridge=[], head=[issue]))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("New manifest audit issues", result.stdout + result.stderr)
+
+    def test_ordinary_mode_never_checks_ancestry_or_uses_bridge(self):
+        result, calls = run_guard(mode="changed", base_ancestry=128, head_ancestry=128,
+                                  audit_results=self.reports())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = [call["cli"] for call in calls if "cli" in call]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--expected-encoder-checkout", commands[0])
+        self.assertNotIn("--all", commands[0])
+        self.assertNotIn("--json", commands[0])
+        self.assertNotIn("attestation bridge", result.stdout)
+
+    def test_bridge_predicate_accepts_only_the_exact_singleton_json(self):
+        source = compile(heredoc(step_source("Reject manual RuleSpec changes"), "PYBASEBRIDGE"),
+                         "base-bridge-predicate", "exec")
+        payloads = [
+            ({"passed": False, "issues": [PRE1883_IDENTITY_ISSUE]}, 0),
+            ({"passed": False, "issues": [PRE1883_IDENTITY_ISSUE + " "]}, 1),
+            ({"passed": False, "issues": [PRE1883_IDENTITY_ISSUE, "other"]}, 1),
+            ({"passed": False, "issues": [PRE1883_IDENTITY_ISSUE] * 2}, 1),
+            ({"passed": True, "issues": [PRE1883_IDENTITY_ISSUE]}, 1),
+            ({"passed": False, "issues": []}, 1), ([], 1),
+        ]
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-bridge-predicate-", dir=TEMP_PARENT) as directory:
+            path = Path(directory) / "base.json"
+            for payload, expected in payloads:
+                with self.subTest(payload=payload):
+                    path.write_text(json.dumps(payload))
+                    with mock.patch.object(sys, "argv", ["bridge", str(path)]):
+                        with self.assertRaises(SystemExit) as result:
+                            exec(source, {"__name__": "__main__"})
+                    self.assertEqual(result.exception.code, expected)
+            path.write_text("not JSON")
+            with mock.patch.object(sys, "argv", ["bridge", str(path)]):
+                with self.assertRaises(SystemExit) as result:
+                    exec(source, {"__name__": "__main__"})
+            self.assertEqual(result.exception.code, 1)
+
+    def test_bridged_ratchet_accepts_exactly_head_subsets_of_retry_issues(self):
+        shell = step_source("Reject manual RuleSpec changes")
+        codes = {label: compile(heredoc(shell, label), label, "exec")
+                 for label in ("PYBASEBRIDGE", "PYBRIDGEIDENTITY", "PYRATCHET")}
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-bridge-property-", dir=TEMP_PARENT) as directory:
+            before, after = Path(directory) / "base.json", Path(directory) / "head.json"
+            for base_bits in range(8):
+                for head_bits in range(8):
+                    base = {f"relative/module-{i}.yaml: issue" for i in range(3) if base_bits & (1 << i)}
+                    head = {f"relative/module-{i}.yaml: issue" for i in range(3) if head_bits & (1 << i)}
+                    with self.subTest(base=base_bits, head=head_bits):
+                        before.write_text(json.dumps(audit_report([PRE1883_IDENTITY_ISSUE])["payload"]))
+                        with mock.patch.object(sys, "argv", ["bridge", str(before)]):
+                            with self.assertRaises(SystemExit) as selected:
+                                exec(codes["PYBASEBRIDGE"], {"__name__": "__main__"})
+                        self.assertEqual(selected.exception.code, 0)
+                        # This is the supervised retry result, replacing the
+                        # identity-only report before the unchanged comparison.
+                        before.write_text(json.dumps(audit_report(sorted(base))["payload"]))
+                        after.write_text(json.dumps(audit_report(sorted(head))["payload"]))
+                        with mock.patch.object(sys, "argv", ["identity", str(before)]):
+                            exec(codes["PYBRIDGEIDENTITY"], {"__name__": "__main__"})
+                        args = ["ratchet", str(before), str(int(bool(base))), str(after), str(int(bool(head))),
+                                "/base/repository", "/head/repository", "/base/dependencies", "/head/dependencies"]
+                        status = 0
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            try:
+                                exec(codes["PYRATCHET"], {"__name__": "__main__"})
+                            except SystemExit as exc:
+                                status = exc.code
+                        self.assertEqual(status, 0 if head <= base else 1)
+                        self.assertIn(f"Inherited manifest audit issues: {len(head & base)}", stdout.getvalue())
+                        if head - base:
+                            self.assertIn(f"New manifest audit issues: {len(head - base)}", stderr.getvalue())
+
+
+class Pre1883AttestationProvisioningTests(unittest.TestCase):
+    def setUp(self):
+        self.preparation = step_source(BASE_PREPARATION_STEP)
+        self.source_fragment = marked_source(self.preparation, "pre1883-attestation-source")
+        self.provision_fragment = marked_source(self.preparation, "base-runtime-provision")
+        directory = tempfile.TemporaryDirectory(prefix="encoder-guard-attestation-source-", dir=TEMP_PARENT)
+        self.addCleanup(directory.cleanup)
+        self.root = root = Path(directory.name)
+        self.origin = root / "origin"
+        git(root, "init", "-q", "-b", "main", str(self.origin))
+        (self.origin / "pyproject.toml").write_text('version = "0.1.0"\n')
+        git(self.origin, "add", "pyproject.toml")
+        git(self.origin, "commit", "-q", "-m", "version bump")
+        self.bump = git(self.origin, "rev-parse", "HEAD")
+        git(self.origin, "commit", "-q", "--allow-empty", "-m", "base pin")
+        self.pin = git(self.origin, "rev-parse", "HEAD")
+        git(self.origin, "commit", "-q", "--allow-empty", "-m", "later main")
+        self.main = git(self.origin, "rev-parse", "HEAD")
+        self.dependencies = root / "dependencies with spaces"
+        self.head = self.dependencies / "axiom-encode"
+        self.head.mkdir(parents=True)
+        git(self.head, "init", "-q")
+        git(self.head, "fetch", "-q", "--no-tags", str(self.origin), "+refs/heads/main:refs/remotes/origin/main")
+        # A detached HEAD can predate the base. The authenticated main objects
+        # must survive the clone so the provisioner can walk base version history.
+        git(self.head, "checkout", "-q", "--detach", self.bump)
+        self.audit = root / "audit with spaces"
+        self.audit.mkdir()
+        self.tools = root / "tools"
+        self.tools.mkdir()
+        (self.tools / "python").symlink_to(sys.executable)
+        sudo = self.tools / "sudo"
+        sudo.write_text('#!/bin/sh\nexec "$@"\n')
+        sudo.chmod(0o755)
+        self.integrity = root / "integrity"
+        self.integrity.mkdir()
+        (self.integrity / "check.py").write_text(
+            "import json, os, sys\n"
+            "with open(os.environ['PROVISION_CALLS'], 'a') as log:\n"
+            "    log.write(json.dumps({'integrity': sys.argv[1:]}) + '\\n')\n")
+        base_scripts = root / "base-dependencies/axiom-encode/scripts"
+        base_scripts.mkdir(parents=True)
+        (base_scripts / "provision_verification_supervisor.py").write_text(
+            "import json, os, sys\n"
+            "with open(os.environ['PROVISION_CALLS'], 'a') as log:\n"
+            "    log.write(json.dumps({'provision': sys.argv[1:]}) + '\\n')\n")
+        self.calls = root / "calls.jsonl"
+        self.calls.touch()
+
+    def run_fragments(self, gated, *, provision=True):
+        source = self.source_fragment + (self.provision_fragment if provision else "")
+        source = source.replace("/opt/axiom-dependency-integrity", str(self.integrity))
+        return subprocess.run(["bash", "-c", "set -euo pipefail\n" + source], cwd=self.root, env={
+            **os.environ, "PATH": str(self.tools) + os.pathsep + os.environ.get("PATH", ""),
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            "AXIOM_DEPENDENCY_ROOT": str(self.dependencies), "audit_root": str(self.audit),
+            "base_dependencies": str(self.root / "base-dependencies"), "BASE_ENCODER_REF": self.pin,
+            "pre1883_base_bridge": "true" if gated else "false", "PROVISION_CALLS": str(self.calls),
+            "TRUST_APPLY_ROOT": "apply", "TRUST_EVAL_ROOT": "eval", "TRUST_CORPUS_RELEASE_ROOT": "corpus",
+        }, capture_output=True, text=True, timeout=120)
+
+    def test_source_has_independent_full_history_and_attests_only_base_provisioner(self):
+        result = self.run_fragments(True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        checkout = self.audit / "encoder-attestation-source"
+        self.assertTrue((checkout / ".git").is_dir())
+        self.assertFalse((checkout / ".git").is_symlink())
+        self.assertFalse((checkout / ".git/objects/info/alternates").exists())
+        self.assertEqual(git(checkout, "rev-parse", "--is-shallow-repository"), "false")
+        self.assertEqual(git(checkout, "rev-parse", "HEAD"), self.pin)
+        self.assertNotEqual(subprocess.run(["git", "-C", str(checkout), "symbolic-ref", "-q", "HEAD"],
+                                           capture_output=True).returncode, 0)
+        self.assertEqual(git(checkout, "config", "--get", "remote.origin.url"), OFFICIAL_ENCODER)
+        self.assertEqual(git(checkout, "rev-list", "HEAD").splitlines(), [self.pin, self.bump])
+        self.assertEqual(git(checkout, "show", f"{self.bump}:pyproject.toml"), 'version = "0.1.0"')
+        self.assertEqual(git(checkout, "cat-file", "-t", self.main), "commit")
+        for source in (self.head / ".git/objects").glob("**/*"):
+            destination = checkout / ".git/objects" / source.relative_to(self.head / ".git/objects")
+            if source.is_file() and destination.is_file():
+                self.assertNotEqual((source.stat().st_dev, source.stat().st_ino),
+                                    (destination.stat().st_dev, destination.stat().st_ino))
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertIn({"integrity": ["add", "base-encoder-attestation-source", str(checkout), "repository"]}, calls)
+        provision = next(call["provision"] for call in calls if "provision" in call)
+        self.assertEqual(provision[provision.index("--encoder-origin-repository") + 1],
+                         "github.com/TheAxiomFoundation/axiom-encode")
+        self.assertEqual(provision[provision.index("--encoder-commit") + 1], self.pin)
+        self.assertEqual(provision[provision.index("--encoder-git-root") + 1], str(checkout))
+
+    def test_non_gated_base_provisioner_has_no_attestation_flags_or_checkout(self):
+        result = self.run_fragments(False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.audit / "encoder-attestation-source").exists())
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(len(calls), 1)
+        for flag in ("--encoder-origin-repository", "--encoder-commit", "--encoder-git-root"):
+            self.assertNotIn(flag, calls[0]["provision"])
+
+    def test_shallow_or_alternates_source_fails_before_provisioning(self):
+        for metadata, content in (("shallow", self.bump + "\n"),
+                                  ("objects/info/alternates", "/missing/object-store\n"),
+                                  ("objects/info/http-alternates", "https://example.invalid/objects\n")):
+            with self.subTest(metadata=metadata):
+                path = self.head / ".git" / metadata
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                try:
+                    result = self.run_fragments(True)
+                finally:
+                    path.unlink()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse((self.audit / "encoder-attestation-source").exists())
+                self.assertEqual(self.calls.read_text(), "")
+
+    def test_both_steps_share_gate_and_head_provisioning_never_receives_flags(self):
+        guard = step_source("Reject manual RuleSpec changes")
+        self.assertEqual(marked_source(self.preparation, "pre1883-bridge-gate"),
+                         marked_source(guard, "pre1883-bridge-gate"))
+        for step in workflow_steps():
+            if step.get("name") == BASE_PREPARATION_STEP:
+                continue
+            source = step.get("run", "")
+            if "provision_verification_supervisor.py" in source:
+                for flag in ("--encoder-origin-repository", "--encoder-commit", "--encoder-git-root"):
+                    self.assertNotIn(flag, source)
+                call_start = 'sudo "$(command -v python)" -I scripts/provision_verification_supervisor.py'
+                invocation = call_start + source.split(call_start, 1)[1].split('\nsudo chown', 1)[0]
+                self.assertEqual(invocation, textwrap.dedent(r'''
+                    sudo "$(command -v python)" -I scripts/provision_verification_supervisor.py \
+                      --destination /opt/axiom-verification \
+                      --supervisor "$RUNNER_TEMP/axiom-encode-signing-supervisor" \
+                      --site-packages "$RUNNER_TEMP/axiom-verification-site-packages" \
+                      --apply-root "$TRUST_APPLY_ROOT" --eval-root "$TRUST_EVAL_ROOT" \
+                      --corpus-release-root "$TRUST_CORPUS_RELEASE_ROOT" \
+                      ${retired_root_args[@]+"${retired_root_args[@]}"} \
+                      --git "$(command -v git)"
+                    ''').strip())
+        self.assertLess(self.preparation.index("base-encoder-attestation-source"),
+                        self.preparation.index("# base-runtime-provision-start"))
+        for step in workflow_steps():
+            if step.get("name") in (BASE_PREPARATION_STEP, "Reject manual RuleSpec changes"):
+                self.assertEqual(step["env"]["BASE_ENCODER_REF"], "${{ needs.shards.outputs.base_axiom_encode_ref }}")
+                self.assertEqual(step["env"]["HEAD_ENCODER_REF"], "${{ needs.shards.outputs.axiom_encode_ref }}")
 
 
 if __name__ == "__main__":

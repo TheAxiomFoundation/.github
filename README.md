@@ -673,6 +673,34 @@ module validation. Staged inactive composer pins remain inactive for older
 encoder callers. Local fixtures exercise this comparison; they do not establish
 the external encoder's manifest-admission policy on complete live repositories.
 
+In an encoder that contains axiom-encode #1859
+(`630aa73931e5aa87c51d25fe448e38dbcfaed50f`) but not #1883
+(`b5e85ab4135be6ed4acaf2b2cd2b783648af2f6e`), the guard sends global Git options
+that the encoder's own trusted Git wrapper rejects, so it returns one identity
+issue before it loads any manifest. For a dependency-pin change whose base
+encoder falls in that range and whose proposed encoder contains #1883, the
+validator prepares a separate full-history encoder checkout, from which the
+base provisioner writes the base runtime's attestation. When the base audit
+then exits 1 with the single issue
+`Cannot verify the running pinned encoder identity: encoder Git metadata is unavailable: git rev-parse failed`,
+the validator repeats that audit without `--expected-encoder-checkout`. An
+error in any of the three ancestry checks fails the step, and every other pin
+change keeps the existing audit path.
+
+The repeated audit uses the base encoder's own sealed runtime, supervisor and
+inputs. Without `--expected-encoder-checkout`, the encoder at `630aa739` reads
+its identity from that attestation. The base provisioner writes it as root
+after it verifies the commit, the official origin, the declared version and the
+version-bump history. It also exports the encoder package from that commit,
+installs it in the runtime and records the package's tree hash in the
+attestation. The bridge changes only where the base issue set comes from: issue
+keys and the ratchet comparison stay the same, and the proposed runtime and the
+ordinary audit path don't change. Invalid results fail the step, and so does an
+encoder identity failure in the repeated audit, whether the encoder reports it
+for the run or for one manifest; a bad runtime attestation reaches the audit as
+an identity failure. Remove the bridge once no RuleSpec caller pins an encoder
+in that range.
+
 The Python/pip installation steps clear ambient Python import settings and use
 isolated imports and pip configuration. Encoder installation uses authenticated
 source copies outside the candidate checkout. The composer setup disables the
