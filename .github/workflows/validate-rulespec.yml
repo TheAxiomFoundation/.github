@@ -4865,6 +4865,7 @@ jobs:
           BASE_ENCODER_REF: ${{ needs.shards.outputs.base_axiom_encode_ref }}
           HEAD_ENCODER_REF: ${{ needs.shards.outputs.axiom_encode_ref }}
           BASE_CORPUS_REF: ${{ needs.shards.outputs.base_axiom_corpus_ref }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
           RELEASE_BASE_URL: ${{ inputs.corpus-release-base-url }}
           RELEASE_REGISTRY_URL: ${{ inputs.corpus-release-registry-url }}
           RELEASE_REGISTRY_ANON_KEY: ${{ inputs.corpus-release-registry-anon-key }}
@@ -5141,7 +5142,7 @@ jobs:
           base_corpus_fetch() {
             # Conditional probes suppress errexit inside this function.
             python -I /opt/axiom-dependency-integrity/check.py verify || return "$?"
-            /opt/axiom-base-verification/python/bin/python${{ inputs.python-version }} -I -B -c \
+            "/opt/axiom-base-verification/python/bin/python${PYTHON_VERSION}" -I -B -c \
               'from axiom_encode.entrypoint import main; raise SystemExit(main())' "$@"
           }
           # corpus-fetch places only the artifacts that are missing and verifies

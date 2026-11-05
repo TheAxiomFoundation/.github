@@ -569,12 +569,16 @@ class PinBumpManifestTests(unittest.TestCase):
             (tools / "python").symlink_to(sys.executable)
             source = source.replace("/opt/axiom-dependency-integrity", str(integrity))
             source = source.replace("/opt/axiom-base-verification", str(root / "runtime"))
-            source = source.replace("${{ inputs.python-version }}", "3.13")
+            # The step passes the Python version through env, so its script
+            # carries no expression.
+            self.assertEqual(preparation["env"]["PYTHON_VERSION"], "${{ inputs.python-version }}")
+            self.assertNotIn("${{", source)
             for invocation in ("if base_corpus_fetch corpus-fetch; then exit 0; else exit $?; fi",
                                "if ! base_corpus_fetch corpus-fetch --help; then exit 1; fi"):
                 with self.subTest(invocation=invocation):
                     result = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n" + invocation],
-                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                                                 "PYTHON_VERSION": "3.13"},
                                             capture_output=True, text=True, timeout=10)
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn("DependencyIntegrityError", result.stderr)
@@ -639,7 +643,10 @@ class PinBumpManifestTests(unittest.TestCase):
             (tools / "python").symlink_to(sys.executable)
             source = source.replace("/opt/axiom-dependency-integrity", str(integrity))
             source = source.replace("/opt/axiom-base-verification", str(root / "runtime"))
-            source = source.replace("${{ inputs.python-version }}", "3.13")
+            # The step passes the Python version through env, so its script
+            # carries no expression.
+            self.assertEqual(preparation["env"]["PYTHON_VERSION"], "${{ inputs.python-version }}")
+            self.assertNotIn("${{", source)
             for invocation, status in (
                 ("base_corpus_fetch corpus-fetch --help", 0),
                 ("base_corpus_fetch corpus-fetch --corpus-path corpus --fixture-status 0", 0),
@@ -648,13 +655,15 @@ class PinBumpManifestTests(unittest.TestCase):
             ):
                 with self.subTest(invocation=invocation):
                     result = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n" + invocation],
-                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                                                 "PYTHON_VERSION": "3.13"},
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
             # The protected-base step's capability probe passes for such an encoder.
             probe = subprocess.run(["bash", "-c", "set -euo pipefail\nbase_corpus_fetch() {\n" + source + "\n}\n"
                                     "if ! base_corpus_fetch corpus-fetch --help >/dev/null 2>&1; then exit 1; fi"],
-                                   env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")},
+                                   env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                                        "PYTHON_VERSION": "3.13"},
                                    capture_output=True, text=True, timeout=10)
             self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
 
