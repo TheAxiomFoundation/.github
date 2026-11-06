@@ -224,7 +224,8 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
 - A drift target that does not exist gives a full run.
 - The validate step prints one `RULESPEC_VALIDATION_CHUNK files=N status=S
   single=PATH|-` line after each worker's log, for callers that turn failures
-  into per-file issues (the validator prints no summary for a one-file chunk).
+  into per-file issues (the validator prints no summary for a one-file chunk),
+  then one `RULESPEC_VALIDATION_CHUNKS total=N` line.
 - Any parse error in the scope step keeps the default selection.
 - `drift-targets` (JSON list of module paths) scopes a `schedule` or
   `workflow_dispatch` run to those modules and their companions, for the

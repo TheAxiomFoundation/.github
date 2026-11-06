@@ -473,6 +473,7 @@ def test_validate_step_prints_one_result_line_per_chunk() -> None:
     run = next(step for step in steps if step.get("name") == "Validate RuleSpec YAML")["run"]
     assert "RULESPEC_VALIDATION_CHUNK files=%s status=%s single=%s" in run
     assert run.count('chunk_result "') == 2
+    assert run.count("RULESPEC_VALIDATION_CHUNKS total=") == 2
 
 
 def main() -> None:
