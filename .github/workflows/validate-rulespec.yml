@@ -5866,10 +5866,14 @@ jobs:
             if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ]; then
               # The floor only moves forward on first-parent main: lowering
               # it would re-admit revoked producers (axiom-encode#2095).
+              # This check runs with the generated guard only; without the
+              # guard the floor enforces nothing (scoping is off then).
               encoder_history="$AXIOM_DEPENDENCY_ROOT/axiom-encode"
+              # Capture first: `rev-list | grep -q` would end in SIGPIPE under
+              # pipefail on a long history and reject every valid floor.
+              first_parent_main="$(git -C "$encoder_history" rev-list --first-parent refs/remotes/origin/main)"
               if [[ ! "$BASE_ENCODER_REF" =~ ^[0-9a-f]{40}$ ]] \
-                  || ! git -C "$encoder_history" rev-list --first-parent refs/remotes/origin/main \
-                    | grep -qx "$PRODUCER_FLOOR" \
+                  || ! grep -qxF -- "$PRODUCER_FLOOR" <<< "$first_parent_main" \
                   || ! git -C "$encoder_history" merge-base --is-ancestor "$BASE_ENCODER_REF" "$PRODUCER_FLOOR"; then
                 echo "EncoderMainVerifier: a floor-only change must move axiom_encode_ref forward on first-parent main (base $BASE_ENCODER_REF, new $PRODUCER_FLOOR)" >&2
                 exit 1

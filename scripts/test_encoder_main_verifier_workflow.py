@@ -414,6 +414,58 @@ def test_pull_requests_ignore_drift_targets() -> None:
     assert result["targets"]["us-ma"][0] == "changed"
 
 
+def run_floor_direction_check(commits: int, base_index: int, floor_index: int) -> int:
+    """Run the guard's forward-floor check on a synthetic first-parent history."""
+
+    workflow = WORKFLOW.read_text()
+    block = workflow[
+        workflow.index("            if [ \"${ENCODER_FLOOR_ONLY:-false}\" = \"true\" ]; then"):
+        workflow.index("              head_floor_args+=(--all)")
+    ]
+    with tempfile.TemporaryDirectory(prefix="floor-direction-") as directory:
+        root = Path(directory)
+        history = root / "deps" / "axiom-encode"
+        history.mkdir(parents=True)
+        base.git(history, "init", "-q", "-b", "main")
+        # fast-import builds a long first-parent chain quickly.
+        stream = "".join(
+            f"commit refs/heads/main\nmark :{n + 1}\n"
+            "committer Fixture <f@example.com> 1767225600 +0000\n"
+            f"data {len(str(n))}\n{n}\n"
+            + (f"from :{n}\n" if n else "")
+            + "\n"
+            for n in range(commits)
+        )
+        subprocess.run(["git", "fast-import", "--quiet"], cwd=history, input=stream,
+                       text=True, check=True)
+        base.git(history, "update-ref", "refs/remotes/origin/main", "refs/heads/main")
+        chain = base.git(history, "rev-list", "--reverse", "refs/heads/main").split()
+        script = (
+            "set -euo pipefail\n" + block + "\n              echo forward\n            fi\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=root,
+            env={
+                **os.environ,
+                "ENCODER_FLOOR_ONLY": "true",
+                "AXIOM_DEPENDENCY_ROOT": str(root / "deps"),
+                "BASE_ENCODER_REF": chain[base_index],
+                "PRODUCER_FLOOR": chain[floor_index],
+            },
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode
+
+
+def test_forward_floor_check_survives_a_long_history() -> None:
+    # 2,000 first-parent commits print about 82 KB, over a 64 KB pipe buffer.
+    assert run_floor_direction_check(2000, 1000, 1998) == 0
+    assert run_floor_direction_check(2000, 1998, 1000) != 0
+
+
 def main() -> None:
     for name, function in sorted(globals().items()):
         if name.startswith("test_") and callable(function):
