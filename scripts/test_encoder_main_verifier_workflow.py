@@ -461,9 +461,18 @@ def run_floor_direction_check(commits: int, base_index: int, floor_index: int) -
 
 
 def test_forward_floor_check_survives_a_long_history() -> None:
-    # 2,000 first-parent commits print about 82 KB, over a 64 KB pipe buffer.
-    assert run_floor_direction_check(2000, 1000, 1998) == 0
-    assert run_floor_direction_check(2000, 1998, 1000) != 0
+    # The old `rev-list | grep -q` failed under pipefail for short and long
+    # histories alike; 2,000 commits also exceed a 64 KB pipe buffer.
+    for commits in (50, 2000):
+        assert run_floor_direction_check(commits, commits // 2, commits - 2) == 0
+        assert run_floor_direction_check(commits, commits - 2, commits // 2) == 1
+
+
+def test_validate_step_prints_one_result_line_per_chunk() -> None:
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    run = next(step for step in steps if step.get("name") == "Validate RuleSpec YAML")["run"]
+    assert "RULESPEC_VALIDATION_CHUNK files=%s status=%s single=%s" in run
+    assert run.count('chunk_result "') == 2
 
 
 def main() -> None:

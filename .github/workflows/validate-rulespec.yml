@@ -6173,11 +6173,23 @@ jobs:
               > "$log_path" 2>&1
           }
 
+          # One result line per chunk, after its log (axiom-encode#2094): the
+          # drift report needs it because the validator prints no failure
+          # summary for a one-file chunk or after a crash.
+          chunk_result() {
+            local count="$1" chunk_status="$2" single="-"
+            if [ "$count" -eq 1 ]; then
+              single="$3"
+            fi
+            printf 'RULESPEC_VALIDATION_CHUNK files=%s status=%s single=%s\n' "$count" "$chunk_status" "$single"
+          }
+
           if [ "$worker_count" -eq 1 ]; then
             log_path="$RUNNER_TEMP/rulespec-validation-0.log"
             status=0
             run_validation "$log_path" "${selected[@]}" || status=$?
             cat "$log_path"
+            chunk_result "${#selected[@]}" "$status" "${selected[0]:-}"
             exit "$status"
           fi
 
@@ -6202,13 +6214,19 @@ jobs:
           done
 
           status=0
+          statuses=()
           for pid in "${pids[@]}"; do
-            if ! wait "$pid"; then
+            chunk_status=0
+            wait "$pid" || chunk_status=$?
+            statuses+=("$chunk_status")
+            if [ "$chunk_status" -ne 0 ]; then
               status=1
             fi
           done
-          for log_path in "${logs[@]}"; do
-            cat "$log_path"
+          for ((worker = 0; worker < worker_count; worker++)); do
+            cat "${logs[$worker]}"
+            mapfile -t chunk < "$chunk_dir/$worker.txt"
+            chunk_result "${#chunk[@]}" "${statuses[$worker]}" "${chunk[0]:-}"
           done
           exit "$status"
 
