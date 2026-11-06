@@ -176,6 +176,42 @@ operational budget rather than a guaranteed runtime bound. A timeout never
 admits a rewind: it fails the proof job, skips dependent validation, and makes
 the aggregate check fail.
 
+### Encoder-main verifier
+
+The `encoder-verifier` input defaults to `pinned`, which keeps the existing
+behavior: `axiom_encode_ref` verifies every pull request. With `main`
+(axiom-encode#2091, #2093, #2095):
+
+- The `shards` job resolves official `TheAxiomFoundation/axiom-encode` `main`
+  once per run (`verifier_encode_ref`). Every matrix leg checks out, attests
+  and runs that exact commit. The guard step runs `axiom-encode
+  verifier-identity` and writes the verifier commit, version and producer
+  floor to the check summary.
+- `axiom_encode_ref` becomes the producer floor. The head guard passes
+  `--encoder-producer-floor <axiom_encode_ref>`: a signed producer is
+  admitted when it is the floor or a first-parent `main` descendant of it.
+  Moving the floor revokes every producer below it; the guard then fails for
+  their manifests until they are re-encoded.
+- A change of `axiom_encode_ref` alone is not a dependency bump. It runs the
+  first shard only (generated guard and whole-repository gates) with no
+  module targets.
+- A change of `known-validation-gaps.yaml` with, at most, the matching
+  `validation_waiver_set_sha256` in `.axiom/toolchain.toml` validates only the
+  modules whose waiver records changed (mode `changed-waiver-ledger`). The
+  waiver audit and generated guard still run on the whole repository.
+  Per-file waiver bindings (axiom-encode#2092) keep the signed manifests of
+  other files admissible.
+- Engine, composer, workflow and corpus pins stay full gates. A corpus pin
+  keeps today's behavior (changed-file mode for a corpus-only toolchain
+  change in the default selector, full targets with import-aware selection):
+  the workflow cannot yet derive the files that cite changed provisions, so
+  citing-file scoping is not done here.
+- Any parse error in the scope step keeps the default selection.
+
+`main` needs an axiom-encode `main` that has `verifier-identity` and
+`--encoder-producer-floor` (axiom-encode#2101) and per-file waiver bindings
+(axiom-encode#2097).
+
 ### Import-aware PR selection
 
 The `import-aware-selection` input defaults to `false`. With automatic roots,
