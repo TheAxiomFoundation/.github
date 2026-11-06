@@ -5723,6 +5723,10 @@ jobs:
               raise SystemExit(1)
           if not isinstance(targets, list) or not targets or len(targets) > 20000:
               raise SystemExit(1)
+          # A listed module that does not exist gives a full run, never a
+          # leg that is green with zero files.
+          if any(not os.path.isfile(path) for path in targets if isinstance(path, str)):
+              raise SystemExit(1)
           for path in targets:
               parts = path.split("/") if isinstance(path, str) else []
               if (len(parts) < 3 or path.startswith("/") or "\\" in path
@@ -5860,6 +5864,16 @@ jobs:
             fi
             head_floor_args=(--encoder-producer-floor "$PRODUCER_FLOOR")
             if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ]; then
+              # The floor only moves forward on first-parent main: lowering
+              # it would re-admit revoked producers (axiom-encode#2095).
+              encoder_history="$AXIOM_DEPENDENCY_ROOT/axiom-encode"
+              if [[ ! "$BASE_ENCODER_REF" =~ ^[0-9a-f]{40}$ ]] \
+                  || ! git -C "$encoder_history" rev-list --first-parent refs/remotes/origin/main \
+                    | grep -qx "$PRODUCER_FLOOR" \
+                  || ! git -C "$encoder_history" merge-base --is-ancestor "$BASE_ENCODER_REF" "$PRODUCER_FLOOR"; then
+                echo "EncoderMainVerifier: a floor-only change must move axiom_encode_ref forward on first-parent main (base $BASE_ENCODER_REF, new $PRODUCER_FLOOR)" >&2
+                exit 1
+              fi
               head_floor_args+=(--all)
             fi
           fi

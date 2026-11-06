@@ -319,6 +319,9 @@ def test_guard_passes_the_floor_only_to_the_head_runtime() -> None:
     assert 'head_floor_args=(--encoder-producer-floor "$PRODUCER_FLOOR")' in block
     # A floor-only change checks every manifest against the new floor.
     assert "head_floor_args+=(--all)" in block
+    # The floor may only move forward on first-parent main.
+    assert 'merge-base --is-ancestor "$BASE_ENCODER_REF" "$PRODUCER_FLOOR"' in block
+    assert "rev-list --first-parent refs/remotes/origin/main" in block
     steps = yaml.safe_load(workflow)["jobs"]["validate"]["steps"]
     names = [step.get("name") for step in steps]
     record = steps[names.index("Record the encoder-main verifier")]
@@ -390,6 +393,16 @@ def test_invalid_drift_targets_run_everything() -> None:
         for mode, modules, _companions in result["targets"].values():
             assert mode in {"full-drift-fallback", "full-push"}, (targets, mode)
             assert modules, targets
+
+
+def test_missing_drift_target_runs_everything() -> None:
+    targets = ["us-ma/statutes/local.yaml", "us-ma/statutes/missing.yaml"]
+    with environment(DRIFT_TARGETS=json.dumps(targets), EVENT_NAME="workflow_dispatch",
+                     DRIFT_TARGETS_VALID="true"):
+        result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
+    mode, modules, _companions = result["targets"]["us-ma"]
+    assert mode == "full-drift-fallback", mode
+    assert len(modules) > 1
 
 
 def test_pull_requests_ignore_drift_targets() -> None:

@@ -215,6 +215,13 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   and ledger scoping are off (full dependency bump and default selection).
 - With `import-aware-selection`, a ledger-only change still selects the full
   matrix: changed waiver records are global validation inputs there.
+- A floor-only change must move `axiom_encode_ref` forward on first-parent
+  `main`; lowering the floor fails, because it would re-admit revoked
+  producers.
+- A full dependency bump (for example an engine pin) in `main` mode audits
+  the base with the base floor encoder and the head with encoder `main`, so
+  the comparison also shows every difference between the floor and `main`.
+- A drift target that does not exist gives a full run.
 - Any parse error in the scope step keeps the default selection.
 - `drift-targets` (JSON list of module paths) scopes a `schedule` or
   `workflow_dispatch` run to those modules and their companions, for the
