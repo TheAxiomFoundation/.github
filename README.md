@@ -176,6 +176,66 @@ operational budget rather than a guaranteed runtime bound. A timeout never
 admits a rewind: it fails the proof job, skips dependent validation, and makes
 the aggregate check fail.
 
+### Encoder-main verifier
+
+The `encoder-verifier` mode defaults to `pinned`, which keeps the existing
+behavior: `axiom_encode_ref` verifies every pull request. With `main`
+(axiom-encode#2091, #2093, #2095):
+
+- The `shards` job resolves official `TheAxiomFoundation/axiom-encode` `main`
+  once per run (`verifier_encode_ref`). Every matrix leg checks out, attests
+  and runs that exact commit. The guard step runs `axiom-encode
+  verifier-identity` and writes the verifier commit, version and producer
+  floor to the check summary.
+- `axiom_encode_ref` becomes the producer floor. The head guard passes
+  `--encoder-producer-floor <axiom_encode_ref>`: a signed producer is
+  admitted when it is the floor or a first-parent `main` descendant of it.
+  Moving the floor revokes every producer below it; the guard then fails for
+  their manifests until they are re-encoded.
+- A change of `axiom_encode_ref` alone is not a dependency bump. It runs the
+  first shard only (generated guard and whole-repository gates) with no
+  module targets.
+- A change of `known-validation-gaps.yaml` with, at most, the matching
+  `validation_waiver_set_sha256` in `.axiom/toolchain.toml` validates only the
+  modules whose waiver records changed (mode `changed-waiver-ledger`). The
+  waiver audit and generated guard still run on the whole repository.
+  Per-file waiver bindings (axiom-encode#2092) keep the signed manifests of
+  other files admissible.
+- Engine, composer, workflow and corpus pins stay full gates. A corpus pin
+  keeps today's behavior (changed-file mode for a corpus-only toolchain
+  change in the default selector, full targets with import-aware selection):
+  the workflow cannot yet derive the files that cite changed provisions, so
+  citing-file scoping is not done here.
+- The mode is protected configuration: `[workflow_toolchain] encoder_verifier
+  = "main"` in `.axiom/workflow-toolchain.toml`. The `encoder-verifier` input
+  must equal it (a pull request controls its own caller), and changing the key
+  is a full dependency change.
+- A floor-only change runs the head guard with `--all`, so every manifest is
+  checked against the new floor. With `run-generated-guard: false`, floor-only
+  and ledger scoping are off (full dependency bump and default selection).
+- With `import-aware-selection`, a ledger-only change still selects the full
+  matrix: changed waiver records are global validation inputs there.
+- A floor-only change must move `axiom_encode_ref` forward on first-parent
+  `main`; lowering the floor fails, because it would re-admit revoked
+  producers.
+- A full dependency bump (for example an engine pin) in `main` mode audits
+  the base with the base floor encoder and the head with encoder `main`, so
+  the comparison also shows every difference between the floor and `main`.
+- A drift target that does not exist gives a full run.
+- The validate step prints one `RULESPEC_VALIDATION_CHUNK files=N status=S
+  single=PATH|-` line after each worker's log, for callers that turn failures
+  into per-file issues (the validator prints no summary for a one-file chunk),
+  then one `RULESPEC_VALIDATION_CHUNKS total=N` line.
+- Any parse error in the scope step keeps the default selection.
+- `drift-targets` (JSON list of module paths) scopes a `schedule` or
+  `workflow_dispatch` run to those modules and their companions, for the
+  event-driven drift run of axiom-encode#2094. Pull requests ignore it. An
+  invalid list runs every target (`full-drift-fallback`).
+
+`main` needs an axiom-encode `main` that has `verifier-identity` and
+`--encoder-producer-floor` (axiom-encode#2101) and per-file waiver bindings
+(axiom-encode#2097).
+
 ### Import-aware PR selection
 
 The `import-aware-selection` input defaults to `false`. With automatic roots,
