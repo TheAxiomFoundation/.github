@@ -178,7 +178,7 @@ the aggregate check fail.
 
 ### Encoder-main verifier
 
-The `encoder-verifier` input defaults to `pinned`, which keeps the existing
+The `encoder-verifier` mode defaults to `pinned`, which keeps the existing
 behavior: `axiom_encode_ref` verifies every pull request. With `main`
 (axiom-encode#2091, #2093, #2095):
 
@@ -206,6 +206,15 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   change in the default selector, full targets with import-aware selection):
   the workflow cannot yet derive the files that cite changed provisions, so
   citing-file scoping is not done here.
+- The mode is protected configuration: `[workflow_toolchain] encoder_verifier
+  = "main"` in `.axiom/workflow-toolchain.toml`. The `encoder-verifier` input
+  must equal it (a pull request controls its own caller), and changing the key
+  is a full dependency change.
+- A floor-only change runs the head guard with `--all`, so every manifest is
+  checked against the new floor. With `run-generated-guard: false`, floor-only
+  and ledger scoping are off (full dependency bump and default selection).
+- With `import-aware-selection`, a ledger-only change still selects the full
+  matrix: changed waiver records are global validation inputs there.
 - Any parse error in the scope step keeps the default selection.
 - `drift-targets` (JSON list of module paths) scopes a `schedule` or
   `workflow_dispatch` run to those modules and their companions, for the

@@ -206,57 +206,93 @@ def test_unsafe_waiver_path_keeps_default_selection() -> None:
     assert json.loads(outputs["scope_drop"]) == [] and json.loads(outputs["scope_add"]) == []
 
 
-def test_dependency_step_reports_a_floor_only_encoder_pin_change() -> None:
-    for verifier, floor_only, pins_changed in (
-        ("main", "true", "false"), ("pinned", "false", "true"),
-    ):
-        with base.WorkflowInputFixture(
-            table=base.workflow_toolchain(base.WORKFLOW_INPUT_PINS),
-            caller=base.literal_pin_caller(base.WORKFLOW_INPUT_PINS),
-        ) as fixture:
-            proposed = {**base.WORKFLOW_INPUT_PINS, "axiom_encode_ref": "9" * 40}
-            fixture.write(base.WORKFLOW_TOOLCHAIN, base.workflow_toolchain(proposed))
-            head = base.commit(fixture.root, "encoder pin")
-            output = fixture.root / "output"
-            with environment(ENCODER_VERIFIER=verifier):
-                result = base.run_workflow_inputs(
-                    fixture.root, fixture.base, pins=proposed, head=head, output=output,
-                )
-            assert result.returncode == 0, result.stderr
-            bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
-            assert bound["encoder_floor_only"] == floor_only, verifier
-            assert bound["dependency_pins_changed"] == pins_changed, verifier
+def run_dependency_step(
+    *, base_mode: str | None, head_mode: str | None, requested: str,
+    pin_changes: dict[str, str], guard: str = "true",
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    def table(mode, pins):
+        extra = {"encoder_verifier": mode} if mode else {}
+        return base.workflow_toolchain({**pins, **extra})
 
-
-def test_engine_pin_change_stays_a_full_dependency_bump_with_main_verifier() -> None:
     with base.WorkflowInputFixture(
-        table=base.workflow_toolchain(base.WORKFLOW_INPUT_PINS),
+        table=table(base_mode, base.WORKFLOW_INPUT_PINS),
         caller=base.literal_pin_caller(base.WORKFLOW_INPUT_PINS),
     ) as fixture:
-        proposed = {**base.WORKFLOW_INPUT_PINS, "axiom_encode_ref": "9" * 40,
-                    "axiom_rules_engine_ref": "4" * 40}
-        fixture.write(base.WORKFLOW_TOOLCHAIN, base.workflow_toolchain(proposed))
-        head = base.commit(fixture.root, "encoder and engine pins")
+        proposed = {**base.WORKFLOW_INPUT_PINS, **pin_changes}
+        fixture.write(base.WORKFLOW_TOOLCHAIN, table(head_mode, proposed))
+        if not pin_changes and base_mode == head_mode:
+            fixture.write("fixture.txt", "head\n")  # a commit with no pin change
+        head = base.commit(fixture.root, "configuration change")
         output = fixture.root / "output"
-        with environment(ENCODER_VERIFIER="main"):
+        with environment(ENCODER_VERIFIER=requested, RUN_GENERATED_GUARD=guard):
             result = base.run_workflow_inputs(
                 fixture.root, fixture.base, pins=proposed, head=head, output=output,
             )
-        assert result.returncode == 0, result.stderr
-        bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
-        assert bound["encoder_floor_only"] == "false"
-        assert bound["dependency_pins_changed"] == "true"
+        bound = (
+            dict(line.split("=", 1) for line in output.read_text().splitlines())
+            if result.returncode == 0 else {}
+        )
+        return result, bound
+
+
+def test_dependency_step_reports_a_floor_only_encoder_pin_change() -> None:
+    encoder_pin = {"axiom_encode_ref": "9" * 40}
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main", pin_changes=encoder_pin,
+    )
+    assert result.returncode == 0, result.stderr
+    assert bound["encoder_verifier"] == "main"
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("true", "false")
+    result, bound = run_dependency_step(
+        base_mode=None, head_mode=None, requested="pinned", pin_changes=encoder_pin,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+    # Without the generated guard nothing enforces the floor: full bump.
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main", pin_changes=encoder_pin,
+        guard="false",
+    )
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+
+
+def test_engine_pin_change_stays_a_full_dependency_bump_with_main_verifier() -> None:
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main",
+        pin_changes={"axiom_encode_ref": "9" * 40, "axiom_rules_engine_ref": "4" * 40},
+    )
+    assert result.returncode == 0, result.stderr
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+
+
+def test_the_caller_cannot_choose_its_verifier_mode() -> None:
+    for protected, requested in (("main", "pinned"), (None, "main")):
+        result, _ = run_dependency_step(
+            base_mode=protected, head_mode=protected, requested=requested, pin_changes={},
+        )
+        assert result.returncode != 0, (protected, requested)
+        assert "must match the protected" in result.stdout + result.stderr
+
+
+def test_switching_the_mode_is_a_full_dependency_change() -> None:
+    result, bound = run_dependency_step(
+        base_mode=None, head_mode="main", requested="main",
+        pin_changes={"axiom_encode_ref": "9" * 40},
+    )
+    assert result.returncode == 0, result.stderr
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
 
 
 def test_invalid_verifier_value_fails_closed() -> None:
-    with base.WorkflowInputFixture(
-        table=base.workflow_toolchain(base.WORKFLOW_INPUT_PINS),
-        caller=base.literal_pin_caller(base.WORKFLOW_INPUT_PINS),
-    ) as fixture:
-        with environment(ENCODER_VERIFIER="latest"):
-            result = base.run_workflow_inputs(fixture.root, fixture.base)
-        assert result.returncode != 0
-        assert "encoder-verifier must be pinned or main" in result.stdout + result.stderr
+    result, _ = run_dependency_step(
+        base_mode="latest", head_mode="latest", requested="pinned", pin_changes={},
+    )
+    assert result.returncode != 0
+    assert "encoder_verifier must be pinned or main" in result.stdout + result.stderr
+    result, _ = run_dependency_step(
+        base_mode=None, head_mode=None, requested="latest", pin_changes={},
+    )
+    assert result.returncode != 0
 
 
 def test_validation_targets_apply_the_verifier_scope() -> None:
@@ -280,8 +316,18 @@ def test_guard_passes_the_floor_only_to_the_head_runtime() -> None:
     start = workflow.index("# encoder-main-verifier-guard-start")
     end = workflow.index("# encoder-main-verifier-guard-end")
     block = workflow[start:end]
-    assert "verifier-identity" in block and "GITHUB_STEP_SUMMARY" in block
     assert 'head_floor_args=(--encoder-producer-floor "$PRODUCER_FLOOR")' in block
+    # A floor-only change checks every manifest against the new floor.
+    assert "head_floor_args+=(--all)" in block
+    steps = yaml.safe_load(workflow)["jobs"]["validate"]["steps"]
+    names = [step.get("name") for step in steps]
+    record = steps[names.index("Record the encoder-main verifier")]
+    assert names.index("Record the encoder-main verifier") < names.index("Reject manual RuleSpec changes")
+    assert "run-generated-guard" not in record["if"]
+    assert "verifier-identity" in record["run"] and "GITHUB_STEP_SUMMARY" in record["run"]
+    assert "inputs.encoder-verifier" not in workflow.split("jobs:", 1)[1].replace(
+        "ENCODER_VERIFIER: ${{ inputs.encoder-verifier }}\n          RUN_GENERATED_GUARD", ""
+    )
     assert 'if [ "$runtime" = /opt/axiom-verification ]; then' in workflow
     # Every head encoder checkout follows the verifier, never the bare pin.
     assert "needs.shards.outputs.axiom_encode_ref }}\n          path:" not in workflow
@@ -322,8 +368,10 @@ def test_shard_selection_applies_the_verifier_scope() -> None:
 
 def test_drift_targets_scope_a_dispatched_run() -> None:
     targets = ["us-ma/statutes/local.yaml", "us/regulations/independent.yml"]
-    with environment(DRIFT_TARGETS=json.dumps(targets), EVENT_NAME="workflow_dispatch"):
+    with environment(DRIFT_TARGETS=json.dumps(targets), EVENT_NAME="workflow_dispatch",
+                     DRIFT_TARGETS_VALID="true"):
         result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
+    assert result["drift-targets-valid"] == "true"
     assert result["matrix"] == ["us-ma", "us"], result["matrix"]
     assert result["targets"]["us-ma"][:2] == ("drift-targets", ["us-ma/statutes/local.yaml"])
     assert result["targets"]["us"][1] == ["us/regulations/independent.yml"]
@@ -331,9 +379,13 @@ def test_drift_targets_scope_a_dispatched_run() -> None:
 
 
 def test_invalid_drift_targets_run_everything() -> None:
-    for targets in ('["../etc/passwd.yaml"]', '"us/statutes/local.yaml"', "not json", "[]"):
-        with environment(DRIFT_TARGETS=targets, EVENT_NAME="workflow_dispatch"):
+    for targets in ('["../etc/passwd.yaml"]', '"us/statutes/local.yaml"', "not json", "[]",
+                    '["xx/statutes/a.yaml"]', '["us/statutes/a\\nus/b.yaml"]'):
+        # The target step sees the selector's verdict through this output.
+        with environment(DRIFT_TARGETS=targets, EVENT_NAME="workflow_dispatch",
+                         DRIFT_TARGETS_VALID="false"):
             result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
+        assert result.get("drift-targets-valid", "false") == "false", targets
         assert result["matrix"] == base.SELECTION_JURISDICTIONS, (targets, result["matrix"])
         for mode, modules, _companions in result["targets"].values():
             assert mode in {"full-drift-fallback", "full-push"}, (targets, mode)

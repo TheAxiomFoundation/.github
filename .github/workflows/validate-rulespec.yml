@@ -552,6 +552,7 @@ jobs:
       allowed-extra: ${{ steps.compute.outputs.allowed-extra }}
       revalidate-shards: ${{ steps.compute.outputs.revalidate-shards }}
       full-targets: ${{ steps.compute.outputs.full-targets }}
+      drift-targets-valid: ${{ steps.compute.outputs.drift-targets-valid }}
       axiom_encode_ref: ${{ steps.dependency_inputs.outputs.axiom_encode_ref }}
       axiom_rules_engine_ref: ${{ steps.dependency_inputs.outputs.axiom_rules_engine_ref }}
       axiom_corpus_ref: ${{ steps.dependency_inputs.outputs.axiom_corpus_ref }}
@@ -561,6 +562,7 @@ jobs:
       base_axiom_corpus_ref: ${{ steps.dependency_inputs.outputs.base_axiom_corpus_ref }}
       dependency_pins_changed: ${{ steps.dependency_inputs.outputs.dependency_pins_changed }}
       encoder_floor_only: ${{ steps.dependency_inputs.outputs.encoder_floor_only }}
+      encoder_verifier: ${{ steps.dependency_inputs.outputs.encoder_verifier }}
       verifier_encode_ref: ${{ steps.verifier_scope.outputs.verifier_encode_ref }}
       verifier_scope_drop: ${{ steps.verifier_scope.outputs.scope_drop }}
       verifier_scope_add: ${{ steps.verifier_scope.outputs.scope_add }}
@@ -606,6 +608,7 @@ jobs:
           RELEASE_REGISTRY_ANON_KEY: ${{ inputs.corpus-release-registry-anon-key }}
           PYTHON_VERSION: ${{ inputs.python-version }}
           ENCODER_VERIFIER: ${{ inputs.encoder-verifier }}
+          RUN_GENERATED_GUARD: ${{ inputs.run-generated-guard }}
         run: |
           set -euo pipefail
           for value in "$AXIOM_ENCODE_SHA" "$AXIOM_RULES_ENGINE_SHA" "$AXIOM_CORPUS_SHA" "$RULESPEC_US_SHA"; do
@@ -869,6 +872,16 @@ jobs:
               return protected_pin, pins, caller_values, direct_caller, opaque_caller
 
           protected_pin, pins, caller_values, direct_caller, opaque_caller = configuration_pins(base)
+          base_table = dict(pins)
+
+          def verifier_mode(table):
+              # The verifier mode is protected configuration, never a caller
+              # choice: a pull request controls its own caller workflow.
+              mode = table.get("encoder_verifier", "pinned")
+              if mode not in ("pinned", "main"):
+                  fail("[workflow_toolchain].encoder_verifier must be pinned or main")
+              return mode
+
           base_inputs = {key: protected_pin(key) for key in INPUTS}
           base_compose = pins.get("axiom_compose_ref", "")
           base_shared_workflow = pins.get("shared_workflow_ref", "")
@@ -894,6 +907,8 @@ jobs:
                       changed.append(key)
               if base_validator != validator_refs(revision):
                   changed.append("shared_validator_ref")
+              if verifier_mode(toolchain) != verifier_mode(base_table):
+                  changed.append("encoder_verifier")
               return changed
 
           configuration = base
@@ -953,15 +968,24 @@ jobs:
               fail("effective axiom_compose_ref must match the protected configuration")
           resolved["axiom_compose_ref"] = protected_pin("axiom_compose_ref") if compose else ""
           dependency_changes = dependency_ref_changes(protected_pin, pins, configuration)
-          encoder_verifier = os.environ.get("ENCODER_VERIFIER") or "pinned"
-          if encoder_verifier not in ("pinned", "main"):
+          encoder_verifier = verifier_mode(pins)
+          requested_verifier = os.environ.get("ENCODER_VERIFIER") or "pinned"
+          if requested_verifier not in ("pinned", "main"):
               fail("encoder-verifier must be pinned or main")
+          if requested_verifier != encoder_verifier:
+              fail("encoder-verifier must match the protected [workflow_toolchain].encoder_verifier")
           # With the encoder-main verifier, axiom_encode_ref is only the
           # producer floor (axiom-encode#2095). Moving it alone changes no
           # validator, so it is not a full dependency bump; the generated guard
           # still checks every manifest against the new floor. Every other pin
           # (engine, corpus, composer, workflow) stays a full gate.
-          encoder_floor_only = encoder_verifier == "main" and dependency_changes == ["axiom_encode_ref"]
+          # The floor is enforced by the generated guard; without the guard a
+          # floor-only change keeps the full dependency bump.
+          encoder_floor_only = (
+              encoder_verifier == "main"
+              and dependency_changes == ["axiom_encode_ref"]
+              and os.environ.get("RUN_GENERATED_GUARD") == "true"
+          )
           dependency_pins_changed = bool(dependency_changes) and not encoder_floor_only
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in resolved.items():
@@ -970,6 +994,7 @@ jobs:
               output.write(f"base_axiom_corpus_ref={base_inputs['axiom_corpus_ref']}\n")
               output.write(f"dependency_pins_changed={str(dependency_pins_changed).lower()}\n")
               output.write(f"encoder_floor_only={str(encoder_floor_only).lower()}\n")
+              output.write(f"encoder_verifier={encoder_verifier}\n")
           print("Effective dependency inputs match the protected workflow configuration.")
           PYPINS
 
@@ -977,7 +1002,8 @@ jobs:
         id: verifier_scope
         shell: bash
         env:
-          ENCODER_VERIFIER: ${{ inputs.encoder-verifier }}
+          ENCODER_VERIFIER: ${{ steps.dependency_inputs.outputs.encoder_verifier }}
+          RUN_GENERATED_GUARD: ${{ inputs.run-generated-guard }}
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           HEAD_SHA: ${{ github.sha }}
@@ -990,7 +1016,9 @@ jobs:
           if [ "${ENCODER_VERIFIER:-pinned}" = "main" ]; then
             # One resolution per run: every matrix leg uses this exact commit,
             # and the guard step records it with its producer floor.
-            verifier="$(git ls-remote https://github.com/TheAxiomFoundation/axiom-encode.git refs/heads/main | cut -f1)"
+            # Exact ref name: ls-remote patterns also match */refs/heads/main.
+            verifier="$(git ls-remote https://github.com/TheAxiomFoundation/axiom-encode.git refs/heads/main \
+              | awk -F '\t' '$2 == "refs/heads/main" { print $1 }')"
             if [[ ! "$verifier" =~ ^[0-9a-f]{40}$ ]]; then
               echo "EncoderMainVerifier: cannot resolve axiom-encode main" >&2
               exit 1
@@ -998,7 +1026,10 @@ jobs:
           fi
           echo "verifier_encode_ref=$verifier" >> "$GITHUB_OUTPUT"
           echo "Encoder verifier: $verifier (${ENCODER_VERIFIER:-pinned}); producer floor: $FLOOR_REF"
-          if [ "${ENCODER_VERIFIER:-pinned}" != "main" ] || [ "$EVENT_NAME" != "pull_request" ]; then
+          # Scoping relies on the generated guard and waiver audit covering
+          # the whole repository, so it is off when the guard is off.
+          if [ "${ENCODER_VERIFIER:-pinned}" != "main" ] || [ "$EVENT_NAME" != "pull_request" ] \
+              || [ "${RUN_GENERATED_GUARD:-true}" != "true" ]; then
             printf 'scope_drop=[]\nscope_add=[]\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1007,8 +1038,6 @@ jobs:
           import os
           import subprocess
           import tomllib
-          from pathlib import PurePosixPath
-
           import yaml
 
           LEDGER = "known-validation-gaps.yaml"
@@ -1043,7 +1072,8 @@ jobs:
 
 
           def module_path(path):
-              parts = PurePosixPath(path).parts if isinstance(path, str) else ()
+              # Split literally: PurePosixPath would collapse "//" and ".".
+              parts = path.split("/") if isinstance(path, str) else []
               if (not parts or path.startswith("/") or "\\" in path
                       or any(part in {"", ".", ".."} for part in parts)
                       or not path.endswith((".yaml", ".yml"))):
@@ -1907,6 +1937,7 @@ jobs:
           {
             echo 'revalidate-shards=[]'
             echo 'full-targets=false'
+            echo 'drift-targets-valid=false'
           } >> "$GITHUB_OUTPUT"
           if [ "$VALIDATE_ROOTS_INPUT" = "auto" ]; then
             all_shards=()
@@ -1997,13 +2028,18 @@ jobs:
                   for path in drift:
                       parts = path.split("/") if isinstance(path, str) else []
                       if (len(parts) < 3 or path.startswith("/") or "\\" in path
+                              or any(ord(char) < 32 or ord(char) == 127 for char in path)
                               or any(part in {"", ".", ".."} for part in parts)
                               or not path.endswith((".yaml", ".yml"))
                               or parts[0] not in shard_set):
                           raise ValueError(f"invalid drift target {path!r}")
                       touched_drift.add(parts[0])
               except (ValueError, TypeError) as exc:
+                  # drift-targets-valid stays false: every leg validates all
+                  # of its targets (full-drift-fallback).
                   full(f"drift targets rejected: {exc}")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("drift-targets-valid=true\n")
               print(f"scope=drift-targets ({len(drift)} modules)", file=sys.stderr)
               emit(touched_drift)
               raise SystemExit
@@ -5474,6 +5510,7 @@ jobs:
           VERIFIER_SCOPE_DROP: ${{ needs.shards.outputs.verifier_scope_drop }}
           VERIFIER_SCOPE_ADD: ${{ needs.shards.outputs.verifier_scope_add }}
           DRIFT_TARGETS: ${{ inputs.drift-targets }}
+          DRIFT_TARGETS_VALID: ${{ needs.shards.outputs.drift-targets-valid }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
@@ -5616,8 +5653,10 @@ jobs:
             # Encoder-main verifier scope (axiom-encode#2093): drop a
             # floor-only or waiver-digest-only toolchain path, and add the
             # modules whose waiver records changed.
-            mapfile -t verifier_scope_drop < <(python3 -I -c 'import json, os; [print(p) for p in json.loads(os.environ.get("VERIFIER_SCOPE_DROP") or "[]")]')
-            mapfile -t verifier_scope_add < <(python3 -I -c 'import json, os; [print(p) for p in json.loads(os.environ.get("VERIFIER_SCOPE_ADD") or "[]")]')
+            python3 -I -c 'import json, os; [print(p) for p in json.loads(os.environ.get("VERIFIER_SCOPE_DROP") or "[]")]' > "$RUNNER_TEMP/verifier-scope-drop.txt"
+            python3 -I -c 'import json, os; [print(p) for p in json.loads(os.environ.get("VERIFIER_SCOPE_ADD") or "[]")]' > "$RUNNER_TEMP/verifier-scope-add.txt"
+            mapfile -t verifier_scope_drop < "$RUNNER_TEMP/verifier-scope-drop.txt"
+            mapfile -t verifier_scope_add < "$RUNNER_TEMP/verifier-scope-add.txt"
             if [ "${#verifier_scope_add[@]}" -gt 0 ]; then
               if [ "$mode" = "changed" ]; then
                 mode="changed-waiver-ledger"
@@ -5670,7 +5709,10 @@ jobs:
             # Scoped drift run (axiom-encode#2094). Check the list again here:
             # an invalid list must give a full run, never a partial one.
             drift_list="$RUNNER_TEMP/drift-targets.txt"
-            if python3 -I - "$drift_list" <<'PY'
+            # The shard selector is the one validator (shard membership and
+            # path shape); this step re-checks the shape and requires its
+            # verdict, so an invalid list never yields a partial run.
+            if [ "${DRIFT_TARGETS_VALID:-false}" = "true" ] && python3 -I - "$drift_list" <<'PY'
           import json
           import os
           import sys
@@ -5684,6 +5726,7 @@ jobs:
           for path in targets:
               parts = path.split("/") if isinstance(path, str) else []
               if (len(parts) < 3 or path.startswith("/") or "\\" in path
+                      or any(ord(char) < 32 or ord(char) == 127 for char in path)
                       or any(part in {"", ".", ".."} for part in parts)
                       or not path.endswith((".yaml", ".yml"))):
                   raise SystemExit(1)
@@ -5725,11 +5768,43 @@ jobs:
           echo "RuleSpec companion tests selected:"
           sed 's/^/- /' "$test_file_list" || true
 
+      - name: Record the encoder-main verifier
+        # Its own step, so the record and the floor-ancestry proof exist also
+        # when the generated guard is off (axiom-encode#2093).
+        if: ${{ needs.shards.outputs.encoder_verifier == 'main' && matrix.shard == needs.shards.outputs.first }}
+        shell: bash
+        env:
+          PRODUCER_FLOOR: ${{ needs.shards.outputs.axiom_encode_ref }}
+        run: |
+          set -euo pipefail
+          unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
+          if [[ ! "$PRODUCER_FLOOR" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "EncoderMainVerifier: the producer floor must be an exact commit" >&2
+            exit 1
+          fi
+          python -I /opt/axiom-dependency-integrity/check.py verify
+          /opt/axiom-verification/axiom-encode-signing-supervisor \
+            --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
+            --trusted-python-runtime-root /opt/axiom-verification/python \
+            --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
+            --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
+            -- /opt/axiom-verification/axiom-encode verifier-identity \
+            --expected-encoder-checkout "$AXIOM_DEPENDENCY_ROOT/axiom-encode" \
+            --encoder-producer-floor "$PRODUCER_FLOOR" > "$RUNNER_TEMP/verifier-identity.json"
+          {
+            echo "### Encoder verifier"
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/verifier-identity.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Reject manual RuleSpec changes
         if: ${{ inputs.run-generated-guard && matrix.shard == needs.shards.outputs.first }}
         shell: bash
         env:
-          ENCODER_VERIFIER: ${{ inputs.encoder-verifier }}
+          ENCODER_VERIFIER: ${{ needs.shards.outputs.encoder_verifier }}
+          ENCODER_FLOOR_ONLY: ${{ needs.shards.outputs.encoder_floor_only }}
           PRODUCER_FLOOR: ${{ needs.shards.outputs.axiom_encode_ref }}
           DEPENDENCY_PINS_CHANGED: ${{ needs.shards.outputs.dependency_pins_changed }}
           BASE_ENCODER_REF: ${{ needs.shards.outputs.base_axiom_encode_ref }}
@@ -5773,8 +5848,9 @@ jobs:
 
           # encoder-main-verifier-guard-start
           # With the encoder-main verifier, the head runtime admits producers
-          # by the repository's axiom_encode_ref as a floor (axiom-encode#2095)
-          # and records the verifier commit in the check summary (#2093).
+          # by the repository's axiom_encode_ref as a floor (axiom-encode#2095).
+          # A floor-only change checks every manifest against the new floor
+          # (--all), so moving the floor revokes the producers below it.
           # Base runtimes keep their own admission rules.
           head_floor_args=()
           if [ "${ENCODER_VERIFIER:-pinned}" = "main" ]; then
@@ -5783,22 +5859,9 @@ jobs:
               exit 1
             fi
             head_floor_args=(--encoder-producer-floor "$PRODUCER_FLOOR")
-            python -I /opt/axiom-dependency-integrity/check.py verify
-            /opt/axiom-verification/axiom-encode-signing-supervisor \
-              --trusted-signing-roots /opt/axiom-verification/signing-trust-roots.json \
-              --trusted-python-runtime-root /opt/axiom-verification/python \
-              --trusted-python-import-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages \
-              --trusted-python-package-root /opt/axiom-verification/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode \
-              -- /opt/axiom-verification/axiom-encode verifier-identity \
-              --expected-encoder-checkout "$AXIOM_DEPENDENCY_ROOT/axiom-encode" \
-              --encoder-producer-floor "$PRODUCER_FLOOR" > "$RUNNER_TEMP/verifier-identity.json"
-            {
-              echo "### Encoder verifier"
-              echo
-              echo '```json'
-              cat "$RUNNER_TEMP/verifier-identity.json"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ]; then
+              head_floor_args+=(--all)
+            fi
           fi
           # encoder-main-verifier-guard-end
 
