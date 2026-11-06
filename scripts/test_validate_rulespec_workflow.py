@@ -8083,12 +8083,74 @@ def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
     print("optional retired corpus release root: ok")
 
 
+# GitHub turns each workflow string that contains a ${{ }} expression into one
+# format() expression and rejects the whole workflow, before any job starts,
+# when that expression exceeds 21,000 characters ("Exceeded max expression
+# length 21000"). Strings without an expression have no such limit. The check
+# keeps 1,000 characters of headroom in case this model of GitHub's conversion
+# undercounts.
+GITHUB_MAX_EXPRESSION_LENGTH = 21_000
+EXPRESSION_LENGTH_HEADROOM = 1_000
+TEMPLATE_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+
+
+def github_template_expression_length(value: str) -> int:
+    """Return the length of the format() expression GitHub builds from a template.
+
+    Literal text doubles quotes and braces, and each ${{ }} becomes {N} in the
+    format string plus one argument.
+    """
+    literal: list[str] = []
+    arguments: list[str] = []
+    position = 0
+    for index, match in enumerate(TEMPLATE_EXPRESSION.finditer(value)):
+        text = value[position:match.start()]
+        literal.append(text.replace("'", "''").replace("{", "{{").replace("}", "}}"))
+        literal.append("{%d}" % index)
+        arguments.append(match.group(1).strip())
+        position = match.end()
+    text = value[position:]
+    literal.append(text.replace("'", "''").replace("{", "{{").replace("}", "}}"))
+    return len("format('" + "".join(literal) + "'" + "".join(", " + argument for argument in arguments) + ")")
+
+
+def test_workflow_expression_templates_fit_github_limit() -> None:
+    import yaml
+
+    assert github_template_expression_length("a'{b}${{ x }}") == len("format('a''{{b}}{0}', x)")
+    assert github_template_expression_length("${{ x }}-${{ y }}") == len("format('{0}-{1}', x, y)")
+    limit = GITHUB_MAX_EXPRESSION_LENGTH - EXPRESSION_LENGTH_HEADROOM
+    workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
+    assert WORKFLOW in workflows
+    checked = 0
+    for path in workflows:
+        pending = [yaml.compose(path.read_text(), Loader=yaml.SafeLoader)]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, yaml.MappingNode):
+                for key, value in node.value:
+                    pending.extend((key, value))
+            elif isinstance(node, yaml.SequenceNode):
+                pending.extend(node.value)
+            elif isinstance(node, yaml.ScalarNode) and "${{" in node.value:
+                checked += 1
+                length = github_template_expression_length(node.value)
+                assert length <= limit, (
+                    f"{path.relative_to(ROOT)}:{node.start_mark.line + 1}: a string with ${{{{ }}}} expands to a "
+                    f"{length}-character expression; GitHub rejects more than {GITHUB_MAX_EXPRESSION_LENGTH}. "
+                    "Pass the value through env: so the script carries no expression."
+                )
+    assert checked
+    print(f"workflow expression templates: {checked} within GitHub's length limit")
+
+
 def main() -> None:
     if any(argument != "--selectors-only" for argument in sys.argv[1:]):
         raise SystemExit("usage: test_validate_rulespec_workflow.py [--selectors-only]")
     run_selector_tests()
     if "--selectors-only" in sys.argv[1:]:
         return
+    test_workflow_expression_templates_fit_github_limit()
     test_retired_corpus_release_root_is_passed_only_when_set()
     test_caller_scalar_loader_matches_ruleset_guard()
     test_literal_numeric_looking_pins_keep_exact_string_identity()

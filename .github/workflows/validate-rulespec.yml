@@ -4818,8 +4818,11 @@ jobs:
         working-directory: ${{ runner.temp }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          DEPENDENCY_PINS_CHANGED: ${{ needs.shards.outputs.dependency_pins_changed }}
           BASE_ENCODER_REF: ${{ needs.shards.outputs.base_axiom_encode_ref }}
+          HEAD_ENCODER_REF: ${{ needs.shards.outputs.axiom_encode_ref }}
           BASE_CORPUS_REF: ${{ needs.shards.outputs.base_axiom_corpus_ref }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
           RELEASE_BASE_URL: ${{ inputs.corpus-release-base-url }}
           RELEASE_REGISTRY_URL: ${{ inputs.corpus-release-registry-url }}
           RELEASE_REGISTRY_ANON_KEY: ${{ inputs.corpus-release-registry-anon-key }}
@@ -4894,6 +4897,75 @@ jobs:
               handle.write(record)
           PYMAINRECORD
           # base-encoder-main-record-end
+          BASE_DEPENDENCY_ROOT="$base_dependencies"
+          # pre1883-bridge-gate-start
+          pre1883_base_bridge=false
+          if [ "$DEPENDENCY_PINS_CHANGED" = "true" ]; then
+            # axiom-encode #1859 (630aa739) added the guard's encoder Git
+            # metadata check, and #1883 (b5e85ab4) made it call the trusted
+            # Git wrapper with -C first. Only a base encoder between them needs
+            # the bridge.
+            base_contains_1859=0
+            git -C "$BASE_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+              630aa73931e5aa87c51d25fe448e38dbcfaed50f "$BASE_ENCODER_REF" || base_contains_1859=$?
+            case "$base_contains_1859" in
+              0|1) ;;
+              *) echo "ManifestAuditError: base encoder ancestry check failed (status $base_contains_1859)" >&2; exit 1 ;;
+            esac
+            base_contains_1883=0
+            git -C "$BASE_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+              b5e85ab4135be6ed4acaf2b2cd2b783648af2f6e "$BASE_ENCODER_REF" || base_contains_1883=$?
+            case "$base_contains_1883" in
+              0|1) ;;
+              *) echo "ManifestAuditError: base encoder ancestry check failed (status $base_contains_1883)" >&2; exit 1 ;;
+            esac
+            head_contains_1883=0
+            git -C "$AXIOM_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+              b5e85ab4135be6ed4acaf2b2cd2b783648af2f6e "$HEAD_ENCODER_REF" || head_contains_1883=$?
+            case "$head_contains_1883" in
+              0|1) ;;
+              *) echo "ManifestAuditError: head encoder ancestry check failed (status $head_contains_1883)" >&2; exit 1 ;;
+            esac
+            if [ "$base_contains_1859" = 0 ] && [ "$base_contains_1883" = 1 ] && [ "$head_contains_1883" = 0 ]; then
+              pre1883_base_bridge=true
+            fi
+          fi
+          # pre1883-bridge-gate-end
+          # pre1883-attestation-source-start
+          encoder_attestation_args=()
+          if [ "$pre1883_base_bridge" = true ]; then
+            # Authentication unshallowed the head checkout's official main,
+            # and the loop above proved the base pin belongs to that history.
+            # A local clone copies that entire object store, including main
+            # beyond detached HEAD. Do not share objects or hardlink them:
+            # the provisioner copies .git into its root-owned snapshot.
+            attestation_source="$audit_root/encoder-attestation-source"
+            test "$(git -C "$AXIOM_DEPENDENCY_ROOT/axiom-encode" rev-parse --is-shallow-repository)" = false
+            test ! -e "$AXIOM_DEPENDENCY_ROOT/axiom-encode/.git/objects/info/alternates"
+            test ! -L "$AXIOM_DEPENDENCY_ROOT/axiom-encode/.git/objects/info/alternates"
+            test ! -e "$AXIOM_DEPENDENCY_ROOT/axiom-encode/.git/objects/info/http-alternates"
+            test ! -L "$AXIOM_DEPENDENCY_ROOT/axiom-encode/.git/objects/info/http-alternates"
+            git -c core.hooksPath=/dev/null clone --no-hardlinks --no-checkout \
+              "$AXIOM_DEPENDENCY_ROOT/axiom-encode" "$attestation_source"
+            git -C "$attestation_source" remote set-url origin https://github.com/TheAxiomFoundation/axiom-encode
+            git -C "$attestation_source" -c core.hooksPath=/dev/null checkout --detach "$BASE_ENCODER_REF"
+            test -d "$attestation_source/.git" && test ! -L "$attestation_source/.git"
+            test ! -e "$attestation_source/.git/objects/info/alternates"
+            test ! -L "$attestation_source/.git/objects/info/alternates"
+            test ! -e "$attestation_source/.git/objects/info/http-alternates"
+            test ! -L "$attestation_source/.git/objects/info/http-alternates"
+            test "$(git -C "$attestation_source" rev-parse --is-shallow-repository)" = false
+            test "$(git -C "$attestation_source" rev-parse HEAD)" = "$BASE_ENCODER_REF"
+            test -z "$(git -C "$attestation_source" status --porcelain --untracked-files=all --ignored)"
+            sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add \
+              base-encoder-attestation-source "$attestation_source" repository
+            encoder_attestation_args=(
+              --encoder-origin-repository github.com/TheAxiomFoundation/axiom-encode
+              --encoder-commit "$BASE_ENCODER_REF" --encoder-git-root "$attestation_source"
+            )
+            echo "Prepared manifest audit base attestation source at $BASE_ENCODER_REF (full history, independent objects)."
+          fi
+          # pre1883-attestation-source-end
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-rules "$base_rules" repository
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-encoder "$base_dependencies/axiom-encode" repository
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py add base-corpus "$base_dependencies/axiom-corpus" repository
@@ -5006,12 +5078,15 @@ jobs:
           fi
           python -I /opt/axiom-dependency-integrity/check.py verify
           sudo rm -rf /opt/axiom-base-verification
+          # base-runtime-provision-start
           sudo "$(command -v python)" -I -B "$base_dependencies/axiom-encode/scripts/provision_verification_supervisor.py" \
             --destination /opt/axiom-base-verification --supervisor "$audit_root/supervisor" \
             --site-packages "$audit_root/site-packages" \
             --apply-root "$TRUST_APPLY_ROOT" --eval-root "$TRUST_EVAL_ROOT" \
             --corpus-release-root "$TRUST_CORPUS_RELEASE_ROOT" \
+            ${encoder_attestation_args[@]+"${encoder_attestation_args[@]}"} \
             ${retired_root_args[@]+"${retired_root_args[@]}"} --git "$(command -v git)"
+          # base-runtime-provision-end
           sudo chown -R root:root /opt/axiom-base-verification
           sudo chmod -R go-w /opt/axiom-base-verification
           python -I /opt/axiom-dependency-integrity/check.py verify
@@ -5024,7 +5099,7 @@ jobs:
           base_corpus_fetch() {
             # Conditional probes suppress errexit inside this function.
             python -I /opt/axiom-dependency-integrity/check.py verify || return "$?"
-            /opt/axiom-base-verification/python/bin/python${{ inputs.python-version }} -I -B -c \
+            "/opt/axiom-base-verification/python/bin/python${PYTHON_VERSION}" -I -B -c \
               'from axiom_encode.entrypoint import main; raise SystemExit(main())' "$@"
           }
           # corpus-fetch places only the artifacts that are missing and verifies
@@ -5143,6 +5218,7 @@ jobs:
           fi
           sudo "$(command -v python)" -I /opt/axiom-dependency-integrity/check.py refresh-base-corpus
           printf 'BASE_RULESPEC_ROOT=%s\nBASE_DEPENDENCY_ROOT=%s\n' "$base_rules" "$base_dependencies" >> "$GITHUB_ENV"
+
       - name: Select RuleSpec validation targets
         id: validation_targets
         shell: bash
@@ -5355,6 +5431,8 @@ jobs:
           GUARD_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GUARD_LANE: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
+          BASE_ENCODER_REF: ${{ needs.shards.outputs.base_axiom_encode_ref }}
+          HEAD_ENCODER_REF: ${{ needs.shards.outputs.axiom_encode_ref }}
           # Unsupported events retain each gate's original comparison base.
           EFFECTIVE_BASE: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.rollback_rewind.outputs.effective_base || '' }}
         run: |
@@ -5400,6 +5478,9 @@ jobs:
           fi
           # generated-guard-base-ref-end
 
+          # Only notary admission receives the actual PR head (GUARD_HEAD_SHA).
+          # The legacy fallback below still audits GITHUB_SHA, the synthetic
+          # merge commit on pull_request, including its whole-repository audit.
           pr_args=()
           if [ -n "$GUARD_PR_NUMBER" ]; then
             pr_args=(--pr-number "$GUARD_PR_NUMBER")
@@ -5414,6 +5495,9 @@ jobs:
             --repo "$GITHUB_WORKSPACE" --base-ref "$admission_base" \
             --head-ref "$GUARD_HEAD_SHA" --lane "$GUARD_LANE" \
             --github-token-file "$token_file" "${pr_args[@]}" || notary_status=$?
+          # Successful admission exits before the legacy pin-bump manifest
+          # ratchet. That ratchet runs only on the legacy fallback (status 78);
+          # activated lanes rely on the external verifier's own coverage.
           case "$notary_status" in
             0) exit 0 ;;
             78) ;; # Trusted base has no consumer: mandatory legacy guard.
@@ -5441,11 +5525,111 @@ jobs:
             exit 0
           fi
 
+          # pre1883-bridge-gate-start
+          pre1883_base_bridge=false
+          if [ "$DEPENDENCY_PINS_CHANGED" = "true" ]; then
+            # axiom-encode #1859 (630aa739) added the guard's encoder Git
+            # metadata check, and #1883 (b5e85ab4) made it call the trusted
+            # Git wrapper with -C first. Only a base encoder between them needs
+            # the bridge.
+            base_contains_1859=0
+            git -C "$BASE_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+              630aa73931e5aa87c51d25fe448e38dbcfaed50f "$BASE_ENCODER_REF" || base_contains_1859=$?
+            case "$base_contains_1859" in
+              0|1) ;;
+              *) echo "ManifestAuditError: base encoder ancestry check failed (status $base_contains_1859)" >&2; exit 1 ;;
+            esac
+            base_contains_1883=0
+            git -C "$BASE_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+              b5e85ab4135be6ed4acaf2b2cd2b783648af2f6e "$BASE_ENCODER_REF" || base_contains_1883=$?
+            case "$base_contains_1883" in
+              0|1) ;;
+              *) echo "ManifestAuditError: base encoder ancestry check failed (status $base_contains_1883)" >&2; exit 1 ;;
+            esac
+            head_contains_1883=0
+            git -C "$AXIOM_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+              b5e85ab4135be6ed4acaf2b2cd2b783648af2f6e "$HEAD_ENCODER_REF" || head_contains_1883=$?
+            case "$head_contains_1883" in
+              0|1) ;;
+              *) echo "ManifestAuditError: head encoder ancestry check failed (status $head_contains_1883)" >&2; exit 1 ;;
+            esac
+            if [ "$base_contains_1859" = 0 ] && [ "$base_contains_1883" = 1 ] && [ "$head_contains_1883" = 0 ]; then
+              pre1883_base_bridge=true
+            fi
+          fi
+          # pre1883-bridge-gate-end
+
           # Audit each revision with its own encoder and corpus. Only exact
           # issue identities newly present at head block adoption or a pin update.
           base_status=0
           run_generated_guard /opt/axiom-base-verification "$BASE_RULESPEC_ROOT" "$BASE_DEPENDENCY_ROOT" "$base_ref" --all --json \
             > "$RUNNER_TEMP/generated-guard-base.json" || base_status=$?
+          # Pre-#1883 encoders send global git options to a trusted wrapper
+          # that rejects them before loading any manifests. Only this exact
+          # failure may retry with the provisioner-verified runtime identity.
+          bridge_status=1
+          if [ "$pre1883_base_bridge" = true ] && [ "$base_status" = 1 ]; then
+            bridge_status=0
+            python -I - "$RUNNER_TEMP/generated-guard-base.json" <<'PYBASEBRIDGE' || bridge_status=$?
+          import json
+          from pathlib import Path
+          import sys
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_bytes())
+          except (OSError, ValueError):
+              raise SystemExit(1)  # The unchanged ratchet validates this result.
+          expected = "Cannot verify the running pinned encoder identity: encoder Git metadata is unavailable: git rev-parse failed"
+          raise SystemExit(0 if isinstance(payload, dict) and payload.get("passed") is False
+                           and payload.get("issues") == [expected] else 1)
+          PYBASEBRIDGE
+            case "$bridge_status" in
+              0|1) ;;
+              *) echo "ManifestAuditError: base bridge predicate failed (status $bridge_status)" >&2; exit 1 ;;
+            esac
+          fi
+          if [ "$bridge_status" = 0 ]; then
+            # Keep run_generated_guard (ordinary and head execution) unchanged.
+            # The base retry changes only the explicit checkout identity flag.
+            run_base_attested_guard() {
+              local runtime="$1" repo="$2" dependencies="$3" head="$4"
+              shift 4
+              python -I /opt/axiom-dependency-integrity/check.py verify || return "$?"
+              "$runtime/axiom-encode-signing-supervisor" \
+                --trusted-signing-roots "$runtime/signing-trust-roots.json" \
+                --trusted-python-runtime-root "$runtime/python" \
+                --trusted-python-import-root "$runtime/python/lib/python${{ inputs.python-version }}/site-packages" \
+                --trusted-python-package-root "$runtime/python/lib/python${{ inputs.python-version }}/site-packages/axiom_encode" \
+                -- "$runtime/axiom-encode" guard-generated \
+                --repo "$repo" --base-ref "$base_ref" --head-ref "$head" \
+                --corpus-path "$dependencies/axiom-corpus" "$@"
+            }
+            echo "Base manifest audit used the pre-#1883 attestation bridge: the old trusted git wrapper rejects the guard's global git options."
+            base_status=0
+            run_base_attested_guard /opt/axiom-base-verification "$BASE_RULESPEC_ROOT" "$BASE_DEPENDENCY_ROOT" "$base_ref" --all --json \
+              > "$RUNNER_TEMP/generated-guard-base.json" || base_status=$?
+            python -I - "$RUNNER_TEMP/generated-guard-base.json" <<'PYBRIDGEIDENTITY'
+          import json
+          from pathlib import Path
+          import sys
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_bytes())
+          except (OSError, ValueError):
+              raise SystemExit("ManifestAuditError: bridged base guard must return valid JSON")
+          # The unchanged issue_set below validates the complete JSON/status
+          # contract. Identity failures must never become inherited issue keys.
+          # The encoder words them these two ways, and a bad runtime attestation
+          # reaches the run-level form through identity resolution. Ordinary
+          # issues can name identity or attestation, in a filename or a field.
+          RUN_LEVEL = "Cannot verify the running pinned encoder identity:"
+          MANIFEST_LEVEL = " cannot verify pinned encoder identity:"
+          if isinstance(payload, dict) and isinstance(payload.get("issues"), list):
+              if any(isinstance(issue, str) and (issue.startswith(RUN_LEVEL) or MANIFEST_LEVEL in issue)
+                     for issue in payload["issues"]):
+                  raise SystemExit("ManifestAuditError: bridged base guard still reports an identity or attestation failure")
+          PYBRIDGEIDENTITY
+          fi
           head_status=0
           run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE" "$AXIOM_DEPENDENCY_ROOT" "$GITHUB_SHA" --all --json \
             > "$RUNNER_TEMP/generated-guard-head.json" || head_status=$?

@@ -148,6 +148,20 @@ pass before merge. The workflow never enrolls a producer, signs an old draft,
 or grants admission based only on author/version. Adopt this workflow only in
 a dedicated reviewed lane rollout after v33 custody and NZ pilot prerequisites.
 
+Those lineage, eligibility, authorization and source-App guarantees belong to
+the external encoder `notary-guard` and the admission App. This repository
+neither implements nor tests them: `scripts/test_notary_guard_workflow.py`
+runs the selection shell against a stub that returns configured statuses and
+authenticates nothing. Treat them as rollout requirements. Before rollout,
+retain the exact adopted encoder SHA and its integration evidence.
+
+Notary admission alone receives the actual PR head commit. The legacy
+fallback still audits `GITHUB_SHA` (the merge commit on `pull_request`),
+including the whole-repository audit. A successful notary admission exits
+before the legacy pin-bump manifest ratchet below, so that ratchet is
+preserved only on the legacy fallback. Activated lanes depend on the external
+verifier's replacement coverage.
+
 ### Exact rollback rewind
 
 For `pull_request`, `push`, `schedule`, and `workflow_dispatch`, the workflow can
@@ -675,7 +689,8 @@ revalidating every module and companion at the proposed pins before merge.
 A workflow edit that changes no dependency ref keeps changed-file selection.
 Changes to the release or waiver-digest toolchain metadata may still require
 full module validation without enabling the whole-repository manifest audit.
-The whole-repository generated-content audit is a ratchet: run supervised
+On the legacy fallback path (no notary consumer on the protected base),
+the whole-repository generated-content audit is a ratchet: run supervised
 `guard-generated --all` against the protected base with its pins and the
 proposed tree with its pins, reject issues present only at the proposed tree,
 and report inherited issues as information. Missing legacy manifests or stale
@@ -689,6 +704,34 @@ proposed tree. This audit does not excuse a newly introduced issue or replace
 module validation. Staged inactive composer pins remain inactive for older
 encoder callers. Local fixtures exercise this comparison; they do not establish
 the external encoder's manifest-admission policy on complete live repositories.
+
+In an encoder that contains axiom-encode #1859
+(`630aa73931e5aa87c51d25fe448e38dbcfaed50f`) but not #1883
+(`b5e85ab4135be6ed4acaf2b2cd2b783648af2f6e`), the guard sends global Git options
+that the encoder's own trusted Git wrapper rejects, so it returns one identity
+issue before it loads any manifest. For a dependency-pin change whose base
+encoder falls in that range and whose proposed encoder contains #1883, the
+validator prepares a separate full-history encoder checkout, from which the
+base provisioner writes the base runtime's attestation. When the base audit
+then exits 1 with the single issue
+`Cannot verify the running pinned encoder identity: encoder Git metadata is unavailable: git rev-parse failed`,
+the validator repeats that audit without `--expected-encoder-checkout`. An
+error in any of the three ancestry checks fails the step, and every other pin
+change keeps the existing audit path.
+
+The repeated audit uses the base encoder's own sealed runtime, supervisor and
+inputs. Without `--expected-encoder-checkout`, the encoder at `630aa739` reads
+its identity from that attestation. The base provisioner writes it as root
+after it verifies the commit, the official origin, the declared version and the
+version-bump history. It also exports the encoder package from that commit,
+installs it in the runtime and records the package's tree hash in the
+attestation. The bridge changes only where the base issue set comes from: issue
+keys and the ratchet comparison stay the same, and the proposed runtime and the
+ordinary audit path don't change. Invalid results fail the step, and so does an
+encoder identity failure in the repeated audit, whether the encoder reports it
+for the run or for one manifest; a bad runtime attestation reaches the audit as
+an identity failure. Remove the bridge once no RuleSpec caller pins an encoder
+in that range.
 
 The Python/pip installation steps clear ambient Python import settings and use
 isolated imports and pip configuration. Encoder installation uses authenticated
