@@ -89,6 +89,15 @@ on:
         required: false
         type: string
         default: pinned
+      drift-targets:
+        description: >-
+          JSON list of repository-relative RuleSpec module paths for a scoped
+          drift run (axiom-encode#2094). Honored only for schedule and
+          workflow_dispatch events; pull requests ignore it. Empty (default)
+          keeps the full run. Invalid entries fall back to the full run.
+        required: false
+        type: string
+        default: ""
       run-pytest:
         description: Whether to run pytest when the repository has a tests directory.
         required: false
@@ -1891,6 +1900,7 @@ jobs:
           IMPORT_AWARE_SELECTION: ${{ inputs.import-aware-selection }}
           VERIFIER_SCOPE_DROP: ${{ steps.verifier_scope.outputs.scope_drop }}
           VERIFIER_SCOPE_ADD: ${{ steps.verifier_scope.outputs.scope_add }}
+          DRIFT_TARGETS: ${{ inputs.drift-targets }}
         run: |
           set -euo pipefail
           # Safe defaults also cover callers using explicit validation roots.
@@ -1974,6 +1984,29 @@ jobs:
           base = os.environ.get("PR_BASE_SHA", "").strip()
           head = os.environ.get("HEAD_SHA", "").strip()
 
+          # A scoped drift run (axiom-encode#2094) validates exactly the listed
+          # modules; it never applies to pull requests. Any invalid entry keeps
+          # the full run.
+          drift_raw = os.environ.get("DRIFT_TARGETS", "").strip()
+          if event in ("schedule", "workflow_dispatch") and drift_raw:
+              try:
+                  drift = json.loads(drift_raw)
+                  if not isinstance(drift, list) or not drift or len(drift) > 20000:
+                      raise ValueError("drift targets must be a nonempty list")
+                  touched_drift = set()
+                  for path in drift:
+                      parts = path.split("/") if isinstance(path, str) else []
+                      if (len(parts) < 3 or path.startswith("/") or "\\" in path
+                              or any(part in {"", ".", ".."} for part in parts)
+                              or not path.endswith((".yaml", ".yml"))
+                              or parts[0] not in shard_set):
+                          raise ValueError(f"invalid drift target {path!r}")
+                      touched_drift.add(parts[0])
+              except (ValueError, TypeError) as exc:
+                  full(f"drift targets rejected: {exc}")
+              print(f"scope=drift-targets ({len(drift)} modules)", file=sys.stderr)
+              emit(touched_drift)
+              raise SystemExit
           if event != "pull_request":
               full(f"event={event or 'unknown'}")
           if not base or not head:
@@ -5440,6 +5473,8 @@ jobs:
           DEPENDENCY_PINS_CHANGED: ${{ needs.shards.outputs.dependency_pins_changed }}
           VERIFIER_SCOPE_DROP: ${{ needs.shards.outputs.verifier_scope_drop }}
           VERIFIER_SCOPE_ADD: ${{ needs.shards.outputs.verifier_scope_add }}
+          DRIFT_TARGETS: ${{ inputs.drift-targets }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -5628,6 +5663,47 @@ jobs:
                   esac
                 done
               done
+            fi
+          elif { [ "${EVENT_NAME:-}" = "schedule" ] || [ "${EVENT_NAME:-}" = "workflow_dispatch" ]; } \
+              && [ -n "${DRIFT_TARGETS:-}" ] \
+              && [ "${FULL_TARGETS:-false}" != "true" ]; then
+            # Scoped drift run (axiom-encode#2094). Check the list again here:
+            # an invalid list must give a full run, never a partial one.
+            drift_list="$RUNNER_TEMP/drift-targets.txt"
+            if python3 -I - "$drift_list" <<'PY'
+          import json
+          import os
+          import sys
+
+          try:
+              targets = json.loads(os.environ["DRIFT_TARGETS"])
+          except ValueError:
+              raise SystemExit(1)
+          if not isinstance(targets, list) or not targets or len(targets) > 20000:
+              raise SystemExit(1)
+          for path in targets:
+              parts = path.split("/") if isinstance(path, str) else []
+              if (len(parts) < 3 or path.startswith("/") or "\\" in path
+                      or any(part in {"", ".", ".."} for part in parts)
+                      or not path.endswith((".yaml", ".yml"))):
+                  raise SystemExit(1)
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              handle.write("".join(path + "\n" for path in targets))
+          PY
+            then
+              mode="drift-targets"
+              while IFS= read -r path; do
+                for root in $VALIDATE_ROOTS; do
+                  case "$path" in
+                    "$root"/*)
+                      add_rulespec_target "$path"
+                      ;;
+                  esac
+                done
+              done < "$drift_list"
+            else
+              mode="full-drift-fallback"
+              add_all_rulespec_targets
             fi
           else
             add_all_rulespec_targets

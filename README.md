@@ -207,6 +207,10 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   the workflow cannot yet derive the files that cite changed provisions, so
   citing-file scoping is not done here.
 - Any parse error in the scope step keeps the default selection.
+- `drift-targets` (JSON list of module paths) scopes a `schedule` or
+  `workflow_dispatch` run to those modules and their companions, for the
+  event-driven drift run of axiom-encode#2094. Pull requests ignore it. An
+  invalid list runs every target (`full-drift-fallback`).
 
 `main` needs an axiom-encode `main` that has `verifier-identity` and
 `--encoder-producer-floor` (axiom-encode#2101) and per-file waiver bindings

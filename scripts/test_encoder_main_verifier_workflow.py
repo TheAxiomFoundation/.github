@@ -320,6 +320,35 @@ def test_shard_selection_applies_the_verifier_scope() -> None:
         assert result["targets"][result["matrix"][0]][1:] == ([], [])
 
 
+def test_drift_targets_scope_a_dispatched_run() -> None:
+    targets = ["us-ma/statutes/local.yaml", "us/regulations/independent.yml"]
+    with environment(DRIFT_TARGETS=json.dumps(targets), EVENT_NAME="workflow_dispatch"):
+        result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
+    assert result["matrix"] == ["us-ma", "us"], result["matrix"]
+    assert result["targets"]["us-ma"][:2] == ("drift-targets", ["us-ma/statutes/local.yaml"])
+    assert result["targets"]["us"][1] == ["us/regulations/independent.yml"]
+    assert result["targets"]["us"][2] == ["us/regulations/independent.test.yml"]
+
+
+def test_invalid_drift_targets_run_everything() -> None:
+    for targets in ('["../etc/passwd.yaml"]', '"us/statutes/local.yaml"', "not json", "[]"):
+        with environment(DRIFT_TARGETS=targets, EVENT_NAME="workflow_dispatch"):
+            result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
+        assert result["matrix"] == base.SELECTION_JURISDICTIONS, (targets, result["matrix"])
+        for mode, modules, _companions in result["targets"].values():
+            assert mode in {"full-drift-fallback", "full-push"}, (targets, mode)
+            assert modules, targets
+
+
+def test_pull_requests_ignore_drift_targets() -> None:
+    change = {"us-ma/statutes/local.yaml": base.selection_module() + "# edited\n"}
+    with environment(DRIFT_TARGETS=json.dumps(["us/statutes/local.yaml"]),
+                     EVENT_NAME="pull_request"):
+        result = base.run_import_aware_selection(change, enabled=False)
+    assert result["matrix"] == ["us-ma"], result["matrix"]
+    assert result["targets"]["us-ma"][0] == "changed"
+
+
 def main() -> None:
     for name, function in sorted(globals().items()):
         if name.startswith("test_") and callable(function):
