@@ -206,6 +206,24 @@ def test_unsafe_waiver_path_keeps_default_selection() -> None:
     assert json.loads(outputs["scope_drop"]) == [] and json.loads(outputs["scope_add"]) == []
 
 
+def test_control_characters_in_waiver_paths_keep_default_selection() -> None:
+    outputs = run_verifier_scope({
+        ".axiom/toolchain.toml": toolchain("c"),
+        LEDGER: ledger({"us/a.yaml\nus/b.yaml": "1"}).replace(
+            "  us/a.yaml\nus/b.yaml:", '  "us/a.yaml\\nus/b.yaml":'
+        ),
+    })
+    assert json.loads(outputs["scope_drop"]) == [] and json.loads(outputs["scope_add"]) == []
+
+
+def test_ledger_change_outside_validate_failures_keeps_default_selection() -> None:
+    outputs = run_verifier_scope({
+        ".axiom/toolchain.toml": toolchain("c"),
+        LEDGER: "schema: v2\n" + ledger({"us/statutes/one.yaml": "1"}),
+    })
+    assert json.loads(outputs["scope_drop"]) == [] and json.loads(outputs["scope_add"]) == []
+
+
 def run_dependency_step(
     *, base_mode: str | None, head_mode: str | None, requested: str,
     pin_changes: dict[str, str], guard: str = "true",
@@ -414,13 +432,16 @@ def test_pull_requests_ignore_drift_targets() -> None:
     assert result["targets"]["us-ma"][0] == "changed"
 
 
-def run_floor_direction_check(commits: int, base_index: int, floor_index: int) -> int:
+def run_floor_direction_check(
+    commits: int, base_index: int, floor_index: int,
+    floor_only: str = "true", floor_changed: str = "true",
+) -> int:
     """Run the guard's forward-floor check on a synthetic first-parent history."""
 
     workflow = WORKFLOW.read_text()
     block = workflow[
-        workflow.index("            if [ \"${ENCODER_FLOOR_ONLY:-false}\" = \"true\" ]; then"):
-        workflow.index("              head_floor_args+=(--all)")
+        workflow.index("            if [ \"${ENCODER_FLOOR_ONLY:-false}\" = \"true\" ] || "):
+        workflow.index("              # A full dependency bump already compares --all")
     ]
     with tempfile.TemporaryDirectory(prefix="floor-direction-") as directory:
         root = Path(directory)
@@ -448,7 +469,8 @@ def run_floor_direction_check(commits: int, base_index: int, floor_index: int) -
             cwd=root,
             env={
                 **os.environ,
-                "ENCODER_FLOOR_ONLY": "true",
+                "ENCODER_FLOOR_ONLY": floor_only,
+                "ENCODER_FLOOR_CHANGED": floor_changed,
                 "AXIOM_DEPENDENCY_ROOT": str(root / "deps"),
                 "BASE_ENCODER_REF": chain[base_index],
                 "PRODUCER_FLOOR": chain[floor_index],
@@ -466,6 +488,36 @@ def test_forward_floor_check_survives_a_long_history() -> None:
     for commits in (50, 2000):
         assert run_floor_direction_check(commits, commits // 2, commits - 2) == 0
         assert run_floor_direction_check(commits, commits - 2, commits // 2) == 1
+
+
+def test_forward_floor_check_covers_full_bumps_and_mode_switches() -> None:
+    # A floor move beside another pin, or a switch from pinned to main, is a
+    # full dependency bump; it must still not lower the floor.
+    assert run_floor_direction_check(50, 40, 20, floor_only="false") == 1
+    assert run_floor_direction_check(50, 20, 40, floor_only="false") == 0
+    # Neither flag: no direction check (pinned mode or an unchanged floor).
+    assert run_floor_direction_check(
+        50, 40, 20, floor_only="false", floor_changed="false",
+    ) == 0
+
+
+def test_dependency_step_reports_every_floor_change_in_main_mode() -> None:
+    floor = {"axiom_encode_ref": "9" * 40}
+    cases = (
+        # (base mode, head mode, requested, pin changes, expected flag)
+        ("main", "main", "main", floor, "true"),
+        ("main", "main", "main", {**floor, "axiom_rules_engine_ref": "4" * 40}, "true"),
+        (None, "main", "main", floor, "true"),
+        ("main", "main", "main", {"axiom_rules_engine_ref": "4" * 40}, "false"),
+        (None, None, "pinned", floor, "false"),
+    )
+    for base_mode, head_mode, requested, changes, expected in cases:
+        result, bound = run_dependency_step(
+            base_mode=base_mode, head_mode=head_mode, requested=requested,
+            pin_changes=changes,
+        )
+        assert result.returncode == 0, result.stderr
+        assert bound["encoder_floor_changed"] == expected, (base_mode, changes)
 
 
 def test_validate_step_prints_one_result_line_per_chunk() -> None:

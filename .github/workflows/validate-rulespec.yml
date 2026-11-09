@@ -562,6 +562,7 @@ jobs:
       base_axiom_corpus_ref: ${{ steps.dependency_inputs.outputs.base_axiom_corpus_ref }}
       dependency_pins_changed: ${{ steps.dependency_inputs.outputs.dependency_pins_changed }}
       encoder_floor_only: ${{ steps.dependency_inputs.outputs.encoder_floor_only }}
+      encoder_floor_changed: ${{ steps.dependency_inputs.outputs.encoder_floor_changed }}
       encoder_verifier: ${{ steps.dependency_inputs.outputs.encoder_verifier }}
       verifier_encode_ref: ${{ steps.verifier_scope.outputs.verifier_encode_ref }}
       verifier_scope_drop: ${{ steps.verifier_scope.outputs.scope_drop }}
@@ -987,6 +988,13 @@ jobs:
               and os.environ.get("RUN_GENERATED_GUARD") == "true"
           )
           dependency_pins_changed = bool(dependency_changes) and not encoder_floor_only
+          # Any change that leaves the head in main mode with another floor
+          # (a floor move beside other pins, or a switch from pinned to main)
+          # must move the floor forward too; the guard step checks this.
+          encoder_floor_changed = (
+              encoder_verifier == "main"
+              and protected_pin("axiom_encode_ref") != base_inputs["axiom_encode_ref"]
+          )
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in resolved.items():
                   output.write(f"{key}={value}\n")
@@ -994,6 +1002,7 @@ jobs:
               output.write(f"base_axiom_corpus_ref={base_inputs['axiom_corpus_ref']}\n")
               output.write(f"dependency_pins_changed={str(dependency_pins_changed).lower()}\n")
               output.write(f"encoder_floor_only={str(encoder_floor_only).lower()}\n")
+              output.write(f"encoder_floor_changed={str(encoder_floor_changed).lower()}\n")
               output.write(f"encoder_verifier={encoder_verifier}\n")
           print("Effective dependency inputs match the protected workflow configuration.")
           PYPINS
@@ -1068,13 +1077,14 @@ jobs:
               records = payload.get("validate_failures") if isinstance(payload, dict) else None
               if not isinstance(records, dict):
                   raise ValueError("the waiver ledger has no validate_failures mapping")
-              return records
+              return payload, records
 
 
           def module_path(path):
               # Split literally: PurePosixPath would collapse "//" and ".".
               parts = path.split("/") if isinstance(path, str) else []
               if (not parts or path.startswith("/") or "\\" in path
+                      or any(ord(char) < 32 or ord(char) == 127 for char in path)
                       or any(part in {"", ".", ".."} for part in parts)
                       or not path.endswith((".yaml", ".yml"))):
                   raise ValueError(f"invalid waiver path {path!r}")
@@ -1107,7 +1117,19 @@ jobs:
                   before_raw, after_raw = show(base, LEDGER), show(head, LEDGER)
                   if before_raw is None or after_raw is None:
                       raise ValueError("the waiver ledger was added or removed")
-                  before, after = ledger_records(before_raw), ledger_records(after_raw)
+                  (before_payload, before), (after_payload, after) = (
+                      ledger_records(before_raw), ledger_records(after_raw)
+                  )
+                  # Only per-file records scope the run; any other ledger
+                  # change keeps the default selection.
+                  others = {
+                      key for key in set(before_payload) | set(after_payload)
+                      if key != "validate_failures"
+                      and before_payload.get(key) != after_payload.get(key)
+                  }
+                  if others:
+                      raise ValueError("the waiver ledger changed outside validate_failures: "
+                                       + ", ".join(sorted(map(str, others))))
                   add = sorted(
                       module_path(path) for path in set(before) | set(after)
                       if before.get(path) != after.get(path)
@@ -5809,6 +5831,7 @@ jobs:
         env:
           ENCODER_VERIFIER: ${{ needs.shards.outputs.encoder_verifier }}
           ENCODER_FLOOR_ONLY: ${{ needs.shards.outputs.encoder_floor_only }}
+          ENCODER_FLOOR_CHANGED: ${{ needs.shards.outputs.encoder_floor_changed }}
           PRODUCER_FLOOR: ${{ needs.shards.outputs.axiom_encode_ref }}
           DEPENDENCY_PINS_CHANGED: ${{ needs.shards.outputs.dependency_pins_changed }}
           BASE_ENCODER_REF: ${{ needs.shards.outputs.base_axiom_encode_ref }}
@@ -5863,9 +5886,11 @@ jobs:
               exit 1
             fi
             head_floor_args=(--encoder-producer-floor "$PRODUCER_FLOOR")
-            if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ]; then
+            if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ] || [ "${ENCODER_FLOOR_CHANGED:-false}" = "true" ]; then
               # The floor only moves forward on first-parent main: lowering
-              # it would re-admit revoked producers (axiom-encode#2095).
+              # it would re-admit revoked producers (axiom-encode#2095). This
+              # holds for a floor-only change, a floor move beside other pins
+              # (a full dependency bump), and a switch from pinned to main.
               # This check runs with the generated guard only; without the
               # guard the floor enforces nothing (scoping is off then).
               encoder_history="$AXIOM_DEPENDENCY_ROOT/axiom-encode"
@@ -5875,10 +5900,14 @@ jobs:
               if [[ ! "$BASE_ENCODER_REF" =~ ^[0-9a-f]{40}$ ]] \
                   || ! grep -qxF -- "$PRODUCER_FLOOR" <<< "$first_parent_main" \
                   || ! git -C "$encoder_history" merge-base --is-ancestor "$BASE_ENCODER_REF" "$PRODUCER_FLOOR"; then
-                echo "EncoderMainVerifier: a floor-only change must move axiom_encode_ref forward on first-parent main (base $BASE_ENCODER_REF, new $PRODUCER_FLOOR)" >&2
+                echo "EncoderMainVerifier: a floor change must move axiom_encode_ref forward on first-parent main (base $BASE_ENCODER_REF, new $PRODUCER_FLOOR)" >&2
                 exit 1
               fi
-              head_floor_args+=(--all)
+              # A full dependency bump already compares --all at both
+              # revisions; a floor-only change adds it here.
+              if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ]; then
+                head_floor_args+=(--all)
+              fi
             fi
           fi
           # encoder-main-verifier-guard-end

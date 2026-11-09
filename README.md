@@ -215,9 +215,19 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   and ledger scoping are off (full dependency bump and default selection).
 - With `import-aware-selection`, a ledger-only change still selects the full
   matrix: changed waiver records are global validation inputs there.
-- A floor-only change must move `axiom_encode_ref` forward on first-parent
+- Every change that leaves `main` mode with another `axiom_encode_ref` (a
+  floor-only change, a floor move beside other pins, or a switch from
+  `pinned` to `main`) must move `axiom_encode_ref` forward on first-parent
   `main`; lowering the floor fails, because it would re-admit revoked
   producers.
+- Push runs compare with the previous `main` commit, not with the floor
+  change. So that a content pull request signed below a new floor cannot
+  merge after the floor pull request passed, require pull requests to be up
+  to date with `main` (or use a merge queue) before callers use `main` mode.
+- With `main`, every merge to axiom-encode `main` changes verification for
+  every caller in `main` mode at once; the check summary records which
+  verifier ran. Protect axiom-encode `main` (required review) before callers
+  opt in.
 - A full dependency bump (for example an engine pin) in `main` mode audits
   the base with the base floor encoder and the head with encoder `main`, so
   the comparison also shows every difference between the floor and `main`.
