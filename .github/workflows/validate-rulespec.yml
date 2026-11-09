@@ -883,6 +883,20 @@ jobs:
                   fail("[workflow_toolchain].encoder_verifier must be pinned or main")
               return mode
 
+          def verifier_hold(table):
+              # Optional protected hold: in main mode, verify with this exact
+              # axiom-encode commit instead of the main tip (a way back when an
+              # encoder merge breaks validation). verifier-identity proves it
+              # is on first-parent main at or after the floor.
+              hold = table.get("encoder_verifier_hold")
+              if hold is None:
+                  return ""
+              if not isinstance(hold, str) or SHA.fullmatch(hold) is None:
+                  fail("[workflow_toolchain].encoder_verifier_hold must be a full lowercase commit")
+              if verifier_mode(table) != "main":
+                  fail("[workflow_toolchain].encoder_verifier_hold requires encoder_verifier = \"main\"")
+              return hold
+
           base_inputs = {key: protected_pin(key) for key in INPUTS}
           base_compose = pins.get("axiom_compose_ref", "")
           base_shared_workflow = pins.get("shared_workflow_ref", "")
@@ -910,6 +924,8 @@ jobs:
                   changed.append("shared_validator_ref")
               if verifier_mode(toolchain) != verifier_mode(base_table):
                   changed.append("encoder_verifier")
+              if verifier_hold(toolchain) != verifier_hold(base_table):
+                  changed.append("encoder_verifier_hold")
               return changed
 
           configuration = base
@@ -982,18 +998,24 @@ jobs:
           # (engine, corpus, composer, workflow) stays a full gate.
           # The floor is enforced by the generated guard; without the guard a
           # floor-only change keeps the full dependency bump.
+          # A change of the hold alone (or with the floor) is treated the same
+          # way: it changes only which encoder-main commit verifies.
+          encoder_hold = verifier_hold(pins)
           encoder_floor_only = (
               encoder_verifier == "main"
-              and dependency_changes == ["axiom_encode_ref"]
+              and bool(dependency_changes)
+              and set(dependency_changes) <= {"axiom_encode_ref", "encoder_verifier_hold"}
               and os.environ.get("RUN_GENERATED_GUARD") == "true"
           )
           dependency_pins_changed = bool(dependency_changes) and not encoder_floor_only
           # Any change that leaves the head in main mode with another floor
           # (a floor move beside other pins, or a switch from pinned to main)
           # must move the floor forward too; the guard step checks this.
-          encoder_floor_changed = (
-              encoder_verifier == "main"
-              and protected_pin("axiom_encode_ref") != base_inputs["axiom_encode_ref"]
+          encoder_floor_changed = encoder_verifier == "main" and (
+              protected_pin("axiom_encode_ref") != base_inputs["axiom_encode_ref"]
+              # A switch from pinned keeps the value but makes it a floor,
+              # which must be on first-parent main.
+              or verifier_mode(base_table) != "main"
           )
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in resolved.items():
@@ -1004,6 +1026,7 @@ jobs:
               output.write(f"encoder_floor_only={str(encoder_floor_only).lower()}\n")
               output.write(f"encoder_floor_changed={str(encoder_floor_changed).lower()}\n")
               output.write(f"encoder_verifier={encoder_verifier}\n")
+              output.write(f"encoder_verifier_hold={encoder_hold}\n")
           print("Effective dependency inputs match the protected workflow configuration.")
           PYPINS
 
@@ -1018,11 +1041,21 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           FLOOR_REF: ${{ steps.dependency_inputs.outputs.axiom_encode_ref }}
           ENCODER_FLOOR_ONLY: ${{ steps.dependency_inputs.outputs.encoder_floor_only }}
+          ENCODER_VERIFIER_HOLD: ${{ steps.dependency_inputs.outputs.encoder_verifier_hold }}
         run: |
           set -euo pipefail
           # verifier-scope-start
           verifier="$FLOOR_REF"
-          if [ "${ENCODER_VERIFIER:-pinned}" = "main" ]; then
+          if [ "${ENCODER_VERIFIER:-pinned}" = "main" ] && [ -n "${ENCODER_VERIFIER_HOLD:-}" ]; then
+            # The protected hold replaces the main tip. "Record the
+            # encoder-main verifier" proves it is on first-parent main at or
+            # after the floor; dependency authentication proves it is on main.
+            if [[ ! "$ENCODER_VERIFIER_HOLD" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "EncoderMainVerifier: the verifier hold must be an exact commit" >&2
+              exit 1
+            fi
+            verifier="$ENCODER_VERIFIER_HOLD"
+          elif [ "${ENCODER_VERIFIER:-pinned}" = "main" ]; then
             # One resolution per run: every matrix leg uses this exact commit,
             # and the guard step records it with its producer floor.
             # Exact ref name: ls-remote patterns also match */refs/heads/main.
@@ -1034,7 +1067,7 @@ jobs:
             fi
           fi
           echo "verifier_encode_ref=$verifier" >> "$GITHUB_OUTPUT"
-          echo "Encoder verifier: $verifier (${ENCODER_VERIFIER:-pinned}); producer floor: $FLOOR_REF"
+          echo "Encoder verifier: $verifier (${ENCODER_VERIFIER:-pinned}${ENCODER_VERIFIER_HOLD:+, held}); producer floor: $FLOOR_REF"
           # Scoping relies on the generated guard and waiver audit covering
           # the whole repository, so it is off when the guard is off.
           if [ "${ENCODER_VERIFIER:-pinned}" != "main" ] || [ "$EVENT_NAME" != "pull_request" ] \
@@ -5903,11 +5936,6 @@ jobs:
                 echo "EncoderMainVerifier: a floor change must move axiom_encode_ref forward on first-parent main (base $BASE_ENCODER_REF, new $PRODUCER_FLOOR)" >&2
                 exit 1
               fi
-              # A full dependency bump already compares --all at both
-              # revisions; a floor-only change adds it here.
-              if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ]; then
-                head_floor_args+=(--all)
-              fi
             fi
           fi
           # encoder-main-verifier-guard-end
@@ -5933,10 +5961,31 @@ jobs:
               --expected-encoder-checkout "$dependencies/axiom-encode" \
               ${floor_args[@]+"${floor_args[@]}"} "$@"
           }
-          if [ "$DEPENDENCY_PINS_CHANGED" != "true" ]; then
+          if [ "$DEPENDENCY_PINS_CHANGED" != "true" ] && [ "${ENCODER_FLOOR_ONLY:-false}" != "true" ]; then
             run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE" "$AXIOM_DEPENDENCY_ROOT" "$GITHUB_SHA"
             exit 0
           fi
+
+          # encoder-floor-ratchet-start
+          # A floor or hold change (encoder-main mode, configuration only)
+          # checks every manifest (--all) with the head verifier, once at the
+          # base floor and once at the new floor. Only issues new at the new
+          # floor fail: moving the floor revokes the producers below it, and
+          # the repository's standing issues stay inherited.
+          if [ "${ENCODER_FLOOR_ONLY:-false}" = "true" ]; then
+            if [[ ! "$BASE_ENCODER_REF" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "EncoderMainVerifier: the base floor must be an exact commit" >&2
+              exit 1
+            fi
+            new_floor_args=("${head_floor_args[@]}")
+            head_floor_args=(--encoder-producer-floor "$BASE_ENCODER_REF")
+            base_status=0
+            run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE" "$AXIOM_DEPENDENCY_ROOT" "$GITHUB_SHA" --all --json \
+              > "$RUNNER_TEMP/generated-guard-base.json" || base_status=$?
+            head_floor_args=("${new_floor_args[@]}")
+            BASE_RULESPEC_ROOT="$GITHUB_WORKSPACE"
+            BASE_DEPENDENCY_ROOT="$AXIOM_DEPENDENCY_ROOT"
+          else
 
           # pre1883-bridge-gate-start
           pre1883_base_bridge=false
@@ -6043,6 +6092,8 @@ jobs:
                   raise SystemExit("ManifestAuditError: bridged base guard still reports an identity or attestation failure")
           PYBRIDGEIDENTITY
           fi
+          fi
+          # encoder-floor-ratchet-end
           head_status=0
           run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE" "$AXIOM_DEPENDENCY_ROOT" "$GITHUB_SHA" --all --json \
             > "$RUNNER_TEMP/generated-guard-head.json" || head_status=$?

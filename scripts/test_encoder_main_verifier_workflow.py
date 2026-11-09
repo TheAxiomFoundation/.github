@@ -101,7 +101,7 @@ def history(changes: dict[str, str]) -> tuple[tempfile.TemporaryDirectory, Path,
 
 def run_verifier_scope(
     changes: dict[str, str], *, verifier: str = "main", floor_only: str = "false",
-    event: str = "pull_request",
+    event: str = "pull_request", hold: str = "",
 ) -> dict[str, str]:
     temporary, root, first, second = history(changes)
     with temporary:
@@ -132,6 +132,7 @@ def run_verifier_scope(
                 "HEAD_SHA": second,
                 "FLOOR_REF": "a" * 40,
                 "ENCODER_FLOOR_ONLY": floor_only,
+                "ENCODER_VERIFIER_HOLD": hold,
                 "GITHUB_OUTPUT": str(output),
             },
             capture_output=True,
@@ -151,6 +152,16 @@ def test_main_verifier_resolves_main_once() -> None:
     outputs = run_verifier_scope({"README.md": "after\n"})
     assert outputs["verifier_encode_ref"] == MAIN_SHA
     assert json.loads(outputs["scope_drop"]) == [] and json.loads(outputs["scope_add"]) == []
+
+
+def test_a_protected_hold_replaces_the_main_tip() -> None:
+    hold = "7" * 40
+    outputs = run_verifier_scope({"README.md": "after\n"}, hold=hold)
+    assert outputs["verifier_encode_ref"] == hold
+    # In pinned mode a hold cannot exist (the dependency step fails); the
+    # scope step ignores it.
+    outputs = run_verifier_scope({"README.md": "after\n"}, verifier="pinned", hold=hold)
+    assert outputs["verifier_encode_ref"] == "a" * 40
 
 
 def test_floor_only_pin_change_is_dropped_from_selection() -> None:
@@ -236,8 +247,16 @@ def run_dependency_step(
         table=table(base_mode, base.WORKFLOW_INPUT_PINS),
         caller=base.literal_pin_caller(base.WORKFLOW_INPUT_PINS),
     ) as fixture:
-        proposed = {**base.WORKFLOW_INPUT_PINS, **pin_changes}
-        fixture.write(base.WORKFLOW_TOOLCHAIN, table(head_mode, proposed))
+        # Table-only keys (the verifier hold) are not workflow inputs.
+        table_only = {
+            key: value for key, value in pin_changes.items()
+            if key == "encoder_verifier_hold"
+        }
+        proposed = {
+            **base.WORKFLOW_INPUT_PINS,
+            **{key: value for key, value in pin_changes.items() if key not in table_only},
+        }
+        fixture.write(base.WORKFLOW_TOOLCHAIN, table(head_mode, {**proposed, **table_only}))
         if not pin_changes and base_mode == head_mode:
             fixture.write("fixture.txt", "head\n")  # a commit with no pin change
         head = base.commit(fixture.root, "configuration change")
@@ -272,6 +291,44 @@ def test_dependency_step_reports_a_floor_only_encoder_pin_change() -> None:
         guard="false",
     )
     assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+
+
+def test_a_hold_change_is_an_encoder_only_change() -> None:
+    hold = {"encoder_verifier_hold": "7" * 40}
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main", pin_changes=hold,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("true", "false")
+    assert bound["encoder_verifier_hold"] == "7" * 40
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main",
+        pin_changes={**hold, "axiom_encode_ref": "9" * 40},
+    )
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("true", "false")
+    # With another pin it stays a full dependency bump.
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main",
+        pin_changes={**hold, "axiom_rules_engine_ref": "4" * 40},
+    )
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+    # No hold: the output is empty.
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main", pin_changes={},
+    )
+    assert result.returncode == 0, result.stderr
+    assert bound["encoder_verifier_hold"] == ""
+
+
+def test_an_invalid_hold_fails_closed() -> None:
+    for mode, hold in (("main", "main"), ("main", "7" * 39), (None, "7" * 40)):
+        requested = "main" if mode else "pinned"
+        result, _ = run_dependency_step(
+            base_mode=mode, head_mode=mode, requested=requested,
+            pin_changes={"encoder_verifier_hold": hold},
+        )
+        assert result.returncode != 0, (mode, hold)
+        assert "encoder_verifier_hold" in result.stdout + result.stderr
 
 
 def test_engine_pin_change_stays_a_full_dependency_bump_with_main_verifier() -> None:
@@ -335,8 +392,16 @@ def test_guard_passes_the_floor_only_to_the_head_runtime() -> None:
     end = workflow.index("# encoder-main-verifier-guard-end")
     block = workflow[start:end]
     assert 'head_floor_args=(--encoder-producer-floor "$PRODUCER_FLOOR")' in block
-    # A floor-only change checks every manifest against the new floor.
-    assert "head_floor_args+=(--all)" in block
+    # A floor-only change checks every manifest at the base floor and at the
+    # new floor with the head verifier; only new issues fail (ratchet).
+    ratchet = workflow[
+        workflow.index("# encoder-floor-ratchet-start"):
+        workflow.index("# encoder-floor-ratchet-end")
+    ]
+    assert 'head_floor_args=(--encoder-producer-floor "$BASE_ENCODER_REF")' in ratchet
+    assert 'run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE"' in ratchet
+    assert '"$GITHUB_SHA" --all --json' in ratchet
+    assert 'BASE_RULESPEC_ROOT="$GITHUB_WORKSPACE"' in ratchet
     # The floor may only move forward on first-parent main.
     assert 'merge-base --is-ancestor "$BASE_ENCODER_REF" "$PRODUCER_FLOOR"' in block
     assert "rev-list --first-parent refs/remotes/origin/main" in block
@@ -441,7 +506,7 @@ def run_floor_direction_check(
     workflow = WORKFLOW.read_text()
     block = workflow[
         workflow.index("            if [ \"${ENCODER_FLOOR_ONLY:-false}\" = \"true\" ] || "):
-        workflow.index("              # A full dependency bump already compares --all")
+        workflow.index("            fi\n          fi\n          # encoder-main-verifier-guard-end")
     ]
     with tempfile.TemporaryDirectory(prefix="floor-direction-") as directory:
         root = Path(directory)
@@ -509,6 +574,7 @@ def test_dependency_step_reports_every_floor_change_in_main_mode() -> None:
         ("main", "main", "main", {**floor, "axiom_rules_engine_ref": "4" * 40}, "true"),
         (None, "main", "main", floor, "true"),
         ("main", "main", "main", {"axiom_rules_engine_ref": "4" * 40}, "false"),
+        (None, "main", "main", {}, "true"),
         (None, None, "pinned", floor, "false"),
     )
     for base_mode, head_mode, requested, changes, expected in cases:

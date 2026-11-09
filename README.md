@@ -210,9 +210,22 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   = "main"` in `.axiom/workflow-toolchain.toml`. The `encoder-verifier` input
   must equal it (a pull request controls its own caller), and changing the key
   is a full dependency change.
-- A floor-only change runs the head guard with `--all`, so every manifest is
-  checked against the new floor. With `run-generated-guard: false`, floor-only
-  and ledger scoping are off (full dependency bump and default selection).
+- A floor-only change runs the head guard with `--all` twice, at the base
+  floor and at the new floor, and fails only on issues that are new at the
+  new floor: producers below the new floor are revoked, and the repository's
+  standing issues stay inherited. With `run-generated-guard: false`,
+  floor-only and ledger scoping are off (full dependency bump and default
+  selection).
+- `[workflow_toolchain] encoder_verifier_hold = "<40-hex commit>"`
+  (optional, `main` mode only) verifies with that axiom-encode commit
+  instead of the `main` tip: a cheap way back when an encoder merge breaks
+  validation. The "Record the encoder-main verifier" step proves that the
+  commit is on first-parent `main` at or after the floor, and dependency
+  authentication proves that it is on `main`; otherwise the run fails. A
+  change of only the hold (or of the hold and the floor) is treated like a
+  floor-only change: first shard, guard ratchet with `--all`. With another
+  pin it is a full dependency bump. A hold in `pinned` mode, or a value that
+  is not a full commit, fails. Remove the hold to return to the `main` tip.
 - With `import-aware-selection`, a ledger-only change still selects the full
   matrix: changed waiver records are global validation inputs there.
 - Every change that leaves `main` mode with another `axiom_encode_ref` (a
