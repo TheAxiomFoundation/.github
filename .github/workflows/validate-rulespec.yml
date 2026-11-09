@@ -1047,9 +1047,10 @@ jobs:
           # verifier-scope-start
           verifier="$FLOOR_REF"
           if [ "${ENCODER_VERIFIER:-pinned}" = "main" ] && [ -n "${ENCODER_VERIFIER_HOLD:-}" ]; then
-            # The protected hold replaces the main tip. "Record the
-            # encoder-main verifier" proves it is on first-parent main at or
-            # after the floor; dependency authentication proves it is on main.
+            # The protected hold replaces the main tip. "Authenticate
+            # dependency commits" proves in workflow shell that it is on
+            # first-parent main at or after the floor, before any verifier
+            # code runs; "Record the encoder-main verifier" records it.
             if [[ ! "$ENCODER_VERIFIER_HOLD" =~ ^[0-9a-f]{40}$ ]]; then
               echo "EncoderMainVerifier: the verifier hold must be an exact commit" >&2
               exit 1
