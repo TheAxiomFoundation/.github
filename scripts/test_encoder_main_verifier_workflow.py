@@ -1152,6 +1152,90 @@ def test_ratchet_without_the_protected_base_table_name_stays_strict() -> None:
         assert "ValidationWaiverRatchetGrowth" in result.stderr, result.stderr
 
 
+def test_ratchet_restate_needs_a_plain_active_fingerprint() -> None:
+    # A protected-base ledger whose text and parsed form differ gets no restate.
+    record = (
+        '      owner: "@owner"\n'
+        '      issue: "https://github.com/example/rules/issues/1"\n'
+        '      expires: "2026-12-21"\n'
+    )
+
+    def ledger(active: str, pending: str = "", owner: str = "") -> bytes:
+        return (
+            "validate_failures:\n  us/statutes/one.yaml:\n    active:\n"
+            + active + (owner or record)
+            + (f"    pending:\n{pending}{record}" if pending else "")
+        ).encode()
+
+    def line(marker: str, anchor: str = "") -> str:
+        return f'      fingerprint: {anchor}"sha256:{marker * 64}"\n'
+
+    cases = {
+        # An alias would restate the pending record with the active one.
+        "alias": (
+            ledger(line("1", "&f "), "      fingerprint: *f\n"),
+            ledger(line("a", "&f "), "      fingerprint: *f\n"),
+        ),
+        # A fingerprint-like line inside a multi-line owner is not a fingerprint.
+        "scalar": tuple(
+            ledger(
+                line("1"),
+                owner='      owner: "@owner\n' + line(marker).rstrip("\n").replace('"', "")
+                + '"\n' + record.split("\n", 1)[1],
+            )
+            for marker in ("2", "a")
+        ),
+        # Duplicate keys: the parser keeps the last one.
+        "duplicate": (ledger(line("1") + line("2")), ledger(line("1") + line("a"))),
+        "duplicate-first": (ledger(line("1") + line("2")), ledger(line("a") + line("2"))),
+    }
+    for name, (base_ledger, head_ledger) in cases.items():
+        result, marked, _ = run_restate_ratchet(head_ledger, base_ledger=base_ledger)
+        assert result.returncode != 0 and not marked, (name, result.stdout, result.stderr)
+    # The plain form of the same ledger is a restate.
+    result, marked, _ = run_restate_ratchet(ledger(line("a")), base_ledger=ledger(line("1")))
+    assert result.returncode == 0 and marked, result.stderr
+
+
+def test_ratchet_restate_refuses_a_second_table() -> None:
+    refused_restate(
+        restate_ledger({**RESTATE_BASE, "us/statutes/one.yaml": ("a",)}),
+        "may hold only the workflow_toolchain table",
+        head_extra='\n[other]\naxiom_corpus_ref = "' + "9" * 40 + '"\n',
+    )
+
+
+def test_the_audit_probe_fails_closed_without_the_restate_flag() -> None:
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    run = next(step for step in steps if step.get("name") == "Enforce validation waiver ratchet")["run"]
+    probe = run[run.index("restate_args=()\n"):]
+    probe = probe[:probe.index("partition_args=()")]
+    assert "${{" not in probe
+    for marker in (False, True):
+        for help_text, flag in (
+            ("  --verifier-restate  restate\n", True),
+            ("  --scope SCOPE\n  --verifier-restated\n", False),
+        ):
+            with tempfile.TemporaryDirectory(prefix="restate-probe-") as directory:
+                root = Path(directory)
+                (root / "help.txt").write_text(help_text)
+                if marker:
+                    (root / "waiver-verifier-restate").write_text("restate\n")
+                result = subprocess.run(
+                    ["bash", "-c", 'audit_help="$RUNNER_TEMP/help.txt"\n' + probe
+                     + '\necho "args=${#restate_args[@]}"'],
+                    env={"PATH": os.environ["PATH"], "RUNNER_TEMP": str(root)},
+                    capture_output=True, text=True,
+                )
+            if marker and not flag:
+                assert result.returncode == 1, result.stdout
+                assert "ValidationWaiverVerifierRestate" in result.stderr
+                assert "args=" not in result.stdout
+            else:
+                assert result.returncode == 0, result.stderr
+                assert result.stdout.strip() == f"args={int(marker)}", result.stdout
+
+
 def test_the_audit_gets_the_restate_flag_only_from_the_ratchet_marker() -> None:
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     run = next(step for step in steps if step.get("name") == "Enforce validation waiver ratchet")["run"]

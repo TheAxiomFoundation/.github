@@ -4917,7 +4917,10 @@ jobs:
               if not path.is_file():
                   return "pinned", {}
               try:
-                  table = tomllib.loads(path.read_bytes().decode()).get("workflow_toolchain", {})
+                  payload = tomllib.loads(path.read_bytes().decode())
+                  if set(payload) - {"workflow_toolchain"}:
+                      refuse(f"{WORKFLOW_TOOLCHAIN} may hold only the workflow_toolchain table")
+                  table = payload.get("workflow_toolchain", {})
               except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
                   refuse(f"{WORKFLOW_TOOLCHAIN} is invalid: {error}")
               mode = table.get("encoder_verifier", "pinned") if isinstance(table, dict) else None
@@ -5071,6 +5074,7 @@ jobs:
                   )
                   and old["end"] == new["end"]
                   and old["value"].count(value.encode()) == 1
+                  and b"&" not in old["value"] and b"*" not in old["value"]
               ):
                   refuse(
                       f"{module}: only the fingerprint of an active record may change; "
@@ -5084,6 +5088,35 @@ jobs:
                   and RESTATED.fullmatch(new["value"][len(before):len(new["value"]) - len(after)])
               ):
                   refuse(f"{module}: the restated fingerprint must be sha256:<64 hex>")
+              # The entry as a parser reads it must agree with the byte rule: only
+              # the active fingerprint differs. This refuses an alias, a duplicate
+              # key or a fingerprint-like line inside another scalar.
+              token = new["value"][len(before):len(new["value"]) - len(after)].decode()
+              expected = {
+                  state: (
+                      {**record, "fingerprint": token} if state == "active" else record
+                  )
+                  for state, record in states.items()
+              }
+              try:
+                  parsed = yaml.safe_load(
+                      b"validate_failures:\n" + b"".join(head_lines)
+                  )["validate_failures"]
+              except (yaml.YAMLError, TypeError, KeyError):
+                  refuse(UNEQUAL)
+              block = lines[active[0] + 1:]
+              block = block[:next(
+                  (index for index, line in enumerate(block) if not line.startswith(b"      ")),
+                  len(block),
+              )]
+              if (
+                  parsed != {module: expected} or token == value
+                  or sum(1 for line in block if FINGERPRINT.fullmatch(line)) != 1
+              ):
+                  refuse(
+                      f"{module}: only the fingerprint of an active record may change; "
+                      "the entry must read as one plain active fingerprint"
+                  )
               restated.append(module)
           if position != len(head_items):
               refuse(UNEQUAL)

@@ -231,8 +231,13 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
     must equal the failure that the verifier observes, and each removed
     file must pass. So the head ledger has one valid content. A verifier
     without `--verifier-restate` (before axiom-encode#2101) fails the step.
-  - The generated guard applies the same record rule and refuses RuleSpec
-    files, manifests and receipts beside a restate.
+  - The generated guard runs on the whole repository for a configuration
+    change. There it applies the same record rule and refuses RuleSpec
+    files, manifests and receipts beside a restate. The ratchet and the
+    audit above do not depend on it.
+  - After a revert to `pinned`, the pinned `axiom_encode_ref` is the
+    verifier. A revert that restates the ledger thus needs a pin at or
+    after axiom-encode#2101; an older pin fails the audit step.
 
   A restate does not add a waiver, and a file that fails with no waiver
   still fails the change. It does re-approve the new failure of a file that
