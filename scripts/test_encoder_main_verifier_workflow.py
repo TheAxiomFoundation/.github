@@ -657,6 +657,521 @@ def test_validate_step_prints_one_result_line_per_chunk() -> None:
     assert run.count("RULESPEC_VALIDATION_CHUNKS total=") == 2
 
 
+# --- verifier restate (axiom-encode#2091, .github#152) ----------------------
+
+def run_restate_admission(
+    *, base_mode: str | None, head_mode: str | None, extra: dict[str, str] | None = None,
+    pin_changes: dict[str, str] | None = None, change_table: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    """Run the dependency step on a change that also edits the waiver ledger."""
+
+    def table(mode, pins):
+        return base.workflow_toolchain({**pins, **({"encoder_verifier": mode} if mode else {})})
+
+    with base.WorkflowInputFixture(
+        table=table(base_mode, base.WORKFLOW_INPUT_PINS),
+        caller=base.literal_pin_caller(base.WORKFLOW_INPUT_PINS),
+    ) as fixture:
+        proposed = {**base.WORKFLOW_INPUT_PINS, **(pin_changes or {})}
+        if change_table:
+            fixture.write(base.WORKFLOW_TOOLCHAIN, table(head_mode, proposed))
+        fixture.write(LEDGER, ledger({"us/statutes/one.yaml": "2"}))
+        fixture.write(".axiom/toolchain.toml", toolchain("c"))
+        for path, content in (extra or {}).items():
+            fixture.write(path, content)
+        head = base.commit(fixture.root, "switch with ledger")
+        output = fixture.root / "output"
+        requested = head_mode or "pinned"
+        with environment(ENCODER_VERIFIER=requested, RUN_GENERATED_GUARD="true"):
+            result = base.run_workflow_inputs(
+                fixture.root, fixture.base, pins=proposed, head=head, output=output,
+            )
+        bound = (
+            dict(line.split("=", 1) for line in output.read_text().splitlines())
+            if result.returncode == 0 else {}
+        )
+        return result, bound
+
+
+def test_a_mode_switch_may_carry_the_waiver_ledger() -> None:
+    result, bound = run_restate_admission(base_mode=None, head_mode="main")
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Still a full dependency change, with the forward-floor check.
+    assert bound["encoder_verifier"] == "main"
+    assert (bound["dependency_pins_changed"], bound["encoder_floor_changed"]) == ("true", "true")
+    # The floor may move in the same change; the guard step checks its direction.
+    result, bound = run_restate_admission(
+        base_mode=None, head_mode="main", pin_changes={"axiom_encode_ref": "9" * 40},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert bound["encoder_floor_changed"] == "true"
+    # A revert with the same encoder commit.
+    result, bound = run_restate_admission(base_mode="main", head_mode=None)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (bound["encoder_verifier"], bound["dependency_pins_changed"]) == ("pinned", "true")
+
+
+def test_the_ledger_cannot_ride_any_other_configuration_change() -> None:
+    refused = "dependency pin changes require a configuration-only change"
+    # A revert that also proposes another encoder commit as the pinned verifier.
+    result, _ = run_restate_admission(
+        base_mode="main", head_mode=None, pin_changes={"axiom_encode_ref": "9" * 40},
+    )
+    assert result.returncode != 0 and refused in result.stdout + result.stderr
+    # An ordinary pin bump, in either mode (.github#152 stays as it is).
+    for mode in (None, "main"):
+        result, _ = run_restate_admission(
+            base_mode=mode, head_mode=mode, pin_changes={"axiom_rules_engine_ref": "4" * 40},
+        )
+        assert result.returncode != 0 and refused in result.stdout + result.stderr, mode
+    # A switch with a module, a document or a manifest beside the ledger.
+    for path in ("us/statutes/item.yaml", "README.md", ".axiom/encoding-manifests/us/statutes/item.json"):
+        result, _ = run_restate_admission(
+            base_mode=None, head_mode="main", extra={path: "changed\n"},
+        )
+        assert result.returncode != 0 and refused in result.stdout + result.stderr, path
+    # A ledger change with no table change keeps the protected-base
+    # configuration: the candidate table is never read.
+    result, bound = run_restate_admission(base_mode=None, head_mode=None, change_table=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert bound["dependency_pins_changed"] == "false"
+
+
+RESTATE_TABLE = '[workflow_toolchain]\naxiom_encode_ref = "{ref}"\n{mode}'
+
+
+def restate_ledger(records: dict[str, tuple[str, ...]], *, expires: str = "2026-12-21") -> bytes:
+    """records: path -> (active marker,) or (active marker, pending marker)."""
+    text = "# reviewed waivers\nvalidate_failures:\n"
+    for path, markers in records.items():
+        text += f"  {path}:\n"
+        for state, marker in zip(("active", "pending"), markers):
+            if marker:
+                text += (
+                    f"    {state}:\n"
+                    f'      fingerprint: "sha256:{marker * 64}"\n'
+                    '      owner: "@owner"\n'
+                    '      issue: "https://github.com/example/rules/issues/1"\n'
+                    f'      expires: "{expires}"\n'
+                )
+    return text.encode()
+
+
+RESTATE_BASE = {
+    "us/statutes/one.yaml": ("1",),
+    "us/statutes/two.yaml": ("2",),
+    "us/statutes/three.yaml": ("3", "4"),
+    "us/statutes/four.yaml": ("", "5"),
+}
+RESTATE_CHANGED = (LEDGER, ".axiom/toolchain.toml", ".axiom/workflow-toolchain.toml")
+
+
+def staged_restate_check(root: Path) -> Path:
+    """Run the staging step and return the check file that it writes."""
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    names = [step.get("name") for step in steps]
+    at = names.index("Stage the verifier restate check")
+    # Nothing runs between the staging step and the ratchet.
+    assert names[at + 1] == "Enforce validation waiver ratchet"
+    assert "${{" not in steps[at]["run"]
+    subprocess.run(
+        ["bash", "-c", steps[at]["run"]], env={**os.environ, "RUNNER_TEMP": str(root)},
+        check=True,
+    )
+    return root / "waiver-verifier-restate-check.py"
+
+
+def run_restate_ratchet(
+    head_ledger: bytes, *, base_ledger: bytes | None = None,
+    base_mode: str | None = None, head_mode: str | None = "main",
+    base_ref: str = "8" * 40, head_ref: str = "8" * 40,
+    changed: tuple[str, ...] = RESTATE_CHANGED, eligible: str = "true",
+    head_toolchain: bytes | None = None, base_table: bool = True,
+    base_extra: str = "", head_extra: str = "",
+) -> tuple[subprocess.CompletedProcess[str], bool, str]:
+    import hashlib
+
+    base_ledger = restate_ledger(RESTATE_BASE) if base_ledger is None else base_ledger
+
+    def waiver_toolchain(raw: bytes) -> bytes:
+        return (
+            "[toolchain]\n"
+            'axiom_corpus_release = "unchanged"\n'
+            f'axiom_corpus_release_content_sha256 = "{"c" * 64}"\n'
+            f'validation_waiver_set_sha256 = "{hashlib.sha256(raw).hexdigest()}"\n'
+        ).encode()
+
+    def table(ref: str, mode: str | None, extra: str) -> str:
+        return RESTATE_TABLE.format(
+            ref=ref, mode=f'encoder_verifier = "{mode}"\n' if mode else "",
+        ) + extra
+
+    with tempfile.TemporaryDirectory(prefix="verifier-restate-") as directory:
+        root = Path(directory)
+        checkout = root / "checkout"
+        (checkout / ".axiom").mkdir(parents=True)
+        (checkout / LEDGER).write_bytes(head_ledger)
+        (checkout / ".axiom/toolchain.toml").write_bytes(
+            waiver_toolchain(head_ledger) if head_toolchain is None else head_toolchain
+        )
+        (checkout / ".axiom/workflow-toolchain.toml").write_text(
+            table(head_ref, head_mode, head_extra)
+        )
+        (root / "base.yaml").write_bytes(base_ledger)
+        (root / "base.toml").write_bytes(waiver_toolchain(base_ledger))
+        (root / "changed.txt").write_text("".join(f"{path}\n" for path in changed))
+        if base_table:
+            (root / "base-workflow.toml").write_text(table(base_ref, base_mode, base_extra))
+        marker = root / "marker"
+        result = subprocess.run(
+            [
+                sys.executable, "-I", "-c", base.waiver_ratchet_source(),
+                str(root / "base.yaml"), str(checkout / LEDGER), str(root / "base.toml"),
+                str(checkout / ".axiom/toolchain.toml"), str(root / "changed.txt"),
+                str(root / "audit-changed.txt"),
+            ],
+            env={
+                **os.environ,
+                "VERIFIER_RESTATE_CHECK": str(staged_restate_check(root)),
+                "BASE_WORKFLOW_TOOLCHAIN": str(root / "base-workflow.toml"),
+                "VERIFIER_RESTATE_MARKER": str(marker),
+                "VERIFIER_RESTATE_ELIGIBLE": eligible,
+            },
+            capture_output=True, text=True,
+        )
+        audit_changed = (
+            (root / "audit-changed.txt").read_text() if (root / "audit-changed.txt").exists() else ""
+        )
+        return result, marker.exists(), audit_changed
+
+
+def refused_restate(head_ledger: bytes, expected: str, **options) -> None:
+    result, marked, _ = run_restate_ratchet(head_ledger, **options)
+    assert result.returncode != 0, (expected, result.stdout)
+    assert expected in result.stderr, (expected, result.stderr)
+    assert not marked, expected
+
+
+def test_ratchet_accepts_a_mechanical_verifier_restate() -> None:
+    # One fingerprint restated, one active-only entry removed, one active
+    # fingerprint restated beside an untouched pending record.
+    head = restate_ledger({
+        "us/statutes/one.yaml": ("a",),
+        "us/statutes/three.yaml": ("b", "4"),
+        "us/statutes/four.yaml": ("", "5"),
+    })
+    result, marked, audit_changed = run_restate_ratchet(head)
+    assert result.returncode == 0, result.stderr
+    assert marked
+    assert "Verifier restate (pinned -> main): 2 fingerprint(s) restated, 1 active-only" in result.stdout
+    # The audit sees the mode change, which --verifier-restate requires.
+    assert ".axiom/workflow-toolchain.toml" in audit_changed.splitlines()
+    # The same rule on a base that has no workflow-toolchain file (pinned).
+    result, marked, _ = run_restate_ratchet(head, base_table=False)
+    assert result.returncode == 0 and marked, result.stderr
+    # A revert to pinned with the same encoder commit; a second switch after
+    # the revert is the first case again.
+    result, marked, _ = run_restate_ratchet(head, base_mode="main", head_mode=None)
+    assert result.returncode == 0 and marked, result.stderr
+    # Caller pins may change with the mode.
+    result, marked, _ = run_restate_ratchet(
+        head, changed=(*RESTATE_CHANGED, ".github/workflows/repository-checks.yml"),
+    )
+    assert result.returncode == 0 and marked, result.stderr
+
+
+def test_ratchet_refuses_a_restate_that_adds_or_loosens_a_waiver() -> None:
+    one_restated = {**RESTATE_BASE, "us/statutes/one.yaml": ("a",)}
+    # A new entry.
+    refused_restate(
+        restate_ledger({**one_restated, "us/statutes/new.yaml": ("9",)}),
+        "cannot add a waiver entry",
+    )
+    # A later expiry, another issue, another owner.
+    base_text = restate_ledger(RESTATE_BASE).decode()
+    first, rest = base_text.split("  us/statutes/two.yaml:", 1)
+    first = first.replace("1" * 64, "a" * 64)
+    for old, new in (
+        ('expires: "2026-12-21"', 'expires: "2027-12-21"'),
+        ("issues/1", "issues/2"),
+        ('"@owner"', '"@other"'),
+    ):
+        refused_restate(
+            (first.replace(old, new) + "  us/statutes/two.yaml:" + rest).encode(),
+            "only the fingerprint of an active record may change",
+        )
+    # A pending record changed, added, removed, or consumed.
+    for change in (
+        {"us/statutes/three.yaml": ("b", "9")},
+        {"us/statutes/one.yaml": ("a", "9")},
+        {"us/statutes/three.yaml": ("b",)},
+        {"us/statutes/three.yaml": ("4",)},
+        {"us/statutes/four.yaml": ("5",)},
+        {"us/statutes/four.yaml": ("", "9")},
+    ):
+        refused_restate(
+            restate_ledger({**one_restated, **change}),
+            "only the fingerprint of an active record may change",
+        )
+    # An entry with a pending record cannot be removed.
+    for path in ("us/statutes/three.yaml", "us/statutes/four.yaml"):
+        refused_restate(
+            restate_ledger({key: value for key, value in one_restated.items() if key != path}),
+            "only an entry with an active record and no pending record may be removed",
+        )
+    # Not a fingerprint; a reordered ledger; a changed comment; another key.
+    refused_restate(
+        restate_ledger(one_restated).replace(b"sha256:" + b"a" * 64, b"sha256:anything"),
+        "the restated fingerprint must be sha256:<64 hex>",
+    )
+    refused_restate(
+        restate_ledger(dict(reversed(list(one_restated.items())))),
+        "must equal the protected-base ledger",
+    )
+    refused_restate(
+        restate_ledger(one_restated).replace(b"# reviewed waivers", b"# changed"),
+        "must equal the protected-base ledger",
+    )
+    refused_restate(
+        restate_ledger(one_restated) + b"other_failures: {}\n",
+        "only validate_failures records may change",
+    )
+    # A duplicate key hides a second record from the YAML loader.
+    duplicate = restate_ledger(one_restated).replace(
+        b'      expires: "2026-12-21"\n  us/statutes/two.yaml:',
+        b'      expires: "2026-12-21"\n      expires: "2099-01-01"\n  us/statutes/two.yaml:',
+        1,
+    )
+    assert b"2099" in duplicate
+    refused_restate(duplicate, "ValidationWaiverVerifierRestate")
+
+
+def test_ratchet_refuses_a_restate_outside_a_clean_mode_switch() -> None:
+    head = restate_ledger({**RESTATE_BASE, "us/statutes/one.yaml": ("a",)})
+    # No mode switch: the strict ratchet applies, in both modes.
+    for mode in (None, "main"):
+        result, marked, _ = run_restate_ratchet(head, base_mode=mode, head_mode=mode)
+        assert result.returncode != 0 and not marked
+        assert "ValidationWaiverRatchetGrowth" in result.stderr, result.stderr
+    # A module, a manifest or a document beside the switch.
+    for path in ("us/statutes/one.yaml", ".axiom/encoding-manifests/us/statutes/one.json", "README.md"):
+        refused_restate(head, "must be configuration-only", changed=(*RESTATE_CHANGED, path))
+    # Another toolchain key (a corpus release pin) beside the digest.
+    import hashlib
+    release = (
+        "[toolchain]\n"
+        'axiom_corpus_release = "another"\n'
+        f'axiom_corpus_release_content_sha256 = "{"d" * 64}"\n'
+        f'validation_waiver_set_sha256 = "{hashlib.sha256(head).hexdigest()}"\n'
+    ).encode()
+    result, marked, _ = run_restate_ratchet(head, head_toolchain=release)
+    assert result.returncode != 0 and not marked, result.stdout
+    # A revert that also changes the encoder commit.
+    refused_restate(
+        head, "only with axiom_encode_ref unchanged",
+        base_mode="main", head_mode=None, head_ref="9" * 40,
+    )
+    # A bootstrap or rewound comparison base.
+    refused_restate(head, "rewound comparison base", eligible="false")
+    # An invalid mode never selects the restate rule.
+    refused_restate(head, "encoder_verifier must be pinned or main", head_mode="tip")
+    # A switch with an unchanged ledger does not use the rule at all.
+    result, marked, _ = run_restate_ratchet(
+        restate_ledger(RESTATE_BASE), changed=(".axiom/workflow-toolchain.toml",),
+    )
+    assert result.returncode == 0 and not marked, result.stderr
+
+
+def test_ratchet_restate_moves_no_other_pin() -> None:
+    head = restate_ledger({**RESTATE_BASE, "us/statutes/one.yaml": ("a",)})
+    engine = 'axiom_rules_engine_ref = "{}"\n'
+    # An engine or corpus pin that moves with the switch could change the
+    # failures by itself.
+    for key in ("axiom_rules_engine_ref", "axiom_corpus_ref", "rulespec_us_ref", "axiom_compose_ref"):
+        refused_restate(
+            head, f"a verifier restate cannot change other pins: {key}",
+            base_extra=f'{key} = "{"3" * 40}"\n', head_extra=f'{key} = "{"4" * 40}"\n',
+        )
+        refused_restate(
+            head, f"a verifier restate cannot change other pins: {key}",
+            head_extra=f'{key} = "{"4" * 40}"\n',
+        )
+    # Unchanged pins, the hold and the producer floor are not a refusal on
+    # a switch to main.
+    result, marked, _ = run_restate_ratchet(
+        head, base_extra=engine.format("3" * 40),
+        head_extra=engine.format("3" * 40) + f'encoder_verifier_hold = "{"7" * 40}"\n',
+        head_ref="9" * 40,
+    )
+    assert result.returncode == 0 and marked, result.stderr
+    # A revert keeps every pin, and needs an exact encoder commit.
+    refused_restate(
+        head, "a verifier restate cannot change other pins: axiom_rules_engine_ref",
+        base_mode="main", head_mode=None,
+        base_extra=engine.format("3" * 40), head_extra=engine.format("4" * 40),
+    )
+    refused_restate(
+        head, "needs an exact axiom_encode_ref",
+        base_mode="main", head_mode=None, base_ref="main", head_ref="main",
+    )
+    # The admission step applies the same rule.
+    refused = "dependency pin changes require a configuration-only change"
+    for key in ("axiom_rules_engine_ref", "axiom_corpus_ref"):
+        result, _ = run_restate_admission(
+            base_mode=None, head_mode="main", pin_changes={key: "4" * 40},
+        )
+        assert result.returncode != 0 and refused in result.stdout + result.stderr, key
+
+
+def test_ratchet_restate_reads_the_ledger_layouts_in_use() -> None:
+    # The rulespec-us form: a comment on the header line, comment lines in
+    # and between entries, a blank line, and no newline at the end.
+    def layout(one: str, two: bool = True, pending: str = "4") -> bytes:
+        record = (
+            '      fingerprint: "sha256:{}"  # reviewed\n'
+            '      owner: "@owner"\n'
+            '      issue: "https://github.com/example/rules/issues/1"\n'
+            '      expires: "2026-12-21"\n'
+        )
+        return (
+            "# reviewed waivers\n"
+            "validate_failures:  # https://github.com/example/rules/issues/396\n"
+            "  us/statutes/one.yaml:\n"
+            "    # staged with the first batch\n"
+            "    active:\n" + record.format(one * 64)
+            + "\n"
+            "  # second batch\n"
+            + (
+                "  us/statutes/two.yaml:\n    active:\n" + record.format("2" * 64)
+                if two else ""
+            )
+            + "# a column-0 comment\n"
+            "  us/statutes/three.yaml:\n"
+            "    active:\n" + record.format("3" * 64)
+            + "\n"
+            "    # the renewal\n"
+            "    pending:\n" + record.format(pending * 64)
+            + "other: 1"
+        ).encode()
+
+    base_ledger = layout("1")
+    result, marked, _ = run_restate_ratchet(layout("a"), base_ledger=base_ledger)
+    assert result.returncode == 0 and marked, result.stderr
+    result, marked, _ = run_restate_ratchet(layout("a", two=False), base_ledger=base_ledger)
+    assert result.returncode == 0 and marked, result.stderr
+    assert "1 fingerprint(s) restated, 1 active-only" in result.stdout
+    # The pending record after the blank line belongs to its entry: it
+    # cannot change, and its entry cannot be removed.
+    refused_restate(
+        layout("a", pending="9"), "only the fingerprint of an active record may change",
+        base_ledger=base_ledger,
+    )
+    without_three = layout("a").split(b"  us/statutes/three.yaml:")[0] + b"other: 1"
+    refused_restate(
+        without_three, "only an entry with an active record and no pending record",
+        base_ledger=base_ledger,
+    )
+    # A changed or dropped comment, and a changed trailing comment.
+    for old, new in (
+        (b"  # second batch\n", b""),
+        (b"    # staged with the first batch\n", b"    # other\n"),
+        (b"# reviewed\n      owner", b"# seen\n      owner"),
+        (b"issues/396", b"issues/397"),
+    ):
+        changed = layout("a").replace(old, new, 1)
+        assert changed != layout("a")
+        refused_restate(changed, "ValidationWaiverVerifierRestate", base_ledger=base_ledger)
+    # CRLF line ends and a flow-style mapping are refused, not misread.
+    crlf = base_ledger.replace(b"\n", b"\r\n")
+    refused_restate(
+        crlf.replace(b"1" * 64, b"a" * 64), "ValidationWaiverVerifierRestate",
+        base_ledger=crlf,
+    )
+    flow = (
+        b"validate_failures: {us/statutes/one.yaml: {active: {fingerprint: 'sha256:"
+        + b"%s', owner: '@o', issue: 'https://github.com/example/rules/issues/1', "
+        b"expires: '2026-12-21'}}}\n"
+    )
+    refused_restate(
+        flow % (b"a" * 64), "layout does not allow a mechanical restate",
+        base_ledger=flow % (b"1" * 64),
+    )
+
+
+def test_repeated_switches_never_grow_the_ledger() -> None:
+    # pinned -> main -> pinned -> main: each step starts from the last
+    # accepted ledger, and no step can add a record or change its terms.
+    ledgers = [restate_ledger(RESTATE_BASE)]
+    for marker, (base_mode, head_mode) in zip("abc", ((None, "main"), ("main", None), (None, "main"))):
+        head = restate_ledger({**RESTATE_BASE, "us/statutes/one.yaml": (marker,)})
+        result, marked, _ = run_restate_ratchet(
+            head, base_ledger=ledgers[-1], base_mode=base_mode, head_mode=head_mode,
+        )
+        assert result.returncode == 0 and marked, result.stderr
+        refused_restate(
+            restate_ledger({**RESTATE_BASE, "us/statutes/one.yaml": (marker,), "us/statutes/new.yaml": ("9",)}),
+            "cannot add a waiver entry",
+            base_ledger=ledgers[-1], base_mode=base_mode, head_mode=head_mode,
+        )
+        ledgers.append(head)
+    # An entry removed by one switch does not come back with a revert.
+    removed = restate_ledger({key: value for key, value in RESTATE_BASE.items() if key != "us/statutes/two.yaml"})
+    refused_restate(
+        restate_ledger(RESTATE_BASE), "cannot add a waiver entry",
+        base_ledger=removed, base_mode="main", head_mode=None,
+    )
+
+
+def test_ratchet_without_the_protected_base_table_name_stays_strict() -> None:
+    # Older callers of the ratchet source pass no environment: no restate.
+    head = restate_ledger({**RESTATE_BASE, "us/statutes/one.yaml": ("a",)})
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        import hashlib
+        files = {
+            "base.yaml": restate_ledger(RESTATE_BASE), "head.yaml": head,
+        }
+        for name, raw in files.items():
+            (root / name).write_bytes(raw)
+            (root / name.replace("yaml", "toml")).write_text(
+                "[toolchain]\n"
+                f'validation_waiver_set_sha256 = "{hashlib.sha256(raw).hexdigest()}"\n'
+            )
+        (root / "changed.txt").write_text("".join(f"{path}\n" for path in RESTATE_CHANGED))
+        environment_ = {
+            key: value for key, value in os.environ.items()
+            if key not in ("BASE_WORKFLOW_TOOLCHAIN", "VERIFIER_RESTATE_MARKER")
+        }
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", base.waiver_ratchet_source(),
+             *(str(root / name) for name in (
+                 "base.yaml", "head.yaml", "base.toml", "head.toml", "changed.txt", "audit.txt"))],
+            env=environment_, capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "ValidationWaiverRatchetGrowth" in result.stderr, result.stderr
+
+
+def test_the_audit_gets_the_restate_flag_only_from_the_ratchet_marker() -> None:
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    run = next(step for step in steps if step.get("name") == "Enforce validation waiver ratchet")["run"]
+    before, after = run.split("# waiver-ratchet-python-end\n", 1)
+    # The marker is cleared before the ratchet and only the ratchet writes it.
+    assert 'rm -f "$base_workflow_toolchain" "$verifier_restate_marker"' in before
+    assert before.index('rm -f "$base_workflow_toolchain"') < before.index("# waiver-ratchet-python-start")
+    assert run.count("VERIFIER_RESTATE_MARKER") == 2  # export, and the one write
+    assert 'if [ -e "$RUNNER_TEMP/waiver-verifier-restate" ]; then' in after
+    assert 'verifier_restate_marker="$RUNNER_TEMP/waiver-verifier-restate"' in before
+    # A verifier without the flag fails; there is no fallback audit.
+    probe = after[after.index('if [ -e "$RUNNER_TEMP/waiver-verifier-restate" ]'):]
+    probe = probe[:probe.index("partition_args=()")]
+    assert "--verifier-restate" in probe and "exit 1" in probe
+    assert "restate_args=(--verifier-restate)" in probe
+    assert '"${restate_args[@]}"' in after
+    # The mode comes from the comparison base, as the ledger does.
+    assert 'git show "$comparison_base:.axiom/workflow-toolchain.toml" > "$base_workflow_toolchain"' in before
+
+
 def main() -> None:
     for name, function in sorted(globals().items()):
         if name.startswith("test_") and callable(function):

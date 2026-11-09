@@ -210,6 +210,37 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   = "main"` in `.axiom/workflow-toolchain.toml`. The `encoder-verifier` input
   must equal it (a pull request controls its own caller), and changing the key
   is a full dependency change.
+- A change of the mode (`pinned` to `main`, or back) may also restate the
+  waiver ledger, because the new verifier computes other failure
+  fingerprints for files that are already waived. This is the one case where
+  `known-validation-gaps.yaml` may ride with a dependency change (#152 stays
+  as it is for every other pin change). The change may contain only
+  `.axiom/workflow-toolchain.toml`, the caller workflow, the ledger and the
+  matching `validation_waiver_set_sha256`. Three checks apply, and each one
+  fails closed:
+  - "Enforce validation waiver ratchet" rebuilds the head ledger from the
+    protected-base bytes. Only the `fingerprint` value of an `active` record
+    may change (to another `sha256:<64 hex>`), and an entry with an `active`
+    record and no `pending` record may be removed. Owner, issue, expiry,
+    `pending` records, order and comments stay byte-identical. No entry is
+    added. No other pin may move, except the hold and, on a switch to
+    `main`, the floor (forward only). A revert to `pinned` must keep
+    `axiom_encode_ref`, because that commit becomes the verifier.
+  - The supervised waiver audit runs with `--verifier-restate` under the
+    resolved verifier on the whole repository: each restated fingerprint
+    must equal the failure that the verifier observes, and each removed
+    file must pass. So the head ledger has one valid content. A verifier
+    without `--verifier-restate` (before axiom-encode#2101) fails the step.
+  - The generated guard applies the same record rule and refuses RuleSpec
+    files, manifests and receipts beside a restate.
+
+  A restate does not add a waiver, and a file that fails with no waiver
+  still fails the change. It does re-approve the new failure of a file that
+  is already waived, with the same owner, issue and expiry: review the
+  restated failures. `pending` records cannot change, so do not switch the
+  mode while a waiver renewal is staged and not yet consumed. A ledger
+  layout that the rebuild cannot read (flow style, CRLF line ends) is
+  refused; reformat it in an ordinary ledger change first.
 - A floor-only change runs the head guard with `--all` twice, at the base
   floor and at the new floor, and fails only on issues that are new at the
   new floor (the ordinary guard of the pull request's own changes also

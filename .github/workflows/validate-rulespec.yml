@@ -941,7 +941,34 @@ jobs:
               changed = {os.fsdecode(path) for path in git(
                   "diff", "--name-only", "-z", "--no-renames", base, candidate,
               ).split(b"\0") if path}
-              if changed and changed <= {TABLE_PATH, *CALLER_PATHS, ".axiom/toolchain.toml"}:
+              configuration_paths = {TABLE_PATH, *CALLER_PATHS, ".axiom/toolchain.toml"}
+              def verifier_restate_candidate():
+                  # A change of the verifier mode moves the failure
+                  # fingerprints of waived modules. That one configuration
+                  # change may carry the waiver ledger. This step only admits
+                  # the path: the waiver ratchet proves the ledger change is a
+                  # mechanical restate, and the supervised audit proves every
+                  # record under the resolved verifier. A revert to the pinned
+                  # verifier must keep axiom_encode_ref, so no unreviewed
+                  # encoder becomes the verifier here.
+                  ledger = "known-validation-gaps.yaml"
+                  if not (
+                      {TABLE_PATH, ledger} <= changed
+                      and changed <= configuration_paths | {ledger}
+                  ):
+                      return False
+                  candidate_pin, candidate_pins, _, _, _ = configuration_pins(candidate)
+                  candidate_mode = verifier_mode(candidate_pins)
+                  if candidate_mode == verifier_mode(base_table):
+                      return False
+                  # No engine, corpus or composer pin moves with a restate.
+                  # The producer floor may move with a switch to main (the
+                  # guard step checks its direction); a revert keeps it.
+                  free = {"encoder_verifier", "encoder_verifier_hold", "shared_validator_ref", "shared_workflow_ref"}
+                  if candidate_mode == "main":
+                      free.add("axiom_encode_ref")
+                  return set(dependency_ref_changes(candidate_pin, candidate_pins, candidate)) <= free
+              if changed and (changed <= configuration_paths or verifier_restate_candidate()):
                   git("merge-base", "--is-ancestor", base, candidate)
                   configuration = candidate
                   protected_pin, pins, caller_values, direct_caller, opaque_caller = configuration_pins(configuration)
@@ -4807,6 +4834,278 @@ jobs:
             exit 1
           fi
 
+      - name: Stage the verifier restate check
+        shell: bash
+        # The waiver ratchet runs this check when one change switches the
+        # verifier mode (pinned <-> main) and changes the waiver ledger. It
+        # is a separate file because one step script has a size limit.
+        #
+        # The check reads only bytes. The head ledger must be the
+        # protected-base ledger with these edits and no other:
+        #   - the fingerprint value of an active record is another
+        #     sha256:<64 hex>; owner, issue, expiry and any pending record
+        #     stay byte-identical;
+        #   - an entry with an active record and no pending record is
+        #     removed (the module passes under the new verifier).
+        # No entry is added, moved or duplicated, and comments stay.
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/waiver-verifier-restate-check.py" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          import yaml
+
+
+          def refuse(reason):
+              raise SystemExit("ValidationWaiverVerifierRestate: " + reason)
+
+
+          LAYOUT = (
+              "the protected-base ledger layout does not allow a mechanical restate "
+              "(one block-style validate_failures mapping, two-space entries, LF line ends)"
+          )
+          UNEQUAL = (
+              "the head ledger must equal the protected-base ledger with only restated "
+              "active fingerprints and removed active-only entries"
+          )
+          HEADER = re.compile(rb"validate_failures:[ \t]*(#[^\n]*)?\n")
+          FINGERPRINT = re.compile(rb" {6}fingerprint: (?P<value>[^\n]*)(?P<end>\n?)")
+          RESTATED = re.compile(rb"sha256:[0-9a-f]{64}")
+
+
+          def split(raw):
+              """Return (lines before the entries, items, lines after the entries).
+
+              An item is ("entry", lines) for one path, or ("other", lines) for blank
+              and comment lines between entries. They are copied, never interpreted.
+              """
+              lines = raw.splitlines(keepends=True)
+              headers = [index for index, line in enumerate(lines) if HEADER.fullmatch(line)]
+              if len(headers) != 1:
+                  return None
+              start = end = headers[0] + 1
+              while end < len(lines) and lines[end][:1] in (b" ", b"#", b"\n"):
+                  end += 1
+              items, held = [], []
+              for line in lines[start:end]:
+                  if line.startswith(b"  ") and line[2:3] not in (b" ", b"#", b"\n", b""):
+                      items.extend(("other", [other]) for other in held)
+                      held = []
+                      items.append(("entry", [line]))
+                  elif line.startswith(b"   ") and items and items[-1][0] == "entry":
+                      # Deeper lines belong to the entry, with any lines held before.
+                      items[-1][1].extend(held + [line])
+                      held = []
+                  else:
+                      held.append(line)
+              items.extend(("other", [other]) for other in held)
+              return lines[:start], items, lines[end:]
+
+
+          WORKFLOW_TOOLCHAIN = ".axiom/workflow-toolchain.toml"
+          LEDGER = "known-validation-gaps.yaml"
+
+
+          def verifier_configuration(path):
+              # Returns (mode, table). An absent file, table or key means the pinned
+              # verifier, as in the dependency step.
+              if not path.is_file():
+                  return "pinned", {}
+              try:
+                  table = tomllib.loads(path.read_bytes().decode()).get("workflow_toolchain", {})
+              except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+                  refuse(f"{WORKFLOW_TOOLCHAIN} is invalid: {error}")
+              mode = table.get("encoder_verifier", "pinned") if isinstance(table, dict) else None
+              if mode not in ("pinned", "main"):
+                  refuse("encoder_verifier must be pinned or main")
+              return mode, table
+
+
+          base_path, head_path, base_table_path, head_table_path, changed_path = map(
+              Path, sys.argv[1:6]
+          )
+          base_mode, base_table = verifier_configuration(base_table_path)
+          head_mode, head_table = verifier_configuration(head_table_path)
+          if base_mode == head_mode:
+              # Content decides, so a push of the merged change gets the same rule as
+              # its pull request. No switch: the strict ratchet applies.
+              json.dump({"switch": False, "restated": [], "removed": []}, sys.stdout)
+              raise SystemExit(0)
+          if os.environ.get("VERIFIER_RESTATE_ELIGIBLE") != "true":
+              refuse("a bootstrap or rewound comparison base cannot carry a verifier restate")
+          # The dependency step admits the same paths. Nothing under a RuleSpec root,
+          # no manifest and no receipt may ride with a restate.
+          changed_paths = frozenset(changed_path.read_text().splitlines())
+          allowed_paths = {
+              LEDGER,
+              ".axiom/toolchain.toml",
+              WORKFLOW_TOOLCHAIN,
+              ".github/workflows/repository-checks.yml",
+              ".github/workflows/repository-checks.yaml",
+          }
+          if not {LEDGER, WORKFLOW_TOOLCHAIN} <= changed_paths or not changed_paths <= allowed_paths:
+              refuse(
+                  "a verifier-mode switch that changes the waiver ledger must be "
+                  "configuration-only; also changed: "
+                  + ", ".join(sorted(changed_paths - allowed_paths))
+              )
+          if sys.argv[6] != "True":
+              # The ratchet proved (or not) the digest-only toolchain companion.
+              refuse("only the exact waiver-set digest may change in .axiom/toolchain.toml")
+          # No engine, corpus or other pin may move with a restate: a failure that
+          # such a pin changes is not a verifier restate. The producer floor may move
+          # with a switch to main (the guard step checks its direction); a revert must
+          # keep it, because it becomes the verifier.
+          free = {"encoder_verifier", "encoder_verifier_hold", "shared_workflow_ref"}
+          if head_mode == "main":
+              free.add("axiom_encode_ref")
+          moved = sorted(
+              key for key in set(base_table) | set(head_table)
+              if key not in free
+              and (type(base_table.get(key)), base_table.get(key))
+              != (type(head_table.get(key)), head_table.get(key))
+          )
+          if moved:
+              refuse(
+                  "a verifier restate cannot change other pins"
+                  + (
+                      " (a revert to the pinned verifier may restate the ledger only "
+                      "with axiom_encode_ref unchanged)"
+                      if "axiom_encode_ref" in moved else ""
+                  )
+                  + ": " + ", ".join(moved)
+              )
+          if head_mode == "pinned" and re.fullmatch(
+              r"[0-9a-f]{40}", str(head_table.get("axiom_encode_ref"))
+          ) is None:
+              refuse("a revert to the pinned verifier needs an exact axiom_encode_ref")
+
+          base_raw, head_raw = base_path.read_bytes(), head_path.read_bytes()
+          base_split, head_split = split(base_raw), split(head_raw)
+          if base_split is None:
+              refuse(LAYOUT)
+          if head_split is None:
+              refuse(UNEQUAL)
+          base_before, base_items, base_after = base_split
+          head_before, head_items, head_after = head_split
+          if (base_before, base_after) != (head_before, head_after):
+              refuse(UNEQUAL + "; only validate_failures records may change")
+
+          # Each protected-base entry must read alone as it reads in the whole ledger,
+          # so a split error cannot hide a pending record.
+          try:
+              whole = yaml.safe_load(base_raw)["validate_failures"]
+              entries = {}
+              for kind, lines in base_items:
+                  if kind != "entry":
+                      continue
+                  (module, states), = yaml.safe_load(
+                      b"validate_failures:\n" + b"".join(lines)
+                  )["validate_failures"].items()
+                  if module in entries or not isinstance(states, dict):
+                      refuse(LAYOUT)
+                  entries[module] = (lines[0], states)
+          except (yaml.YAMLError, TypeError, ValueError, KeyError, AttributeError):
+              refuse(LAYOUT)
+          if not isinstance(whole, dict) or {
+              module: states for module, (_, states) in entries.items()
+          } != whole or len({key for key, _ in entries.values()}) != len(entries):
+              refuse(LAYOUT)
+
+          base_keys = [lines[0] for kind, lines in base_items if kind == "entry"]
+          head_keys = [lines[0] for kind, lines in head_items if kind == "entry"]
+          added = [key for key in head_keys if key not in set(base_keys)]
+          if added:
+              refuse(
+                  "a verifier restate cannot add a waiver entry: "
+                  + ", ".join(key.decode(errors="replace").strip().rstrip(":") for key in added)
+              )
+          remaining = iter(base_keys)
+          if not all(key in remaining for key in head_keys):
+              refuse(UNEQUAL + "; entries keep their order and appear once")
+
+          restated, removed = [], []
+          position = 0
+          for kind, lines in base_items:
+              head_item = head_items[position] if position < len(head_items) else None
+              if kind == "other":
+                  if head_item != (kind, lines):
+                      refuse(UNEQUAL)
+                  position += 1
+                  continue
+              module, (_, states) = next(
+                  (module, value) for module, value in entries.items() if value[0] == lines[0]
+              )
+              if head_item is None or head_item[0] != "entry" or head_item[1][0] != lines[0]:
+                  if set(states) != {"active"}:
+                      refuse(
+                          f"{module}: only an entry with an active record and no pending "
+                          "record may be removed"
+                      )
+                  removed.append(module)
+                  continue
+              position += 1
+              head_lines = head_item[1]
+              if head_lines == lines:
+                  continue
+              changed = (
+                  [index for index, pair in enumerate(zip(lines, head_lines)) if pair[0] != pair[1]]
+                  if len(lines) == len(head_lines) else []
+              )
+              active = [index for index, line in enumerate(lines) if line == b"    active:\n"]
+              old = FINGERPRINT.fullmatch(lines[changed[0]]) if len(changed) == 1 else None
+              new = FINGERPRINT.fullmatch(head_lines[changed[0]]) if len(changed) == 1 else None
+              value = states.get("active", {}).get("fingerprint") if isinstance(
+                  states.get("active"), dict
+              ) else None
+              if not (
+                  old and new and len(active) == 1 and isinstance(value, str) and value
+                  and active[0] < changed[0]
+                  and all(
+                      line.startswith(b"      ") for line in lines[active[0] + 1:changed[0] + 1]
+                  )
+                  and old["end"] == new["end"]
+                  and old["value"].count(value.encode()) == 1
+              ):
+                  refuse(
+                      f"{module}: only the fingerprint of an active record may change; "
+                      "owner, issue, expiry and pending records must stay exactly as on "
+                      "the protected base"
+                  )
+              before, after = old["value"].split(value.encode())
+              if not (
+                  new["value"].startswith(before) and new["value"].endswith(after)
+                  and len(new["value"]) >= len(before) + len(after)
+                  and RESTATED.fullmatch(new["value"][len(before):len(new["value"]) - len(after)])
+              ):
+                  refuse(f"{module}: the restated fingerprint must be sha256:<64 hex>")
+              restated.append(module)
+          if position != len(head_items):
+              refuse(UNEQUAL)
+          if not (restated or removed):
+              refuse("the ledger changed without a restated or removed record")
+          if not all(isinstance(module, str) for module in (*restated, *removed)):
+              refuse(LAYOUT)
+          json.dump(
+              {
+                  "switch": True,
+                  "restated": restated,
+                  "removed": removed,
+                  "summary": (
+                      f"Verifier restate ({base_mode} -> {head_mode}): "
+                      f"{len(restated)} fingerprint(s) restated, "
+                      f"{len(removed)} active-only entr(ies) removed."
+                  ),
+              },
+              sys.stdout,
+          )
+          PY
+
       - name: Enforce validation waiver ratchet
         shell: bash
         # Green rulespec-us legs, September 2026: p50 13, at most 125
@@ -4905,12 +5204,35 @@ jobs:
               exit 1
             }
           fi
+          # A verifier-mode switch may restate the ledger (see the ratchet).
+          # The mode comes from the same protected comparison base as the
+          # ledger. An absent table means the pinned verifier.
+          base_workflow_toolchain="$RUNNER_TEMP/protected-workflow-toolchain.toml"
+          verifier_restate_marker="$RUNNER_TEMP/waiver-verifier-restate"
+          rm -f "$base_workflow_toolchain" "$verifier_restate_marker"
+          if [ -z "$BOOTSTRAP_SHA256" ] \
+              && git cat-file -e "$comparison_base:.axiom/workflow-toolchain.toml" 2>/dev/null; then
+            git show "$comparison_base:.axiom/workflow-toolchain.toml" > "$base_workflow_toolchain"
+          fi
+          export BASE_WORKFLOW_TOOLCHAIN="$base_workflow_toolchain"
+          export VERIFIER_RESTATE_MARKER="$verifier_restate_marker"
+          export VERIFIER_RESTATE_CHECK="$RUNNER_TEMP/waiver-verifier-restate-check.py"
+          if [ -z "$BOOTSTRAP_SHA256" ] && [ "$comparison_base" = "$base_ref" ]; then
+            export VERIFIER_RESTATE_ELIGIBLE=true
+          else
+            # A bootstrap or a rewound comparison base has no single
+            # protected state to restate from.
+            export VERIFIER_RESTATE_ELIGIBLE=false
+          fi
           # waiver-ratchet-python-start
           python -I - "$protected_base" known-validation-gaps.yaml \
             "$protected_base_toolchain" .axiom/toolchain.toml "$changed_paths" \
             "$audit_changed_paths" <<'PY'
           import hashlib
+          import json
+          import os
           import re
+          import subprocess
           import sys
           import tomllib
           from pathlib import Path
@@ -4934,6 +5256,21 @@ jobs:
               raise SystemExit(
                   "ValidationWaiverRatchetSchema: validate_failures must be a mapping"
               )
+          def exactly_equal(left, right):
+              # Type-strict: 1, 1.0, and True must not stand in for
+              # one another when matching a staged approval.
+              if type(left) is not type(right):
+                  return False
+              if isinstance(left, dict):
+                  return set(left) == set(right) and all(
+                      exactly_equal(left[key], right[key]) for key in left
+                  )
+              if isinstance(left, list):
+                  return len(left) == len(right) and all(
+                      exactly_equal(a, b) for a, b in zip(left, right)
+                  )
+              return left == right
+
           pin_companion_verified = False
           companion_paths = frozenset(
               {"known-validation-gaps.yaml", ".axiom/toolchain.toml"}
@@ -5001,21 +5338,6 @@ jobs:
                           "toolchain key must stay unchanged"
                       )
 
-                  def exactly_equal(left, right):
-                      # Type-strict: 1, 1.0, and True must not stand in for
-                      # one another when matching a staged approval.
-                      if type(left) is not type(right):
-                          return False
-                      if isinstance(left, dict):
-                          return set(left) == set(right) and all(
-                              exactly_equal(left[key], right[key]) for key in left
-                          )
-                      if isinstance(left, list):
-                          return len(left) == len(right) and all(
-                              exactly_equal(a, b) for a, b in zip(left, right)
-                          )
-                      return left == right
-
                   retired = [module for module in base_entries if module not in head_entries]
                   consumed = []
                   unsanctioned = []
@@ -5059,8 +5381,53 @@ jobs:
                   # Keep full changed paths and do not enable pending approvals.
               else:
                   pin_companion_verified = True
+          # One change that switches the verifier mode (pinned <-> main) may
+          # restate the ledger for the new verifier and nothing more: see
+          # the step "Stage the verifier restate check", which holds the
+          # rule. The audit below then runs with --verifier-restate under
+          # the resolved verifier. Without the protected-base file name the
+          # rule is off and the strict ratchet applies.
+          restated, restate_removed = [], []
+          if (
+              os.environ.get("BASE_WORKFLOW_TOOLCHAIN")
+              and "known-validation-gaps.yaml" in changed_paths
+          ):
+              check = subprocess.run(
+                  [
+                      sys.executable, "-I", os.environ["VERIFIER_RESTATE_CHECK"],
+                      str(base_path), str(head_path),
+                      os.environ["BASE_WORKFLOW_TOOLCHAIN"],
+                      str(head_path.parent / ".axiom/workflow-toolchain.toml"),
+                      str(changed_path), str(pin_companion_verified),
+                  ],
+                  capture_output=True, text=True,
+              )
+              if check.returncode != 0:
+                  raise SystemExit(
+                      check.stderr.strip()
+                      or "ValidationWaiverVerifierRestate: the restate check failed"
+                  )
+              restate = json.loads(check.stdout)
+              restated, restate_removed = restate["restated"], restate["removed"]
+              if restate["switch"]:
+                  # The byte check and this step's own parse must agree.
+                  if set(restate_removed) != set(base_entries) - set(
+                      head_entries
+                  ) or set(restated) != {
+                      module for module in head_entries
+                      if not exactly_equal(head_entries[module], base_entries.get(module))
+                  }:
+                      raise SystemExit(
+                          "ValidationWaiverVerifierRestate: the restate check and "
+                          "the parsed ledgers disagree"
+                      )
+                  Path(os.environ["VERIFIER_RESTATE_MARKER"]).write_text("restate\n")
+                  print(restate["summary"])
           growth = []
           for module, head_states in head_entries.items():
+              if module in restated:
+                  # Byte reconstruction above proved a fingerprint-only edit.
+                  continue
               base_states = base_entries.get(module)
               if not isinstance(head_states, dict):
                   growth.append(str(module))
@@ -5146,6 +5513,16 @@ jobs:
             echo "::error::Validation waiver audit capability probe returned no help." >&2
             exit 1
           fi
+          restate_args=()
+          if [ -e "$RUNNER_TEMP/waiver-verifier-restate" ]; then
+            # The ratchet proved the ledger change is a mechanical restate.
+            # Only an audit that knows the restate rule may accept it.
+            if ! grep -qE -- '(^|[[:space:],])--verifier-restate([[:space:]=,]|$)' "$audit_help"; then
+              echo "::error::ValidationWaiverVerifierRestate: the resolved verifier has no --verifier-restate audit. Use a verifier at or after axiom-encode#2101 (main tip, or a hold or pin on such a commit)." >&2
+              exit 1
+            fi
+            restate_args=(--verifier-restate)
+          fi
           partition_args=()
           if grep -qE -- '(^|[[:space:],])--partition-key([[:space:]=,]|$)' "$audit_help" \
             && grep -qE -- '(^|[[:space:],])--partition-keys-json([[:space:]=,]|$)' "$audit_help"; then
@@ -5166,6 +5543,7 @@ jobs:
             --protected-base "$protected_base" \
             --changed-paths "$audit_changed_paths" \
             "${partition_args[@]}" \
+            "${restate_args[@]}" \
             --axiom-rules-engine-path "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine"
 
       - name: Prepare protected-base manifest audit
