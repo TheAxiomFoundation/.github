@@ -3644,6 +3644,8 @@ jobs:
           AXIOM_RULES_ENGINE_SHA: ${{ needs.shards.outputs.axiom_rules_engine_ref }}
           AXIOM_CORPUS_SHA: ${{ needs.shards.outputs.axiom_corpus_ref }}
           RULESPEC_US_SHA: ${{ needs.shards.outputs.rulespec_us_ref }}
+          ENCODER_VERIFIER: ${{ needs.shards.outputs.encoder_verifier }}
+          PRODUCER_FLOOR: ${{ needs.shards.outputs.axiom_encode_ref }}
         run: |
           set -euo pipefail
           verify_ancestor() {
@@ -3662,6 +3664,26 @@ jobs:
           verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine" "$AXIOM_RULES_ENGINE_SHA"
           verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/axiom-corpus" "$AXIOM_CORPUS_SHA"
           verify_ancestor "${AXIOM_DEPENDENCY_ROOT}/rulespec-us" "$RULESPEC_US_SHA"
+          # encoder-main-verifier-authentication-start
+          # In encoder-main mode the verifier (the main tip or the protected
+          # hold) must be on first-parent main at or after the floor. This
+          # workflow-owned check runs before any verifier code is built or
+          # provisioned, so the verifier never attests to itself.
+          if [ "${ENCODER_VERIFIER:-pinned}" = "main" ]; then
+            encoder_history="${AXIOM_DEPENDENCY_ROOT}/axiom-encode"
+            if [[ ! "$PRODUCER_FLOOR" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "EncoderMainVerifier: the producer floor must be an exact commit" >&2
+              exit 1
+            fi
+            # Capture first: `rev-list | grep -q` ends in SIGPIPE under pipefail.
+            first_parent_main="$(git -C "$encoder_history" rev-list --first-parent refs/remotes/origin/main)"
+            if ! grep -qxF -- "$AXIOM_ENCODE_SHA" <<< "$first_parent_main" \
+                || ! git -C "$encoder_history" merge-base --is-ancestor "$PRODUCER_FLOOR" "$AXIOM_ENCODE_SHA"; then
+              echo "EncoderMainVerifier: the verifier $AXIOM_ENCODE_SHA must be on first-parent axiom-encode main at or after the floor $PRODUCER_FLOOR" >&2
+              exit 1
+            fi
+          fi
+          # encoder-main-verifier-authentication-end
 
       - name: Validate composer pin
         if: ${{ needs.shards.outputs.axiom_compose_ref != '' }}
@@ -5977,6 +5999,11 @@ jobs:
               echo "EncoderMainVerifier: the base floor must be an exact commit" >&2
               exit 1
             fi
+            # The ordinary guard of the pull request's own changes must pass
+            # at the new floor: the ratchet below compares two runs of the
+            # same tree, so it cannot see issues that do not depend on the
+            # floor.
+            run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE" "$AXIOM_DEPENDENCY_ROOT" "$GITHUB_SHA"
             new_floor_args=("${head_floor_args[@]}")
             head_floor_args=(--encoder-producer-floor "$BASE_ENCODER_REF")
             base_status=0

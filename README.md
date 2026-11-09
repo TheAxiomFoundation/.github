@@ -212,20 +212,24 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   is a full dependency change.
 - A floor-only change runs the head guard with `--all` twice, at the base
   floor and at the new floor, and fails only on issues that are new at the
-  new floor: producers below the new floor are revoked, and the repository's
+  new floor (the ordinary guard of the pull request's own changes also
+  runs): producers below the new floor are revoked, and the repository's
   standing issues stay inherited. With `run-generated-guard: false`,
   floor-only and ledger scoping are off (full dependency bump and default
   selection).
 - `[workflow_toolchain] encoder_verifier_hold = "<40-hex commit>"`
   (optional, `main` mode only) verifies with that axiom-encode commit
   instead of the `main` tip: a cheap way back when an encoder merge breaks
-  validation. The "Record the encoder-main verifier" step proves that the
-  commit is on first-parent `main` at or after the floor, and dependency
-  authentication proves that it is on `main`; otherwise the run fails. A
-  change of only the hold (or of the hold and the floor) is treated like a
-  floor-only change: first shard, guard ratchet with `--all`. With another
-  pin it is a full dependency bump. A hold in `pinned` mode, or a value that
-  is not a full commit, fails. Remove the hold to return to the `main` tip.
+  validation. "Authenticate dependency commits" checks in workflow shell,
+  before any verifier code runs, that the verifier (tip or hold) is on
+  first-parent `main` at or after the floor; "Record the encoder-main
+  verifier" records it. A change of only the hold (or of the hold and the
+  floor) is treated like a floor-only change: first shard, the ordinary
+  guard, and the guard ratchet with `--all`. It does not revalidate every
+  file under the new verifier, so dispatch a full drift run after a hold
+  change. With another pin it is a full dependency bump. A hold in `pinned`
+  mode, or a value that is not a full commit, fails. Remove the hold to
+  return to the `main` tip.
 - With `import-aware-selection`, a ledger-only change still selects the full
   matrix: changed waiver records are global validation inputs there.
 - Every change that leaves `main` mode with another `axiom_encode_ref` (a

@@ -402,6 +402,12 @@ def test_guard_passes_the_floor_only_to_the_head_runtime() -> None:
     assert 'run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE"' in ratchet
     assert '"$GITHUB_SHA" --all --json' in ratchet
     assert 'BASE_RULESPEC_ROOT="$GITHUB_WORKSPACE"' in ratchet
+    # The pull request's own changes still get the ordinary guard.
+    assert ratchet.index(
+        'run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE" '
+        '"$AXIOM_DEPENDENCY_ROOT" "$GITHUB_SHA"\n'
+    ) < ratchet.index('head_floor_args=(--encoder-producer-floor "$BASE_ENCODER_REF")')
+
     # The floor may only move forward on first-parent main.
     assert 'merge-base --is-ancestor "$BASE_ENCODER_REF" "$PRODUCER_FLOOR"' in block
     assert "rev-list --first-parent refs/remotes/origin/main" in block
@@ -418,6 +424,63 @@ def test_guard_passes_the_floor_only_to_the_head_runtime() -> None:
     # Every head encoder checkout follows the verifier, never the bare pin.
     assert "needs.shards.outputs.axiom_encode_ref }}\n          path:" not in workflow
     assert workflow.count("needs.shards.outputs.verifier_encode_ref") == 5
+
+def run_verifier_authentication(commits: int, verifier: str, floor_index: int,
+                                mode: str = "main") -> int:
+    """Run the workflow-owned verifier check on a synthetic history.
+
+    verifier is "first-parent:<index>" or "side": a commit of a merged
+    feature branch (an ancestor of main, not on its first-parent chain).
+    """
+
+    workflow = WORKFLOW.read_text()
+    block = workflow[
+        workflow.index("          # encoder-main-verifier-authentication-start"):
+        workflow.index("          # encoder-main-verifier-authentication-end")
+    ]
+    with tempfile.TemporaryDirectory(prefix="verifier-auth-") as directory:
+        root = Path(directory)
+        history = root / "deps" / "axiom-encode"
+        history.mkdir(parents=True)
+        base.git(history, "init", "-q", "-b", "main")
+        for n in range(commits):
+            base.git(history, "-c", "user.name=F", "-c", "user.email=f@e", "commit",
+                     "-q", "--allow-empty", "-m", str(n))
+        chain = base.git(history, "rev-list", "--reverse", "refs/heads/main").split()
+        base.git(history, "checkout", "-q", "-b", "side", chain[-1])
+        base.git(history, "-c", "user.name=F", "-c", "user.email=f@e", "commit",
+                 "-q", "--allow-empty", "-m", "side")
+        side = base.git(history, "rev-parse", "HEAD").strip()
+        base.git(history, "checkout", "-q", "main")
+        base.git(history, "-c", "user.name=F", "-c", "user.email=f@e", "merge",
+                 "-q", "--no-ff", "-m", "merge side", "side")
+        base.git(history, "update-ref", "refs/remotes/origin/main", "refs/heads/main")
+        target = side if verifier == "side" else chain[int(verifier.split(":")[1])]
+        result = subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + block],
+            cwd=root,
+            env={
+                **os.environ,
+                "AXIOM_DEPENDENCY_ROOT": str(root / "deps"),
+                "AXIOM_ENCODE_SHA": target,
+                "PRODUCER_FLOOR": chain[floor_index],
+                "ENCODER_VERIFIER": mode,
+            },
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode
+
+
+def test_the_workflow_authenticates_the_verifier_before_running_it() -> None:
+    assert run_verifier_authentication(6, "first-parent:4", 2) == 0
+    assert run_verifier_authentication(6, "first-parent:2", 2) == 0
+    # Below the floor, or a merged side-branch commit: rejected.
+    assert run_verifier_authentication(6, "first-parent:1", 2) == 1
+    assert run_verifier_authentication(6, "side", 2) == 1
+    # Pinned mode does not run the check.
+    assert run_verifier_authentication(6, "side", 2, mode="pinned") == 0
 
 
 def test_shard_selection_applies_the_verifier_scope() -> None:
