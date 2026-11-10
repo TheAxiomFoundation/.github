@@ -6463,6 +6463,10 @@ def _assert_rollback_rewind_preserves_unsupported_event_comparison_bases(event: 
                     "steps.rollback_rewind.outputs.effective_base": "f" * 40,
                 }
                 freeze_base = _rollback_rewind_event_expression(freeze["env"]["BASE_SHA"], context)
+                # The ratchet reads the queue base from env, never from an
+                # expression interpolated into the script.
+                group_env = _rollback_rewind_event_expression(audit["env"]["MERGE_GROUP_BASE_SHA"], context)
+                assert "github.event.merge_group" not in audit["run"]
                 ordinary_freeze = pr_base or group_base or before
                 if not ordinary_freeze or ordinary_freeze == "0" * 40:
                     ordinary_freeze = head + "^"
@@ -6489,7 +6493,9 @@ def _assert_rollback_rewind_preserves_unsupported_event_comparison_bases(event: 
                     effective = _rollback_rewind_event_expression(consumer["env"]["EFFECTIVE_BASE"], context)
                     result = subprocess.run(
                         ["bash", "-c", "set -euo pipefail\n" + source + '\nprintf %s "$' + name + '"\n'],
-                        cwd=root, env={**os.environ, "EFFECTIVE_BASE": effective}, capture_output=True, text=True,
+                        cwd=root,
+                        env={**os.environ, "EFFECTIVE_BASE": effective, "MERGE_GROUP_BASE_SHA": group_env},
+                        capture_output=True, text=True,
                     )
                     assert result.returncode == 0, (event, consumer["name"], result.stderr)
                     assert result.stdout == expected, (event, consumer["name"], result.stdout, expected)
@@ -6544,9 +6550,13 @@ def test_merge_group_comparison_bases_use_the_queue_base_or_fail_closed() -> Non
         assert "${{" not in source, source
         effective = _rollback_rewind_event_expression(audit["env"]["EFFECTIVE_BASE"], context(group_base))
         assert effective == ""
+        group_env = _rollback_rewind_event_expression(audit["env"]["MERGE_GROUP_BASE_SHA"], context(group_base))
+        assert group_env == group_base
         return subprocess.run(
             ["bash", "-c", "set -euo pipefail\n" + source + '\nprintf %s "$comparison_base"\n'],
-            cwd=root, env={**os.environ, "EFFECTIVE_BASE": effective}, capture_output=True, text=True,
+            cwd=root,
+            env={**os.environ, "EFFECTIVE_BASE": effective, "MERGE_GROUP_BASE_SHA": group_env},
+            capture_output=True, text=True,
         )
 
     with tempfile.TemporaryDirectory() as directory:
@@ -6579,6 +6589,99 @@ def test_merge_group_comparison_bases_use_the_queue_base_or_fail_closed() -> Non
             result = audit_base(root, missing)
             assert result.returncode != 0, (missing, result.stdout)
             assert "ValidationWaiverBaseMissing: merge group base must be an exact commit" in result.stderr
+
+
+def test_merge_group_ratchet_and_freeze_read_the_queue_base_tree() -> None:
+    """Run the real base materialisation: growth in an earlier queued commit stays visible."""
+    import yaml
+
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    steps = {step.get("name"): step for step in jobs["validate"]["steps"]}
+    audit = steps["Enforce validation waiver ratchet"]
+    freeze = steps["Verify immutable retired-schema freeze"]
+    # The ratchet step from its base resolver through the files it hands to
+    # the ratchet: the protected waiver ledger and the changed paths.
+    audit_source = audit["run"][audit["run"].index('if [ "${{ github.event_name }}"'):].split(
+        "# waiver-ratchet-python-start", 1
+    )[0]
+    freeze_source = freeze["run"].split('head_ref = os.environ["GITHUB_SHA"]\n', 1)[1].split(
+        "\nhead_raw = ", 1
+    )[0]
+    freeze_file = ".axiom/retired-schema-freeze.json"
+
+    def ledger(count: int) -> str:
+        return "waivers:\n" + "".join(f"  - path: us/statutes/{i}.yaml\n" for i in range(count))
+
+    with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as runner_temp:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        (root / ".axiom").mkdir()
+        (root / ".axiom/toolchain.toml").write_text("[toolchain]\n")
+        (root / freeze_file).write_text("{}\n")
+        (root / "known-validation-gaps.yaml").write_text(ledger(1))
+        (root / "README.md").write_text("base\n")
+        base = commit(root, "queue base: one waiver, sealed freeze")
+        # First queued commit adds a waiver and removes the freeze file. The
+        # second is unrelated, so HEAD~1 already holds both changes.
+        (root / "known-validation-gaps.yaml").write_text(ledger(2))
+        (root / freeze_file).unlink()
+        commit(root, "add a waiver, remove the freeze")
+        (root / "README.md").write_text("unrelated\n")
+        head = commit(root, "unrelated change")
+
+        context = {
+            "github.event_name": "merge_group",
+            "github.event.pull_request.base.sha": "",
+            "github.event.merge_group.base_sha": base,
+            "github.event.before": "",
+            "steps.rollback_rewind.outputs.effective_base": "f" * 40,
+        }
+        source = audit_source
+        for key, value in context.items():
+            source = source.replace("${{ " + key + " }}", value)
+        assert "${{" not in source, source
+        result = subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + source],
+            cwd=root,
+            env={
+                **os.environ,
+                "RUNNER_TEMP": runner_temp,
+                "GITHUB_SHA": head,
+                "BOOTSTRAP_SHA256": "",
+                "MIGRATION_AUTHORIZED": "",
+                "MIGRATION_CANDIDATE": "",
+                "EFFECTIVE_BASE": _rollback_rewind_event_expression(audit["env"]["EFFECTIVE_BASE"], context),
+                "MERGE_GROUP_BASE_SHA": _rollback_rewind_event_expression(
+                    audit["env"]["MERGE_GROUP_BASE_SHA"], context
+                ),
+            },
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        protected = (Path(runner_temp) / "protected-known-validation-gaps.yaml").read_text()
+        # One waiver at the queue base, two at the head: the growth is visible.
+        assert protected == ledger(1), protected
+        assert (root / "known-validation-gaps.yaml").read_text() == ledger(2)
+        assert git(root, "show", "HEAD~1:known-validation-gaps.yaml") == ledger(2).strip()
+        changed = (Path(runner_temp) / "waiver-changed-paths.txt").read_text().splitlines()
+        assert "known-validation-gaps.yaml" in changed and freeze_file in changed, changed
+
+        # Freeze: the resolved base still holds the sealed file that the first
+        # queued commit removed; HEAD^ does not.
+        resolved = subprocess.run(
+            [sys.executable, "-I", "-c", _FREEZE_BASE_PRELUDE + freeze_source + '\nprint(base_ref, end="")'],
+            cwd=root,
+            env={
+                **os.environ, "GITHUB_SHA": head, "EVENT_NAME": "merge_group",
+                "BASE_SHA": _rollback_rewind_event_expression(freeze["env"]["BASE_SHA"], context),
+            },
+            capture_output=True, text=True,
+        )
+        assert resolved.returncode == 0, resolved.stderr
+        assert git(root, "ls-tree", resolved.stdout, "--", freeze_file)
+        assert not git(root, "ls-tree", head + "^", "--", freeze_file)
 
 
 def test_merge_group_prechecks_scan_the_whole_group_or_fail_closed() -> None:
@@ -6658,6 +6761,28 @@ def test_merge_group_prechecks_scan_the_whole_group_or_fail_closed() -> None:
         for event in ("schedule", "workflow_dispatch"):
             assert run(unmanifested, root, "", head, event).returncode == 0
             assert run(paths, root, "", head, event).returncode == 0
+
+    # The unsupported-path check must diff the whole group. The queue base
+    # tracks a path with a control character; the first queued commit deletes
+    # it and the second is unrelated. Only the diff from the queue base names
+    # the path: it is absent from the head tree and from HEAD~1..HEAD.
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        (root / "README.md").write_text("base\n")
+        (root / "bad\x01name.txt").write_text("x\n")
+        base = commit(root, "queue base with an unsupported path")
+        (root / "bad\x01name.txt").unlink()
+        middle = commit(root, "delete the unsupported path")
+        (root / "README.md").write_text("unrelated\n")
+        head = commit(root, "unrelated change")
+        result = run(paths, root, base, head)
+        assert result.returncode != 0, result.stdout
+        assert "unsupported tracked path" in result.stderr, result.stderr
+        # Control: the last commit alone is clean, so a HEAD~1 base passes.
+        assert run(paths, root, middle, head).returncode == 0
 
 
 def test_rollback_rewind_preserves_other_unsupported_event_comparison_bases() -> None:
@@ -6931,6 +7056,7 @@ def run_rollback_rewind_tests() -> None:
         test_rollback_rewind_preserves_pull_request_target_comparison_bases,
         test_rollback_rewind_preserves_merge_group_comparison_bases,
         test_merge_group_comparison_bases_use_the_queue_base_or_fail_closed,
+        test_merge_group_ratchet_and_freeze_read_the_queue_base_tree,
         test_merge_group_prechecks_scan_the_whole_group_or_fail_closed,
         test_rollback_rewind_preserves_other_unsupported_event_comparison_bases,
         test_rollback_rewind_keeps_restored_waiver_expiry_enforced,
@@ -7020,6 +7146,8 @@ def test_generated_guard_resolves_scheduled_base_to_exact_commit() -> None:
         # Anything that is not an exact commit identity is refused up front.
         assert resolve(root, event="pull_request", pr_base="main").returncode != 0
         assert resolve(root, event="merge_group", group_base="main").returncode != 0
+        assert resolve(root, event="merge_group", group_base="0" * 40).returncode != 0
+        assert resolve(root, event="merge_group", group_base="").returncode != 0
         assert resolve(root, event="push", before="HEAD~1").returncode != 0
 
 
