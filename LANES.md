@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-10 — Merge pull request #2152 from TheAxiomFoundation/claude/untrack-reverse-index | 53 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-10 — Register Maryland's capital gains surtax source conflict (#2080) | 47 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | queued |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-08 — Merge pull request #137 from TheAxiomFoundation/nzhub/engine-89571cc2 | 0 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-11-07 — Rename Populace to Microcosm in prose and code (#139) | 3 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-05 — Point the UK CTR README at the release #538 bound (#539) | 37 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
