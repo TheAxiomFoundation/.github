@@ -6417,6 +6417,13 @@ def _rollback_rewind_event_expression(expression: str, context: dict[str, str]) 
     return eval(compile(parsed, "<workflow event expression>", "eval"), {"__builtins__": {}})
 
 
+_FREEZE_BASE_PRELUDE = (
+    "import os\nimport re\n"
+    "def fail(message):\n    raise SystemExit(f'RetiredSchemaFreezeError: {message}')\n"
+    "head_ref = os.environ['GITHUB_SHA']\n"
+)
+
+
 def _assert_rollback_rewind_preserves_unsupported_event_comparison_bases(event: str) -> None:
     """Execute all three real resolvers, preserving even legacy literal ref spellings."""
     import yaml
@@ -6444,28 +6451,34 @@ def _assert_rollback_rewind_preserves_unsupported_event_comparison_bases(event: 
         # prior base, even when it differs from every ordinary base below.
         for pr_base in ("", "1" * 40):
             for before in ("", "0" * 40, "3" * 40):
+                # A merge group names its own base; it never falls back to
+                # the push `before` SHA, to `HEAD~1` or to `HEAD^`.
+                group_base = "2" * 40 if event == "merge_group" else ""
                 context = {
                     "github.event_name": event,
                     "github.event.pull_request.base.sha": pr_base,
-                    "github.event.merge_group.base_sha": "2" * 40,
+                    # GitHub fills the merge_group payload on that event only.
+                    "github.event.merge_group.base_sha": group_base,
                     "github.event.before": before,
                     "steps.rollback_rewind.outputs.effective_base": "f" * 40,
                 }
                 freeze_base = _rollback_rewind_event_expression(freeze["env"]["BASE_SHA"], context)
-                ordinary_freeze = pr_base or before
+                ordinary_freeze = pr_base or group_base or before
                 if not ordinary_freeze or ordinary_freeze == "0" * 40:
                     ordinary_freeze = head + "^"
                 result = subprocess.run(
-                    [sys.executable, "-I", "-c", "import os\nhead_ref = os.environ['GITHUB_SHA']\n" +
+                    [sys.executable, "-I", "-c", _FREEZE_BASE_PRELUDE +
                      freeze_source + '\nprint(base_ref, end="")'],
-                    cwd=root, env={**os.environ, "GITHUB_SHA": head, "BASE_SHA": freeze_base},
+                    cwd=root,
+                    env={**os.environ, "GITHUB_SHA": head, "BASE_SHA": freeze_base, "EVENT_NAME": event},
                     capture_output=True, text=True,
                 )
                 assert result.returncode == 0, result.stderr
                 assert result.stdout == ordinary_freeze, (event, "freeze", result.stdout, ordinary_freeze)
 
                 for consumer, source, expected in (
-                    (audit, audit_source, before if before and before != "0" * 40 else "HEAD~1"),
+                    (audit, audit_source, "2" * 40 if event == "merge_group" else
+                     before if before and before != "0" * 40 else "HEAD~1"),
                     (guard, guard_base_ref_source(), "2" * 40 if event == "merge_group" else
                      before if before and before != "0" * 40 else parent),
                 ):
@@ -6488,6 +6501,163 @@ def test_rollback_rewind_preserves_pull_request_target_comparison_bases() -> Non
 
 def test_rollback_rewind_preserves_merge_group_comparison_bases() -> None:
     _assert_rollback_rewind_preserves_unsupported_event_comparison_bases("merge_group")
+
+
+def test_merge_group_comparison_bases_use_the_queue_base_or_fail_closed() -> None:
+    """A merge group compares against merge_group.base_sha, never HEAD~1 or HEAD^."""
+    import yaml
+
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    steps = {step.get("name"): step for step in jobs["validate"]["steps"]}
+    freeze = steps["Verify immutable retired-schema freeze"]
+    audit = steps["Enforce validation waiver ratchet"]
+    freeze_source = freeze["run"].split('head_ref = os.environ["GITHUB_SHA"]\n', 1)[1].split(
+        "\nhead_raw = ", 1
+    )[0]
+    audit_source = audit["run"][audit["run"].index('if [ "${{ github.event_name }}"'):].split(
+        '\nprotected_base=', 1
+    )[0]
+    assert freeze["env"]["EVENT_NAME"] == "${{ github.event_name }}"
+
+    def context(group_base: str) -> dict[str, str]:
+        return {
+            "github.event_name": "merge_group",
+            "github.event.pull_request.base.sha": "",
+            "github.event.merge_group.base_sha": group_base,
+            "github.event.before": "",
+            "steps.rollback_rewind.outputs.effective_base": "f" * 40,
+        }
+
+    def freeze_base(root: Path, head: str, group_base: str) -> subprocess.CompletedProcess:
+        value = _rollback_rewind_event_expression(freeze["env"]["BASE_SHA"], context(group_base))
+        return subprocess.run(
+            [sys.executable, "-I", "-c", _FREEZE_BASE_PRELUDE + freeze_source + '\nprint(base_ref, end="")'],
+            cwd=root,
+            env={**os.environ, "GITHUB_SHA": head, "BASE_SHA": value, "EVENT_NAME": "merge_group"},
+            capture_output=True, text=True,
+        )
+
+    def audit_base(root: Path, group_base: str) -> subprocess.CompletedProcess:
+        source = audit_source
+        for key, value in context(group_base).items():
+            source = source.replace("${{ " + key + " }}", value)
+        assert "${{" not in source, source
+        effective = _rollback_rewind_event_expression(audit["env"]["EFFECTIVE_BASE"], context(group_base))
+        assert effective == ""
+        return subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + source + '\nprintf %s "$comparison_base"\n'],
+            cwd=root, env={**os.environ, "EFFECTIVE_BASE": effective}, capture_output=True, text=True,
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        (root / "file.txt").write_text("base\n")
+        base = commit(root, "queue base")
+        # Two commits on top of the base: two queued pull requests, or one
+        # pull request the queue rebased. HEAD~1 is then NOT the queue base.
+        (root / "file.txt").write_text("one\n")
+        middle = commit(root, "first queued commit")
+        (root / "file.txt").write_text("two\n")
+        head = commit(root, "second queued commit")
+        assert middle != base
+
+        result = freeze_base(root, head, base)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == base
+        result = audit_base(root, base)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == base
+
+        # No exact base: stop. Never compare against the last commit only.
+        for missing in ("", "0" * 40, "main", "HEAD~1", base[:39]):
+            result = freeze_base(root, head, missing)
+            assert result.returncode != 0, (missing, result.stdout)
+            assert "merge group base must be an exact commit" in result.stderr, result.stderr
+            result = audit_base(root, missing)
+            assert result.returncode != 0, (missing, result.stdout)
+            assert "ValidationWaiverBaseMissing: merge group base must be an exact commit" in result.stderr
+
+
+def test_merge_group_prechecks_scan_the_whole_group_or_fail_closed() -> None:
+    """The first-job pre-checks diff a merge group from merge_group.base_sha."""
+    import yaml
+
+    steps = {
+        step.get("name"): step
+        for step in yaml.safe_load(WORKFLOW.read_text())["jobs"]["shards"]["steps"]
+    }
+    paths = steps["Reject unsupported tracked paths"]
+    unmanifested = steps["Reject unmanifested RuleSpec content"]
+    base_expression = (
+        "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha"
+        " || github.event.before || '' }}"
+    )
+    for step in (paths, unmanifested):
+        assert step["env"]["BASE_SHA"] == base_expression
+        assert step["env"]["EVENT_NAME"] == "${{ github.event_name }}"
+        assert _rollback_rewind_event_expression(base_expression, {
+            "github.event_name": "merge_group",
+            "github.event.pull_request.base.sha": "",
+            "github.event.merge_group.base_sha": "2" * 40,
+            "github.event.before": "",
+        }) == "2" * 40
+
+    def run(step: dict, root: Path, base: str, head: str, event: str = "merge_group"):
+        git(root, "checkout", "-q", "--detach", head)
+        return subprocess.run(
+            ["bash", "-c", step["run"]],
+            cwd=root,
+            env={
+                **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+                "BASE_SHA": base,
+                "GITHUB_SHA": head,
+                "GITHUB_REPOSITORY": "TheAxiomFoundation/rulespec-us",
+                "EVENT_NAME": event,
+                "RUN_GENERATED_GUARD": "true",
+                "GUARD_PROGRAMS_ROOT": "false",
+            },
+            capture_output=True,
+            text=True,
+        )
+
+    module = "statutes/7/2014/a.yaml"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "workflow-test@example.com")
+        git(root, "config", "user.name", "Workflow Test")
+        (root / "README.md").write_text("base\n")
+        base = commit(root, "queue base")
+        # First queued commit hand-writes a module; the second is unrelated,
+        # so a HEAD~1 comparison would not see the module at all.
+        (root / module).parent.mkdir(parents=True)
+        (root / module).write_text("format: rulespec/v1\nrules: []\n")
+        commit(root, "hand-written module")
+        (root / "README.md").write_text("unrelated\n")
+        head = commit(root, "unrelated change")
+
+        result = run(unmanifested, root, base, head)
+        assert result.returncode != 0, result.stdout
+        assert module in result.stdout + result.stderr, result.stdout + result.stderr
+        # The same head with nothing queued on the base is clean.
+        result = run(unmanifested, root, head, head)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert run(paths, root, base, head).returncode == 0
+
+        for missing in ("", "0" * 40, "main"):
+            result = run(unmanifested, root, missing, head)
+            assert result.returncode != 0, missing
+            assert "UnmanifestedRuleSpecBaseMissing: merge group base must be an exact commit" in result.stderr
+            result = run(paths, root, missing, head)
+            assert result.returncode != 0, missing
+            assert "UnsupportedTrackedPathBaseMissing: merge group base must be an exact commit" in result.stderr
+        # Events with no change set keep their documented behaviour.
+        for event in ("schedule", "workflow_dispatch"):
+            assert run(unmanifested, root, "", head, event).returncode == 0
+            assert run(paths, root, "", head, event).returncode == 0
 
 
 def test_rollback_rewind_preserves_other_unsupported_event_comparison_bases() -> None:
@@ -6645,7 +6815,7 @@ def test_rollback_rewind_static_trust_and_comparison_wiring() -> None:
     steps = {step.get("name"): step for step in jobs["validate"]["steps"]}
     freeze = steps["Verify immutable retired-schema freeze"]
     supported = "(github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')"
-    assert freeze["env"]["BASE_SHA"] == "${{ " + supported + " && steps.rollback_rewind.outputs.effective_base || (github.event.pull_request.base.sha || github.event.before) }}"
+    assert freeze["env"]["BASE_SHA"] == "${{ " + supported + " && steps.rollback_rewind.outputs.effective_base || (github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before) }}"
     audit = steps["Enforce validation waiver ratchet"]
     assert audit["env"]["EFFECTIVE_BASE"] == "${{ " + supported + " && steps.rollback_rewind.outputs.effective_base || '' }}"
     assert 'comparison_base="$EFFECTIVE_BASE"' in audit["run"]
@@ -6760,6 +6930,8 @@ def run_rollback_rewind_tests() -> None:
         test_rollback_rewind_waiver_comparison_requires_exact_lowercase_commit,
         test_rollback_rewind_preserves_pull_request_target_comparison_bases,
         test_rollback_rewind_preserves_merge_group_comparison_bases,
+        test_merge_group_comparison_bases_use_the_queue_base_or_fail_closed,
+        test_merge_group_prechecks_scan_the_whole_group_or_fail_closed,
         test_rollback_rewind_preserves_other_unsupported_event_comparison_bases,
         test_rollback_rewind_keeps_restored_waiver_expiry_enforced,
         test_rollback_rewind_static_trust_and_comparison_wiring,
