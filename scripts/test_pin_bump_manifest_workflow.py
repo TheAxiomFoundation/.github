@@ -58,7 +58,7 @@ def heredoc(source, label):
 def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
               inherited=False, scenario="manifest", base_pin="a" * 40,
               integrity_fail_after=0, event="pull_request", base_ancestry=0, head_ancestry=0,
-              base_bug_ancestry=0,
+              base_bug_ancestry=0, pin_direction=0,
               audit_results=None, bridge_predicate_status=0):
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     shell = next(step["run"] for step in steps if step.get("name") == "Reject manual RuleSpec changes")
@@ -133,6 +133,10 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
                 assert args[0] == '-C', args
                 is_base = args[1] == os.environ['BASE_DEPENDENCY_ROOT'] + '/axiom-encode'
                 expected = os.environ['BASE_ENCODER_REF' if is_base else 'HEAD_ENCODER_REF']
+                if not is_base and args[2:] == ['merge-base', '--is-ancestor',
+                                                os.environ['BASE_ENCODER_REF'], expected]:
+                    # The producer-carry gate asks whether the pin moves forward.
+                    sys.exit(int(os.environ['PIN_DIRECTION']))
                 # Only the base checks for the #1859 commit; both sides check #1883.
                 commits = [os.environ['PRE1883_FIX']] + ([os.environ['PRE1883_BUG']] if is_base else [])
                 assert args[2:4] == ['merge-base', '--is-ancestor'] and args[4] in commits, args
@@ -277,7 +281,8 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
             "BASE_ENCODER": base_pin, "BASE_ENCODER_REF": base_pin, "HEAD_ENCODER_REF": PROPOSED,
             "PRE1883_FIX": PRE1883_FIX, "BASE_ANCESTRY": str(base_ancestry),
             "PRE1883_BUG": PRE1883_BUG, "BASE_BUG_ANCESTRY": str(base_bug_ancestry),
-            "HEAD_ANCESTRY": str(head_ancestry), "AUDIT_RESULTS": json.dumps(audit_results),
+            "HEAD_ANCESTRY": str(head_ancestry), "PIN_DIRECTION": str(pin_direction),
+            "AUDIT_RESULTS": json.dumps(audit_results),
             "BRIDGE_PREDICATE_STATUS": str(bridge_predicate_status),
             "INTEGRITY_FAIL_AFTER": str(integrity_fail_after),
         }, capture_output=True, text=True, timeout=120)
@@ -760,6 +765,9 @@ class ProducerRefusalCarryTests(unittest.TestCase):
     FIELD = " validation_execution.axiom_encode"
     EXACT = " does not match the running pinned encoder"
     ANCESTRY = EXACT + ": the pinned encoder commit is not an ancestor of the producer"
+    GIT_ONLY_CONTRACTS = ("reviewed candidate promotion", "exact dependent migration",
+                          "retained successor migration", "legacy replacement",
+                          "path migration", "retirement")
 
     def setUp(self):
         shell = step_source("Reject manual RuleSpec changes")
@@ -775,22 +783,43 @@ class ProducerRefusalCarryTests(unittest.TestCase):
         return json.dumps({"schema_version": "fixture", "axiom_encode_git": {"commit": producer},
                            "validation_execution": {"axiom_encode": {"commit": execution}}}).encode()
 
+    def git_only_manifest(self, producer=None, dirty=False):
+        producer = self.BASE_PIN if producer is None else producer
+        return json.dumps({"schema_version": "fixture", "tool": "fixture",
+                           "axiom_encode_git": {"commit": producer, "dirty_tracked": dirty}}).encode()
+
     def write(self, root, data, path=None):
         target = root / (self.PATH if path is None else path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         return target
 
-    def ratchet(self, base, head, *, base_pin=None):
+    def write_both(self, data, path=None):
+        for root in (self.base_root, self.head_root):
+            self.write(root, data, path)
+
+    def reset_trees(self):
+        for root in (self.base_root, self.head_root):
+            if root.exists() or root.is_symlink():
+                subprocess.run(["rm", "-rf", str(root)], check=True)
+
+    def ratchet(self, base, head, *, base_pin=None, older_wording=True, base_pin_produced=True,
+                summary=None):
         base_pin = self.BASE_PIN if base_pin is None else base_pin
         before, after = self.root / "base.json", self.root / "head.json"
         before.write_text(json.dumps({"passed": not base, "issues": base}))
         after.write_text(json.dumps({"passed": not head, "issues": head}))
         args = ["ratchet", str(before), str(int(bool(base))), str(after), str(int(bool(head))),
                 str(self.base_root), str(self.head_root), str(self.root / "base-deps"), str(self.root / "head-deps")]
-        env = {k: v for k, v in os.environ.items() if k != "BASE_ENCODER_REF"}
+        drop = {"BASE_ENCODER_REF", "PRODUCER_CARRY_OLDER_WORDING", "PRODUCER_CARRY_BASE_PIN",
+                "GITHUB_STEP_SUMMARY"}
+        env = {k: v for k, v in os.environ.items() if k not in drop}
         if base_pin is not False:
             env["BASE_ENCODER_REF"] = base_pin
+        env["PRODUCER_CARRY_OLDER_WORDING"] = "true" if older_wording else "false"
+        env["PRODUCER_CARRY_BASE_PIN"] = "true" if base_pin_produced else "false"
+        if summary is not None:
+            env["GITHUB_STEP_SUMMARY"] = str(summary)
         stdout, stderr = io.StringIO(), io.StringIO()
         status = 0
         with mock.patch.object(sys, "argv", args), mock.patch.dict(os.environ, env, clear=True), \
@@ -801,12 +830,27 @@ class ProducerRefusalCarryTests(unittest.TestCase):
                 status = exc.code
         return status, stdout.getvalue(), stderr.getvalue()
 
-    def refusal(self, path=None):
-        return (self.PATH if path is None else path) + self.FIELD + self.ANCESTRY
+    def refusal(self, path=None, field=None):
+        return (self.PATH if path is None else path) + (self.FIELD if field is None else field) + self.ANCESTRY
+
+    def older(self, path=None, field=None):
+        return (self.PATH if path is None else path) + (self.FIELD if field is None else field) + self.EXACT
+
+    def carry_block(self):
+        source = marked_source(heredoc(step_source("Reject manual RuleSpec changes"), "PYRATCHET"),
+                               "producer-refusal-carry")
+        namespace = {"json": json, "os": os, "Path": Path, "re": __import__("re")}
+        exec(compile(textwrap.dedent(source), "producer-refusal-carry", "exec"), namespace)
+        return namespace
+
+    def assert_new(self, result, label=""):
+        status, stdout, stderr = result
+        self.assertEqual(status, 1, label + stdout + stderr)
+        self.assertNotIn("Producer refusals carried", stdout, label)
+        self.assertNotIn("Traceback", stderr, label)
 
     def test_manifest_the_base_pin_produced_carries_when_unchanged(self):
-        for root in (self.base_root, self.head_root):
-            self.write(root, self.manifest())
+        self.write_both(self.manifest())
         status, stdout, stderr = self.ratchet([], [self.refusal()])
         self.assertEqual(status, 0, stdout + stderr)
         self.assertIn("Producer refusals carried from the base pin: 1 (information)", stdout)
@@ -814,85 +858,148 @@ class ProducerRefusalCarryTests(unittest.TestCase):
         self.assertIn("Manifest audit ratchet passed: no new issues.", stdout)
 
     def test_older_wording_carries_when_unchanged(self):
-        older = self.manifest(producer="f" * 40)
-        for root in (self.base_root, self.head_root):
-            self.write(root, older)
-        status, stdout, stderr = self.ratchet([self.PATH + self.FIELD + self.EXACT], [self.refusal()])
+        self.write_both(self.manifest(producer="f" * 40))
+        status, stdout, stderr = self.ratchet([self.older()], [self.refusal()])
         self.assertEqual(status, 0, stdout + stderr)
         self.assertIn("the base refused it in the older wording", stdout)
 
+    def test_git_only_contracts_carry_from_axiom_encode_git(self):
+        for contract in self.GIT_ONLY_CONTRACTS:
+            field = " " + contract
+            with self.subTest(contract=contract, path="base pin"):
+                self.reset_trees()
+                self.write_both(self.git_only_manifest())
+                status, stdout, stderr = self.ratchet([], [self.refusal(field=field)])
+                self.assertEqual(status, 0, contract + stdout + stderr)
+                self.assertIn("the base pin produced it", stdout)
+            with self.subTest(contract=contract, path="older wording"):
+                self.reset_trees()
+                self.write_both(self.git_only_manifest(producer="f" * 40))
+                status, stdout, stderr = self.ratchet([self.older(field=field)], [self.refusal(field=field)])
+                self.assertEqual(status, 0, contract + stdout + stderr)
+                self.assertIn("the base refused it in the older wording", stdout)
+            for label, data in (("dirty producer", self.git_only_manifest(dirty=True)),
+                                ("dirty flag missing", json.dumps({"axiom_encode_git": {"commit": self.BASE_PIN}}).encode()),
+                                ("newer producer", self.git_only_manifest(producer="f" * 40))):
+                with self.subTest(contract=contract, label=label):
+                    self.reset_trees()
+                    self.write_both(data)
+                    self.assert_new(self.ratchet([], [self.refusal(field=field)]), label)
+
+    def test_gate_flags_switch_each_path(self):
+        self.write_both(self.manifest())
+        self.assert_new(self.ratchet([], [self.refusal()], base_pin_produced=False), "base pin path off")
+        status, stdout, _ = self.ratchet([], [self.refusal()], older_wording=False)
+        self.assertEqual(status, 0, stdout)
+        self.reset_trees()
+        self.write_both(self.manifest(producer="f" * 40))
+        self.assert_new(self.ratchet([self.older()], [self.refusal()], older_wording=False), "older path off")
+        status, stdout, _ = self.ratchet([self.older()], [self.refusal()], base_pin_produced=False)
+        self.assertEqual(status, 0, stdout)
+
     def test_refusals_without_the_base_pin_evidence_stay_new(self):
+        nested = b'{"axiom_encode_git": ' + b"[" * 100000 + b"]" * 100000 + b"}"
+        duplicate = ('{"axiom_encode_git": {"commit": "%s"}, "axiom_encode_git": {"commit": "%s"}, '
+                     '"validation_execution": {"axiom_encode": {"commit": "%s"}}}'
+                     % ("f" * 40, self.BASE_PIN, self.BASE_PIN)).encode()
         cases = {
             "producer newer than the base pin": (self.manifest(producer="f" * 40), None, []),
             "fields disagree": (self.manifest(execution="f" * 40), None, []),
             "producer block missing": (json.dumps({"validation_execution": {"axiom_encode": {"commit": self.BASE_PIN}}}).encode(), None, []),
             "not JSON": (b"not json", None, []),
+            "JSON list": (b"[]", None, []),
+            "deeply nested JSON": (nested, None, []),
+            "duplicate keys": (duplicate, None, []),
             "no base pin": (self.manifest(), False, []),
             "malformed base pin": (self.manifest(), self.BASE_PIN[:39], []),
+            "upper-case base pin": (self.manifest(producer="C" * 40), "C" * 40, []),
+            "base pin with a newline": (self.manifest(producer=self.BASE_PIN + "\n"), self.BASE_PIN + "\n", []),
             "empty base pin and producer": (self.manifest(producer=""), "", []),
             "short base pin and producer": (self.manifest(producer="c" * 39), "c" * 39, []),
             "older wording for a different field": (self.manifest(producer="f" * 40), None,
-                                                    [self.PATH + " retirement" + self.EXACT]),
+                                                    [self.older(field=" retirement")]),
+            "older wording for a different manifest": (self.manifest(producer="f" * 40), None,
+                                                       [self.older(path=self.PATH.replace("act-2018-2", "act-2018-3"))]),
         }
         for label, (data, base_pin, base_issues) in cases.items():
             with self.subTest(label):
-                for root in (self.base_root, self.head_root):
-                    self.write(root, data)
-                status, stdout, stderr = self.ratchet(base_issues, [self.refusal()], base_pin=base_pin)
-                self.assertEqual(status, 1, label + stdout)
-                self.assertIn("New manifest audit issues: 1", stderr)
-                self.assertNotIn("Producer refusals carried", stdout)
+                self.write_both(data)
+                result = self.ratchet(base_issues, [self.refusal()], base_pin=base_pin)
+                self.assert_new(result, label)
+                self.assertIn("New manifest audit issues: 1", result[2])
 
-    def test_changed_missing_or_linked_manifests_stay_new(self):
-        produced = self.manifest()
-        for label in ("changed", "missing at base", "missing at head", "symlink at head", "symlinked directory"):
-            with self.subTest(label):
-                for root in (self.base_root, self.head_root):
-                    if root.exists():
-                        subprocess.run(["rm", "-rf", str(root)], check=True)
-                if label != "missing at base":
-                    self.write(self.base_root, produced)
-                if label == "changed":
-                    self.write(self.head_root, produced + b"\n")
-                elif label == "symlink at head":
-                    target = self.write(self.root / "elsewhere", produced)
-                    link = self.head_root / self.PATH
-                    link.parent.mkdir(parents=True, exist_ok=True)
-                    link.symlink_to(target)
-                elif label == "symlinked directory":
-                    real = self.root / "real-manifests"
-                    self.write(real, produced, path=self.PATH.split("/", 2)[2])
-                    (self.head_root / ".axiom").mkdir(parents=True, exist_ok=True)
-                    (self.head_root / ".axiom/encoding-manifests").symlink_to(real)
-                elif label != "missing at head":
-                    self.write(self.head_root, produced)
-                status, stdout, stderr = self.ratchet([], [self.refusal()])
-                self.assertEqual(status, 1, label + stdout)
-                self.assertNotIn("Producer refusals carried", stdout)
+    def test_changed_missing_or_linked_manifests_stay_new_on_both_paths(self):
+        for path_name, data, base_issues in (("base pin", self.manifest(), []),
+                                             ("older wording", self.manifest(producer="f" * 40), [self.older()])):
+            for label in ("changed", "missing at base", "missing at head", "symlink at head",
+                          "symlink at base", "symlinked directory"):
+                with self.subTest(path=path_name, label=label):
+                    self.reset_trees()
+                    if label not in ("missing at base", "symlink at base"):
+                        self.write(self.base_root, data)
+                    if label == "changed":
+                        self.write(self.head_root, data + b"\n")
+                    elif label in ("symlink at head", "symlink at base"):
+                        target = self.write(self.root / ("elsewhere-" + label.split()[-1]), data)
+                        link = (self.head_root if label.endswith("head") else self.base_root) / self.PATH
+                        link.parent.mkdir(parents=True, exist_ok=True)
+                        link.symlink_to(target)
+                        if label.endswith("base"):
+                            self.write(self.head_root, data)
+                    elif label == "symlinked directory":
+                        real = self.root / "real-manifests"
+                        self.write(real, data, path=self.PATH.split("/", 2)[2])
+                        (self.head_root / ".axiom").mkdir(parents=True, exist_ok=True)
+                        (self.head_root / ".axiom/encoding-manifests").symlink_to(real)
+                    elif label != "missing at head":
+                        self.write(self.head_root, data)
+                    self.assert_new(self.ratchet(base_issues, [self.refusal()]), path_name + " " + label)
 
     def test_only_exact_producer_refusals_under_the_manifest_tree_carry(self):
         produced = self.manifest()
-        for root in (self.base_root, self.head_root):
-            self.write(root, produced)
-            self.write(root, produced, path="zm/statutes/act.json")
+        self.write_both(produced)
+        self.write_both(produced, path="zm/statutes/act.json")
+        # A traversal that resolves to the real manifest must not carry.
+        self.write_both(produced, path="escape/" + self.PATH)
+        self.write_both(produced, path=".axiom/encoding-manifests/zm/statutes/act.yaml")
         for issue in (
             self.refusal() + " ",
             self.refusal() + "; also stale",
             self.PATH + self.FIELD + self.EXACT + ": producer identity is malformed",
             self.PATH + self.FIELD + self.EXACT,
             self.PATH + self.ANCESTRY,
+            self.PATH + " source_attestation" + self.ANCESTRY,
+            self.PATH + " has invalid fields; validation_execution.axiom_encode" + self.ANCESTRY,
             "zm/statutes/act.json" + self.FIELD + self.ANCESTRY,
+            ".axiom/encoding-manifests/zm/statutes/act.yaml" + self.FIELD + self.ANCESTRY,
             ".axiom/encoding-manifests/../" + self.PATH + self.FIELD + self.ANCESTRY,
+            ".axiom/encoding-manifests/../../" + self.PATH + self.FIELD + self.ANCESTRY,
+            ".axiom/encoding-manifests/../../escape/" + self.PATH + self.FIELD + self.ANCESTRY,
             self.PATH + " has invalid source_attestation: bad root",
+            str(self.head_root) + "/" + self.PATH + self.FIELD + self.ANCESTRY,
         ):
             with self.subTest(issue=issue):
-                status, stdout, stderr = self.ratchet([], [issue])
-                self.assertEqual(status, 1, issue + stdout)
-                self.assertNotIn("Producer refusals carried", stdout)
+                self.assert_new(self.ratchet([], [issue]), issue)
+
+    def test_carry_functions_refuse_unsafe_paths_and_keys(self):
+        carry = self.carry_block()
+        self.write_both(self.manifest())
+        for relative in ("", ".axiom//encoding-manifests/x.json", "./" + self.PATH, self.PATH + "/.",
+                         ".axiom/encoding-manifests/../" + self.PATH.split("/", 1)[1],
+                         "../" + self.head_root.name + "/" + self.PATH):
+            with self.subTest(relative=relative):
+                self.assertIsNone(carry["manifest_bytes"](self.head_root, relative))
+        self.assertEqual(carry["manifest_bytes"](self.head_root, self.PATH), self.manifest())
+        literal = ("literal", self.refusal())
+        args = (set(), self.base_root, self.head_root, self.BASE_PIN, True, True)
+        self.assertEqual(carry["carried_refusal"]((literal,), *args), "the base pin produced it")
+        for key in ((literal, literal), (("repository", self.refusal()),), (literal, ("literal", "x")), ()):
+            with self.subTest(key=key):
+                self.assertIsNone(carry["carried_refusal"](key, *args))
+        self.assertEqual(set(carry["CONTRACTS"]), {"validation_execution.axiom_encode", *self.GIT_ONLY_CONTRACTS})
 
     def test_other_head_issues_for_a_carried_manifest_still_fail(self):
-        for root in (self.base_root, self.head_root):
-            self.write(root, self.manifest())
+        self.write_both(self.manifest())
         other = self.PATH + " source_attestation cannot be resolved from the signed local corpus release"
         status, stdout, stderr = self.ratchet([], [self.refusal(), other])
         self.assertEqual(status, 1)
@@ -900,13 +1007,91 @@ class ProducerRefusalCarryTests(unittest.TestCase):
         self.assertIn("New manifest audit issues: 1", stderr)
         self.assertIn("source_attestation", stderr)
 
+    def test_carried_refusals_reach_the_step_summary(self):
+        self.write_both(self.manifest())
+        summary = self.root / "summary.md"
+        status, stdout, stderr = self.ratchet([], [self.refusal()], summary=summary)
+        self.assertEqual(status, 0, stdout + stderr)
+        text = summary.read_text()
+        self.assertIn("### Producer refusals carried from the base pin: 1", text)
+        self.assertIn(self.refusal() + " (the base pin produced it)", text)
+        status, stdout, _ = self.ratchet([], [self.refusal()], summary=self.root / "missing-dir" / "summary.md")
+        self.assertEqual(status, 0, stdout)
+        self.assertIn("::warning::Could not write the carried refusals", stdout)
+
     def test_carry_code_sits_in_the_ratchet_once(self):
         shell = step_source("Reject manual RuleSpec changes")
         self.assertIn("producer-refusal-carry-start", heredoc(shell, "PYRATCHET"))
         for step in workflow_steps():
             if step.get("name") != "Reject manual RuleSpec changes":
                 self.assertNotIn("producer-refusal-carry-start", step.get("run", ""))
-        self.assertEqual(step_source("Reject manual RuleSpec changes").count("producer-refusal-carry-start"), 1)
+                self.assertNotIn("producer-carry-gate-start", step.get("run", ""))
+        self.assertEqual(shell.count("producer-refusal-carry-start"), 1)
+        self.assertEqual(shell.count("producer-carry-gate-start"), 1)
+        self.assertLess(shell.index("producer-carry-gate-end"), shell.index("<<'PYRATCHET'"))
+
+
+class ProducerCarryGateTests(unittest.TestCase):
+    """The shell gate enables each carry path from real Git ancestry."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="encoder-guard-carry-gate-", dir=TEMP_PARENT)
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        repo = self.root / "deps" / "axiom-encode"
+        repo.mkdir(parents=True)
+        env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(self.root),
+               "PATH": os.environ.get("PATH", ""), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        self.env = env
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                                  text=True, env=env).stdout.strip()
+
+        git("init", "-q", "-b", "main")
+        commits = {}
+        for name in ("old", "fix1859", "new", "newer"):
+            git("commit", "-q", "--allow-empty", "-m", name)
+            commits[name] = git("rev-parse", "HEAD")
+        git("checkout", "-q", "-b", "side", commits["old"])
+        git("commit", "-q", "--allow-empty", "-m", "side")
+        commits["side"] = git("rev-parse", "HEAD")
+        self.commits = commits
+        source = marked_source(step_source("Reject manual RuleSpec changes"), "producer-carry-gate")
+        self.assertEqual(source.count("630aa73931e5aa87c51d25fe448e38dbcfaed50f"), 1)
+        self.gate = textwrap.dedent(source).replace("630aa73931e5aa87c51d25fe448e38dbcfaed50f", commits["fix1859"])
+
+    def run_gate(self, base, head):
+        script = ("set -euo pipefail\n" + self.gate +
+                  'printf "%s %s\\n" "$PRODUCER_CARRY_OLDER_WORDING" "$PRODUCER_CARRY_BASE_PIN"\n')
+        deps = str(self.root / "deps")
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, env={
+            **self.env, "BASE_DEPENDENCY_ROOT": deps, "AXIOM_DEPENDENCY_ROOT": deps,
+            "BASE_ENCODER_REF": base, "HEAD_ENCODER_REF": head})
+
+    def test_paths_follow_pin_direction_and_base_ancestry(self):
+        c = self.commits
+        for label, base, head, expected in (
+            ("forward from a pre-#1859 base", c["old"], c["new"], "true true"),
+            ("forward from the #1859 commit", c["fix1859"], c["new"], "true false"),
+            ("forward from a later base", c["new"], c["newer"], "true false"),
+            ("backward", c["newer"], c["old"], "false false"),
+            ("unchanged pin", c["new"], c["new"], "false false"),
+            ("sideways from a pre-#1859 base", c["side"], c["new"], "false false"),
+        ):
+            with self.subTest(label):
+                result = self.run_gate(base, head)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected, label)
+
+    def test_unknown_commits_fail_the_step(self):
+        result = self.run_gate("f" * 40, self.commits["new"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ManifestAuditError: encoder pin direction check failed (status 128)", result.stderr)
+        result = self.run_gate(self.commits["old"], "f" * 40)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("encoder pin direction check failed", result.stderr)
 
 
 def audit_report(issues, *, status=None):
