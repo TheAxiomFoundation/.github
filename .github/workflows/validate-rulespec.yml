@@ -5126,9 +5126,9 @@ jobs:
               0) ;;
               1)
                 base_takes_retired_root=false
-                echo "Base encoder $BASE_ENCODER_REF predates axiom-encode #1233; its runtime gets no retired corpus release root."
+                echo "::notice::Base encoder $BASE_ENCODER_REF predates axiom-encode #1233; its runtime gets no retired corpus release root."
                 ;;
-              *) echo "ManifestAuditError: base encoder ancestry check failed (status $base_contains_1233)" >&2; exit 1 ;;
+              *) echo "ManifestAuditError: base encoder #1233 ancestry check failed (status $base_contains_1233)" >&2; exit 1 ;;
             esac
           fi
           # retired-root-base-gate-end

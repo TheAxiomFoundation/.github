@@ -8047,6 +8047,16 @@ def retired_root_gate(run: str) -> str | None:
     return text.split(start, 1)[1].split(end, 1)[0]
 
 
+def retired_root_gate_through_array(run: str) -> str:
+    """The workflow's lines from the gate's start marker through the fi that
+    closes the retired-root array, so nothing between them escapes the probe."""
+    lines = [line.strip() for line in run.splitlines()]
+    start = lines.index(f"# {BASE_RETIRED_ROOT_GATE}-start")
+    array = next(i for i in range(start, len(lines)) if lines[i] == "retired_root_args=()")
+    end = next(i for i in range(array, len(lines)) if lines[i] == "fi")
+    return "\n".join(lines[start : end + 1]) + "\n"
+
+
 def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
     import yaml
 
@@ -8125,10 +8135,11 @@ def test_base_audit_passes_retired_root_only_to_encoders_that_take_it() -> None:
         newer = git(encoder, "rev-parse", "HEAD")
         # The fixture repository cannot hold the real commit, so the gate tests
         # its own copy, pointed at the fixture's commit that adds the flag.
-        fixture_gate = gate.replace(RETIRED_ROOT_PROVISIONER_COMMIT, flag_commit)
+        span = retired_root_gate_through_array(run)
+        assert span.count(RETIRED_ROOT_PROVISIONER_COMMIT) == 1
+        fixture_span = span.replace(RETIRED_ROOT_PROVISIONER_COMMIT, flag_commit)
         probe = (
-            fixture_gate
-            + retired_root_block(run)
+            fixture_span
             + '\nshow() { echo "n=$#"; for arg in "$@"; do printf "<%s>\\n" "$arg"; done; }'
             + '\nshow ${retired_root_args[@]+"${retired_root_args[@]}"}'
         )
@@ -8138,12 +8149,12 @@ def test_base_audit_passes_retired_root_only_to_encoders_that_take_it() -> None:
             (newer, RETIRED, 0, passed, ""),
             (flag_commit, RETIRED, 0, passed, ""),
             (older, RETIRED, 0,
-             f"Base encoder {older} predates axiom-encode #1233; its runtime gets no retired corpus release root.\nn=0\n", ""),
+             f"::notice::Base encoder {older} predates axiom-encode #1233; its runtime gets no retired corpus release root.\nn=0\n", ""),
             # No retired root: the gate runs no Git command at all.
             ("not-a-commit", None, 0, "n=0\n", ""),
             ("not-a-commit", "", 0, "n=0\n", ""),
             # A ref Git cannot resolve stops the audit instead of guessing.
-            ("f" * 40, RETIRED, 1, "", "ManifestAuditError: base encoder ancestry check failed (status 128)"),
+            ("f" * 40, RETIRED, 1, "", "ManifestAuditError: base encoder #1233 ancestry check failed (status 128)"),
         )
         for ref, value, status, stdout, stderr in cases:
             env = {k: v for k, v in os.environ.items() if k != "TRUST_RETIRED_CORPUS_RELEASE_ROOT"}
