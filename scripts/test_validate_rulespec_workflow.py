@@ -8032,6 +8032,31 @@ def retired_root_block(run: str) -> str:
     return "\n".join(line.strip() for line in lines[start : end + 1])
 
 
+BASE_RETIRED_ROOT_GATE = "retired-root-base-gate"
+# axiom-encode #1233, which added --retired-corpus-release-root to the provisioner.
+RETIRED_ROOT_PROVISIONER_COMMIT = "b9d376684cfb5e86202daa3451b8fc716703ed19"
+
+
+def retired_root_gate(run: str) -> str | None:
+    start, end = f"# {BASE_RETIRED_ROOT_GATE}-start\n", f"# {BASE_RETIRED_ROOT_GATE}-end\n"
+    lines = [line.strip() + "\n" for line in run.splitlines()]
+    text = "".join(lines)
+    if text.count(start) == 0 and text.count(end) == 0:
+        return None
+    assert (text.count(start), text.count(end)) == (1, 1), BASE_RETIRED_ROOT_GATE
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def retired_root_gate_through_array(run: str) -> str:
+    """The workflow's lines from the gate's start marker through the fi that
+    closes the retired-root array, so nothing between them escapes the probe."""
+    lines = [line.strip() for line in run.splitlines()]
+    start = lines.index(f"# {BASE_RETIRED_ROOT_GATE}-start")
+    array = next(i for i in range(start, len(lines)) if lines[i] == "retired_root_args=()")
+    end = next(i for i in range(array, len(lines)) if lines[i] == "fi")
+    return "\n".join(lines[start : end + 1]) + "\n"
+
+
 def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
     import yaml
 
@@ -8044,6 +8069,18 @@ def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
         assert "retired_root_args=(--retired-corpus-release-root" in run, name
         assert '${retired_root_args[@]+"${retired_root_args[@]}"}' in run, name
         block = retired_root_block(run)
+        gate = retired_root_gate(run)
+        # Only the base audit provisions a runtime from an encoder other than
+        # the pin, so only it checks that the encoder takes the flag. Here the
+        # gate is bypassed as if the base encoder contains #1233;
+        # test_base_audit_passes_retired_root_only_to_encoders_that_take_it
+        # runs the gate itself.
+        if name == "Prepare protected-base manifest audit":
+            assert gate is not None, name
+            assert '[ "$base_takes_retired_root" = true ]' in block, name
+            block = "base_takes_retired_root=true\n" + block
+        else:
+            assert gate is None, name
         # Expand the array exactly as the workflow passes it to the provisioner, then
         # report the argument count and each argument, so an empty argument cannot
         # pass for no argument.
@@ -8069,6 +8106,73 @@ def test_retired_corpus_release_root_is_passed_only_when_set() -> None:
             assert result.returncode == 0, (name, value, result.stderr)
             assert result.stdout == expected, (name, value, result.stdout)
     print("optional retired corpus release root: ok")
+
+
+def test_base_audit_passes_retired_root_only_to_encoders_that_take_it() -> None:
+    import yaml
+
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
+    run = next(step["run"] for step in steps if step.get("name") == "Prepare protected-base manifest audit")
+    gate = retired_root_gate(run)
+    assert gate is not None
+    assert gate.count(RETIRED_ROOT_PROVISIONER_COMMIT) == 1
+    # The gate must run before the array it controls, and the array before the
+    # provisioner call that expands it.
+    assert run.index(f"# {BASE_RETIRED_ROOT_GATE}-end") < run.index("retired_root_args=()")
+    assert run.index("retired_root_args=()") < run.index("# base-runtime-provision-start")
+    with tempfile.TemporaryDirectory(prefix="retired-root-base-gate-") as directory:
+        root = Path(directory)
+        encoder = root / "dependencies with spaces" / "axiom-encode"
+        encoder.mkdir(parents=True)
+        git(encoder, "init", "-q", "-b", "main")
+        git(encoder, "config", "user.name", "Workflow Test")
+        git(encoder, "config", "user.email", "workflow-test@example.com")
+        git(encoder, "commit", "-q", "--allow-empty", "-m", "older encoder")
+        older = git(encoder, "rev-parse", "HEAD")
+        git(encoder, "commit", "-q", "--allow-empty", "-m", "add the retired root flag")
+        flag_commit = git(encoder, "rev-parse", "HEAD")
+        git(encoder, "commit", "-q", "--allow-empty", "-m", "newer encoder")
+        newer = git(encoder, "rev-parse", "HEAD")
+        # The fixture repository cannot hold the real commit, so the gate tests
+        # its own copy, pointed at the fixture's commit that adds the flag.
+        span = retired_root_gate_through_array(run)
+        assert span.count(RETIRED_ROOT_PROVISIONER_COMMIT) == 1
+        fixture_span = span.replace(RETIRED_ROOT_PROVISIONER_COMMIT, flag_commit)
+        probe = (
+            fixture_span
+            + '\nshow() { echo "n=$#"; for arg in "$@"; do printf "<%s>\\n" "$arg"; done; }'
+            + '\nshow ${retired_root_args[@]+"${retired_root_args[@]}"}'
+        )
+        passed = f"n=2\n<--retired-corpus-release-root>\n<{RETIRED}>\n"
+        cases = (
+            # (base encoder ref, retired root, exit status, stdout, stderr fragment)
+            (newer, RETIRED, 0, passed, ""),
+            (flag_commit, RETIRED, 0, passed, ""),
+            (older, RETIRED, 0,
+             f"::notice::Base encoder {older} predates axiom-encode #1233; its runtime gets no retired corpus release root.\nn=0\n", ""),
+            # No retired root: the gate runs no Git command at all.
+            ("not-a-commit", None, 0, "n=0\n", ""),
+            ("not-a-commit", "", 0, "n=0\n", ""),
+            # A ref Git cannot resolve stops the audit instead of guessing.
+            ("f" * 40, RETIRED, 1, "", "ManifestAuditError: base encoder #1233 ancestry check failed (status 128)"),
+        )
+        for ref, value, status, stdout, stderr in cases:
+            env = {k: v for k, v in os.environ.items() if k != "TRUST_RETIRED_CORPUS_RELEASE_ROOT"}
+            env.update({
+                "BASE_DEPENDENCY_ROOT": str(encoder.parent), "BASE_ENCODER_REF": ref,
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            })
+            if value is not None:
+                env["TRUST_RETIRED_CORPUS_RELEASE_ROOT"] = value
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", probe],
+                env=env, capture_output=True, text=True, timeout=30, check=False,
+            )
+            label = (ref, value)
+            assert result.returncode == status, (label, result.stdout, result.stderr)
+            assert result.stdout == stdout, (label, result.stdout)
+            assert stderr in result.stderr, (label, result.stderr)
+    print("base audit retired root gate: ok")
 
 
 # GitHub turns each workflow string that contains a ${{ }} expression into one
@@ -8140,6 +8244,7 @@ def main() -> None:
         return
     test_workflow_expression_templates_fit_github_limit()
     test_retired_corpus_release_root_is_passed_only_when_set()
+    test_base_audit_passes_retired_root_only_to_encoders_that_take_it()
     test_caller_scalar_loader_matches_ruleset_guard()
     test_literal_numeric_looking_pins_keep_exact_string_identity()
     test_binding_rejects_caller_pin_lines_outside_printable_ascii_lf()

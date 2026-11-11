@@ -5112,11 +5112,31 @@ jobs:
             CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-buildid=' \
               -o "$audit_root/supervisor" ./cmd/axiom-encode-signing-supervisor
           )
+          # retired-root-base-gate-start
+          # axiom-encode #1233 (b9d37668) taught the provisioner to accept a
+          # retired corpus release root. An older base encoder's provisioner
+          # exits on that unknown option, so its runtime gets the current corpus
+          # release root alone.
+          base_takes_retired_root=true
+          if [ -n "${TRUST_RETIRED_CORPUS_RELEASE_ROOT:-}" ]; then
+            base_contains_1233=0
+            git -C "$BASE_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+              b9d376684cfb5e86202daa3451b8fc716703ed19 "$BASE_ENCODER_REF" || base_contains_1233=$?
+            case "$base_contains_1233" in
+              0) ;;
+              1)
+                base_takes_retired_root=false
+                echo "::notice::Base encoder $BASE_ENCODER_REF predates axiom-encode #1233; its runtime gets no retired corpus release root."
+                ;;
+              *) echo "ManifestAuditError: base encoder #1233 ancestry check failed (status $base_contains_1233)" >&2; exit 1 ;;
+            esac
+          fi
+          # retired-root-base-gate-end
           # The retired corpus release root is optional: pass it only while the
           # organization still sets it, so deleting the variable after re-signing
           # does not hand the provisioner an empty root (which it refuses).
           retired_root_args=()
-          if [ -n "${TRUST_RETIRED_CORPUS_RELEASE_ROOT:-}" ]; then
+          if [ -n "${TRUST_RETIRED_CORPUS_RELEASE_ROOT:-}" ] && [ "$base_takes_retired_root" = true ]; then
             retired_root_args=(--retired-corpus-release-root "$TRUST_RETIRED_CORPUS_RELEASE_ROOT")
           fi
           python -I /opt/axiom-dependency-integrity/check.py verify
