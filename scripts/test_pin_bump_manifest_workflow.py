@@ -1081,13 +1081,13 @@ class ProducerCarryGateTests(unittest.TestCase):
         self.assertEqual(source.count("630aa73931e5aa87c51d25fe448e38dbcfaed50f"), 1)
         self.gate = textwrap.dedent(source).replace("630aa73931e5aa87c51d25fe448e38dbcfaed50f", commits["fix1859"])
 
-    def run_gate(self, base, head):
+    def run_gate(self, base, head, base_deps=None):
         script = ("set -euo pipefail\n" + self.gate +
                   'printf "%s %s\\n" "$PRODUCER_CARRY_OLDER_WORDING" "$PRODUCER_CARRY_BASE_PIN"\n')
         deps = str(self.root / "deps")
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, env={
-            **self.env, "BASE_DEPENDENCY_ROOT": deps, "AXIOM_DEPENDENCY_ROOT": deps,
-            "BASE_ENCODER_REF": base, "HEAD_ENCODER_REF": head})
+            **self.env, "BASE_DEPENDENCY_ROOT": deps if base_deps is None else str(base_deps),
+            "AXIOM_DEPENDENCY_ROOT": deps, "BASE_ENCODER_REF": base, "HEAD_ENCODER_REF": head})
 
     def test_paths_follow_pin_direction_and_base_ancestry(self):
         c = self.commits
@@ -1111,6 +1111,18 @@ class ProducerCarryGateTests(unittest.TestCase):
         result = self.run_gate(self.commits["old"], "f" * 40)
         self.assertEqual(result.returncode, 1)
         self.assertIn("encoder pin direction check failed", result.stderr)
+
+    def test_a_failed_1859_check_in_the_base_checkout_fails_the_step(self):
+        # The base checkout holds neither commit, so its #1859 check exits 128
+        # while the direction check in the head checkout still succeeds.
+        empty = self.root / "empty-deps"
+        (empty / "axiom-encode").mkdir(parents=True)
+        subprocess.run(["git", "-C", str(empty / "axiom-encode"), "init", "-q", "-b", "main"], check=True,
+                       capture_output=True, env=self.env)
+        result = self.run_gate(self.commits["old"], self.commits["new"], base_deps=empty)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ManifestAuditError: base encoder #1859 ancestry check failed (status 128)", result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
 
 
 def audit_report(issues, *, status=None):

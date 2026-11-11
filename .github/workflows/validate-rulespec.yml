@@ -5742,12 +5742,13 @@ jobs:
           # pin or a first-parent descendant of it. It refuses a producer on
           # first-parent main that does not descend from the pin with ANCESTRY;
           # its other refusal reasons read differently and never carry. Earlier
-          # encoders admitted the exact pin alone and refused others with EXACT. A forward pin change from such an encoder
-          # therefore refuses, at head, manifests the base refused in the older
-          # wording, and manifests the base pin itself produced. Each carries
-          # over when the manifest keeps its bytes from base to head and the
-          # gate above enables its path. Every other head issue for the same
-          # manifest still goes through the ratchet.
+          # encoders admitted the exact pin alone and refused others with
+          # EXACT. A forward pin change from such an encoder therefore refuses,
+          # at head, manifests the base refused in the older wording, and
+          # manifests the base pin itself produced. Each carries over when the
+          # manifest keeps its bytes from base to head and the gate above
+          # enables its path. Every other head issue for the same manifest
+          # still goes through the ratchet.
           EXACT = " does not match the running pinned encoder"
           ANCESTRY = EXACT + ": the pinned encoder commit is not an ancestor of the producer"
           MANIFEST = re.compile(r"\.axiom/encoding-manifests(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)+\.json")
