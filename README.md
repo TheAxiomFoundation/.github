@@ -677,23 +677,29 @@ external encoder's manifest-admission policy on complete live repositories.
 A forward encoder pin change can turn an inherited producer refusal into a new
 issue key. Since axiom-encode #1859 (`630aa73931e5aa87c51d25fe448e38dbcfaed50f`),
 the guard admits a manifest whose signed producer is the pin or a first-parent
-descendant of it, and its refusal ends with
-`the pinned encoder commit is not an ancestor of the producer`. Earlier
-encoders admit the exact pin alone and end the refusal at
+descendant of it. It refuses a producer on first-parent main that does not
+descend from the pin with a message that ends
+`the pinned encoder commit is not an ancestor of the producer`; its other
+refusal reasons read differently and never carry. Earlier encoders admit the
+exact pin alone and end the refusal at
 `does not match the running pinned encoder`. The ratchet reports such a
 proposed-tree refusal as information, in the log and the step summary, when the
 base encoder is a proper ancestor of the proposed encoder, the manifest keeps
 the same bytes at base and proposed tree, and one of two conditions holds: the
 base refused that manifest and contract in the older wording, or the base
-encoder predates #1859 and the manifest names the base pin as its producer. The
-second condition reads `axiom_encode_git.commit`, plus `dirty_tracked: false`
-for the six contracts that record the producer there alone, or
-`validation_execution.axiom_encode.commit` for the
-`validation_execution.axiom_encode` contract. A base encoder before #1859
-admits its own commit and nothing else, so no re-encode passes under both pins
-and the pin change has no other way to land. From a later base, a re-encode
-lands first, and the ratchet carries no manifest the base pin produced. The
-carry covers the seven producer contracts axiom-encode names in these refusals,
+encoder predates #1859 and the manifest names the base pin as its producer. For
+the six contracts whose producer axiom-encode reads from `axiom_encode_git`,
+the second condition reads `axiom_encode_git.commit` with
+`dirty_tracked: false`. For the `validation_execution.axiom_encode` contract it
+reads both `validation_execution.axiom_encode.commit` and
+`axiom_encode_git.commit`. A base encoder before #1859 admits its own commit and
+nothing else, so no re-encode by another encoder commit passes under both pins,
+and the pin change has no other way to land. A base that contains #1859 admits
+a newer producer on main, so the ratchet carries no manifest that such a base
+pin produced. At a base between #1859 and #1883, the guard stops at the
+identity issue the next paragraph describes before it reads any manifest, so
+no re-encode lands there first either, and those manifests stay new. The carry
+covers the seven producer contracts axiom-encode names in these refusals,
 manifest paths under `.axiom/encoding-manifests/` with no symlink along the
 path, and issue keys that hold the message alone. Every other proposed-tree
 issue for that manifest still goes through the ratchet, and an error in either

@@ -5663,8 +5663,8 @@ jobs:
           # moves forward to another encoder. It carries a manifest the base pin
           # produced only when the base encoder predates axiom-encode #1859
           # (630aa739): that base admits its own commit and no other, so no
-          # re-encode passes under both pins. A later base admits newer
-          # producers, so a re-encode can land before the pin moves.
+          # re-encode by another encoder commit passes under both pins. A later
+          # base admits a newer producer on main, so this path stays off there.
           pin_moves_forward=0
           git -C "$AXIOM_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
             "$BASE_ENCODER_REF" "$HEAD_ENCODER_REF" || pin_moves_forward=$?
@@ -5739,9 +5739,10 @@ jobs:
 
           # producer-refusal-carry-start
           # axiom-encode #1859 admits a manifest whose signed producer is the
-          # pin or a first-parent descendant of it, and refuses others with
-          # ANCESTRY. Earlier encoders admitted the exact pin alone and refused
-          # others with EXACT. A forward pin change from such an encoder
+          # pin or a first-parent descendant of it. It refuses a producer on
+          # first-parent main that does not descend from the pin with ANCESTRY;
+          # its other refusal reasons read differently and never carry. Earlier
+          # encoders admitted the exact pin alone and refused others with EXACT. A forward pin change from such an encoder
           # therefore refuses, at head, manifests the base refused in the older
           # wording, and manifests the base pin itself produced. Each carries
           # over when the manifest keeps its bytes from base to head and the
@@ -5751,8 +5752,9 @@ jobs:
           ANCESTRY = EXACT + ": the pinned encoder commit is not an ancestor of the producer"
           MANIFEST = re.compile(r"\.axiom/encoding-manifests(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)+\.json")
           # The producer contracts axiom-encode names in these refusals. True
-          # marks the contract whose validation_execution block also records
-          # the producer; the others record it in axiom_encode_git alone.
+          # marks the one whose refusal reads validation_execution.axiom_encode,
+          # which axiom-encode also requires to match axiom_encode_git; the other
+          # six come from check_producer, which reads axiom_encode_git alone.
           CONTRACTS = {
               "validation_execution.axiom_encode": True,
               "reviewed candidate promotion": False,

@@ -59,7 +59,8 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
               inherited=False, scenario="manifest", base_pin="a" * 40,
               integrity_fail_after=0, event="pull_request", base_ancestry=0, head_ancestry=0,
               base_bug_ancestry=0, pin_direction=0,
-              audit_results=None, bridge_predicate_status=0):
+              audit_results=None, bridge_predicate_status=0,
+              manifest_payload=None, summary=None):
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     shell = next(step["run"] for step in steps if step.get("name") == "Reject manual RuleSpec changes")
     with tempfile.TemporaryDirectory(prefix="encoder-guard-pin-manifest-", dir=TEMP_PARENT) as directory:
@@ -81,6 +82,10 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
         base_manifest.parent.mkdir(parents=True)
         base_manifest.write_text(json.dumps({"valid": valid if inherited else True,
                                             "sha256": hashlib.sha256(module.read_bytes()).hexdigest()}))
+        if manifest_payload is not None:
+            # The same bytes at base and head, as a landed manifest has.
+            for path in (manifest, base_manifest):
+                path.write_text(json.dumps(manifest_payload))
         if scenario in ("legacy", "new-module"):
             manifest.unlink()
             base_manifest.unlink()
@@ -285,6 +290,8 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
             "AUDIT_RESULTS": json.dumps(audit_results),
             "BRIDGE_PREDICATE_STATUS": str(bridge_predicate_status),
             "INTEGRITY_FAIL_AFTER": str(integrity_fail_after),
+            # Keep the step's summary out of the CI job that runs these tests.
+            "GITHUB_STEP_SUMMARY": str(root / "summary.md" if summary is None else summary),
         }, capture_output=True, text=True, timeout=120)
         return result, [json.loads(line) for line in calls.read_text().splitlines()]
 
@@ -816,8 +823,11 @@ class ProducerRefusalCarryTests(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k not in drop}
         if base_pin is not False:
             env["BASE_ENCODER_REF"] = base_pin
-        env["PRODUCER_CARRY_OLDER_WORDING"] = "true" if older_wording else "false"
-        env["PRODUCER_CARRY_BASE_PIN"] = "true" if base_pin_produced else "false"
+        # None leaves a flag unset, as a step without the gate would.
+        if older_wording is not None:
+            env["PRODUCER_CARRY_OLDER_WORDING"] = "true" if older_wording else "false"
+        if base_pin_produced is not None:
+            env["PRODUCER_CARRY_BASE_PIN"] = "true" if base_pin_produced else "false"
         if summary is not None:
             env["GITHUB_STEP_SUMMARY"] = str(summary)
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -896,6 +906,15 @@ class ProducerRefusalCarryTests(unittest.TestCase):
         self.assert_new(self.ratchet([self.older()], [self.refusal()], older_wording=False), "older path off")
         status, stdout, _ = self.ratchet([self.older()], [self.refusal()], base_pin_produced=False)
         self.assertEqual(status, 0, stdout)
+
+    def test_unset_flags_carry_nothing(self):
+        self.write_both(self.manifest())
+        self.assert_new(self.ratchet([], [self.refusal()], older_wording=None, base_pin_produced=None),
+                        "base pin path, flags unset")
+        self.reset_trees()
+        self.write_both(self.manifest(producer="f" * 40))
+        self.assert_new(self.ratchet([self.older()], [self.refusal()], older_wording=None,
+                                     base_pin_produced=None), "older path, flags unset")
 
     def test_refusals_without_the_base_pin_evidence_stay_new(self):
         nested = b'{"axiom_encode_git": ' + b"[" * 100000 + b"]" * 100000 + b"}"
@@ -1097,6 +1116,79 @@ class ProducerCarryGateTests(unittest.TestCase):
 def audit_report(issues, *, status=None):
     return {"payload": {"passed": not issues, "issues": issues},
             "status": int(bool(issues)) if status is None else status}
+
+
+class ProducerCarryStepTests(unittest.TestCase):
+    """The gate's flags reach the ratchet when the whole step runs."""
+
+    CONTRACT = " validation_execution.axiom_encode"
+    EXACT = ProducerRefusalCarryTests.EXACT
+    ANCESTRY = ProducerRefusalCarryTests.ANCESTRY
+
+    @staticmethod
+    def manifest(producer):
+        return {"schema_version": "fixture", "axiom_encode_git": {"commit": producer},
+                "validation_execution": {"axiom_encode": {"commit": producer}}}
+
+    def run_step(self, *, base_issues=(), producer=BASE, base_pin=BASE, pin_direction=0,
+                 base_bug_ancestry=1):
+        # base_bug_ancestry=1: the base encoder lacks #1859 (630aa739).
+        refusal = MANIFEST + self.CONTRACT + self.ANCESTRY
+        with tempfile.TemporaryDirectory(prefix="encoder-guard-carry-step-", dir=TEMP_PARENT) as directory:
+            summary = Path(directory) / "summary.md"
+            result, _ = run_guard(manifest_payload=self.manifest(producer), base_pin=base_pin,
+                                  pin_direction=pin_direction, base_bug_ancestry=base_bug_ancestry,
+                                  audit_results={"base": audit_report(list(base_issues)),
+                                                 "head": audit_report([refusal])},
+                                  summary=summary)
+            return result, summary.read_text() if summary.exists() else ""
+
+    def assert_new(self, outcome, label):
+        result, summary = outcome
+        self.assertEqual(result.returncode, 1, label + result.stdout + result.stderr)
+        self.assertIn("New manifest audit issues: 1", result.stderr, label)
+        self.assertNotIn("Producer refusals carried", result.stdout, label)
+        self.assertEqual(summary, "", label)
+
+    def test_base_pin_refusal_carries_through_the_step(self):
+        result, summary = self.run_step()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Producer refusals carried from the base pin: 1 (information)", result.stdout)
+        self.assertIn("the base pin produced it", result.stdout)
+        self.assertIn("Manifest audit ratchet passed: no new issues.", result.stdout)
+        self.assertIn("### Producer refusals carried from the base pin: 1", summary)
+        self.assertIn(f"- {MANIFEST}{self.CONTRACT}{self.ANCESTRY} (the base pin produced it)", summary)
+
+    def test_older_wording_carries_through_the_step(self):
+        older = MANIFEST + self.CONTRACT + self.EXACT
+        for base_bug_ancestry in (0, 1):
+            with self.subTest(base_contains_1859=not base_bug_ancestry):
+                result, summary = self.run_step(base_issues=[older], producer="f" * 40,
+                                                base_bug_ancestry=base_bug_ancestry)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("the base refused it in the older wording", result.stdout)
+                self.assertIn("(the base refused it in the older wording)", summary)
+
+    def test_the_step_keeps_refusals_new_outside_their_gate(self):
+        older = MANIFEST + self.CONTRACT + self.EXACT
+        for label, kwargs in (
+                ("base pin path, pin moves backward or sideways", {"pin_direction": 1}),
+                ("base pin path, base contains #1859", {"base_bug_ancestry": 0}),
+                ("base pin path, pin unchanged", {"base_pin": PROPOSED, "producer": PROPOSED}),
+                ("older path, pin moves backward or sideways",
+                 {"pin_direction": 1, "base_issues": [older], "producer": "f" * 40}),
+                ("older path, pin unchanged",
+                 {"base_pin": PROPOSED, "base_issues": [older], "producer": "f" * 40}),
+        ):
+            with self.subTest(label):
+                self.assert_new(self.run_step(**kwargs), label)
+
+    def test_a_failed_direction_check_fails_the_step(self):
+        result, summary = self.run_step(pin_direction=128)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ManifestAuditError: encoder pin direction check failed (status 128)", result.stderr)
+        self.assertNotIn("Manifest audit ratchet passed", result.stdout)
+        self.assertEqual(summary, "")
 
 
 class Pre1883ManifestBridgeTests(unittest.TestCase):
