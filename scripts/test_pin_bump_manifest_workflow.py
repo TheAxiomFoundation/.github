@@ -62,6 +62,11 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
               audit_results=None, bridge_predicate_status=0):
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["validate"]["steps"]
     shell = next(step["run"] for step in steps if step.get("name") == "Reject manual RuleSpec changes")
+    # This suite exercises the legacy pin-bump ratchet. Notary selection and
+    # its mandatory fallback are covered by test_notary_guard_workflow.py.
+    notary_start = shell.index("pr_args=()\n")
+    notary_end = shell.index("\nrun_generated_guard() {", notary_start)
+    shell = shell[:notary_start] + "# Fixture protected base has no notary consumer.\n" + shell[notary_end:]
     with tempfile.TemporaryDirectory(prefix="encoder-guard-pin-manifest-", dir=TEMP_PARENT) as directory:
         root = Path(directory)
         workspace = root / "rulespec-uk"
@@ -267,6 +272,7 @@ def run_guard(*, mode="full-toolchain-bump", valid=True, encoder="fixture",
         result = subprocess.run(["bash", "-c", shell], cwd=workspace, env={
             **os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
             "GITHUB_WORKSPACE": str(workspace), "RUNNER_TEMP": str(root),
+            "GITHUB_TOKEN": "fixture-read-token",
             "AXIOM_DEPENDENCY_ROOT": str(dependencies), "GITHUB_SHA": HEAD,
             "RULESPEC_VALIDATION_MODE": mode, "EXPECTED_BASE": BASE,
             "PROPOSED_ENCODER": PROPOSED, "GUARD_CALLS": str(calls),

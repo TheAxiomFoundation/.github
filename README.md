@@ -131,6 +131,37 @@ that command for rejection of new or broadened waivers. Pin-only updates require
 full RuleSpec revalidation; the acceptance checklist specifies the hosted
 evidence to retain at the exact adopted validator SHA.
 
+### Enrolled-producer admission (not activated here)
+
+The generated-file guard is mandatory in this workflow revision. The retained
+`run-generated-guard` compatibility input must be true. A consumer present only
+in the PR head cannot opt into notary admission. A valid activated consumer on
+the protected base selects the encoder's `notary-guard`; an absent consumer
+selects mandatory `guard-generated`, while malformed consumers or unsupported
+encoder versions fail. This revision therefore requires an encoder containing
+`notary-guard` (the implementation is proposed in axiom-encode#1662).
+
+For activated lanes, authenticated exact-byte producer lineage, current enrolled
+writer eligibility and full chain verification replace legacy apply manifests.
+The independently required, source-App-bound notary admission check must also
+pass before merge. The workflow never enrolls a producer, signs an old draft,
+or grants admission based only on author/version. Adopt this workflow only in
+a dedicated reviewed lane rollout after v33 custody and NZ pilot prerequisites.
+
+Those lineage, eligibility, authorization and source-App guarantees belong to
+the external encoder `notary-guard` and the admission App. This repository
+neither implements nor tests them: `scripts/test_notary_guard_workflow.py`
+runs the selection shell against a stub that returns configured statuses and
+authenticates nothing. Treat them as rollout requirements. Before rollout,
+retain the exact adopted encoder SHA and its integration evidence.
+
+Notary admission alone receives the actual PR head commit. The legacy
+fallback still audits `GITHUB_SHA` (the merge commit on `pull_request`),
+including the whole-repository audit. A successful notary admission exits
+before the legacy pin-bump manifest ratchet below, so that ratchet is
+preserved only on the legacy fallback. Activated lanes depend on the external
+verifier's replacement coverage.
+
 ### Exact rollback rewind
 
 For `pull_request`, `push`, `schedule`, and `workflow_dispatch`, the workflow can
@@ -658,7 +689,8 @@ revalidating every module and companion at the proposed pins before merge.
 A workflow edit that changes no dependency ref keeps changed-file selection.
 Changes to the release or waiver-digest toolchain metadata may still require
 full module validation without enabling the whole-repository manifest audit.
-The whole-repository generated-content audit is a ratchet: run supervised
+On the legacy fallback path (no notary consumer on the protected base),
+the whole-repository generated-content audit is a ratchet: run supervised
 `guard-generated --all` against the protected base with its pins and the
 proposed tree with its pins, reject issues present only at the proposed tree,
 and report inherited issues as information. Missing legacy manifests or stale
