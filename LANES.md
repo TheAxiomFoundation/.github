@@ -4,19 +4,19 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-10 — Register Maryland's capital gains surtax source conflict (#2080) | 49 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | failure |
-| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-08 — Merge pull request #137 from TheAxiomFoundation/nzhub/engine-89571cc2 | 0 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
+| [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-11-11 — Merge pull request #31 from TheAxiomFoundation/manifest-pin-gate | 2 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-11-11 — Merge pull request #24 from TheAxiomFoundation/manifest-pin-gate | 1 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-10 — Register Maryland's capital gains surtax source conflict (#2080) | 50 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | queued |
+| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-08 — Merge pull request #137 from TheAxiomFoundation/nzhub/engine-89571cc2 | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-11-07 — Rename Populace to Microcosm in prose and code (#139) | 3 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-05 — Point the UK CTR README at the release #538 bound (#539) | 37 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
-| [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-27 — Merge pull request #29 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-27 — Merge pull request #26 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-10-27 — Merge pull request #30 from TheAxiomFoundation/engine-pin/32bc1c12 | 2 | tz-rulespec-2026-07-21 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-10-27 — Merge pull request #23 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | rw-rulespec-2026-07-16 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-10-27 — Merge pull request #17 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | ng-rulespec-2026-07-22 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-27 — Merge pull request #43 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-27 — Merge pull request #23 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
-| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-10-27 — Merge pull request #107 from TheAxiomFoundation/engine-pin/32bc1c12 | 0 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
-| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 179 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-05 — Point the UK CTR README at the release #538 bound (#539) | 38 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
+| [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-27 — Merge pull request #29 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-27 — Merge pull request #26 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-10-27 — Merge pull request #17 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | ng-rulespec-2026-07-22 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-27 — Merge pull request #43 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-10-27 — Merge pull request #23 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | et-rulespec-2026-07-12 | 5c8e16891b39d400269ebd49d0ad3f88f77e9ec1 | success |
+| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-10-27 — Merge pull request #107 from TheAxiomFoundation/engine-pin/32bc1c12 | 1 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
+| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 180 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
 | [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 5 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
 
 <!-- curated:start -->
