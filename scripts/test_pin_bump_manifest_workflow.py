@@ -751,6 +751,164 @@ class PinBumpManifestTests(unittest.TestCase):
                 self.assertNotEqual(check(accepted, invalid, head_status=status), 0)
 
 
+class ProducerRefusalCarryTests(unittest.TestCase):
+    """A forward pin change carries the base pin's own producer verdicts only."""
+
+    BASE_PIN = "c" * 40
+    HEAD_PIN = "d" * 40
+    PATH = ".axiom/encoding-manifests/zm/statutes/act-2018-2/national-health-insurance-act-2018.json"
+    FIELD = " validation_execution.axiom_encode"
+    EXACT = " does not match the running pinned encoder"
+    ANCESTRY = EXACT + ": the pinned encoder commit is not an ancestor of the producer"
+
+    def setUp(self):
+        shell = step_source("Reject manual RuleSpec changes")
+        self.code = compile(heredoc(shell, "PYRATCHET"), "manifest-ratchet", "exec")
+        directory = tempfile.TemporaryDirectory(prefix="encoder-guard-carry-", dir=TEMP_PARENT)
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.base_root, self.head_root = self.root / "base", self.root / "head"
+
+    def manifest(self, producer=None, execution=None):
+        producer = self.BASE_PIN if producer is None else producer
+        execution = producer if execution is None else execution
+        return json.dumps({"schema_version": "fixture", "axiom_encode_git": {"commit": producer},
+                           "validation_execution": {"axiom_encode": {"commit": execution}}}).encode()
+
+    def write(self, root, data, path=None):
+        target = root / (self.PATH if path is None else path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return target
+
+    def ratchet(self, base, head, *, base_pin=None):
+        base_pin = self.BASE_PIN if base_pin is None else base_pin
+        before, after = self.root / "base.json", self.root / "head.json"
+        before.write_text(json.dumps({"passed": not base, "issues": base}))
+        after.write_text(json.dumps({"passed": not head, "issues": head}))
+        args = ["ratchet", str(before), str(int(bool(base))), str(after), str(int(bool(head))),
+                str(self.base_root), str(self.head_root), str(self.root / "base-deps"), str(self.root / "head-deps")]
+        env = {k: v for k, v in os.environ.items() if k != "BASE_ENCODER_REF"}
+        if base_pin is not False:
+            env["BASE_ENCODER_REF"] = base_pin
+        stdout, stderr = io.StringIO(), io.StringIO()
+        status = 0
+        with mock.patch.object(sys, "argv", args), mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                exec(self.code, {"__name__": "__main__"})
+            except SystemExit as exc:
+                status = exc.code
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def refusal(self, path=None):
+        return (self.PATH if path is None else path) + self.FIELD + self.ANCESTRY
+
+    def test_manifest_the_base_pin_produced_carries_when_unchanged(self):
+        for root in (self.base_root, self.head_root):
+            self.write(root, self.manifest())
+        status, stdout, stderr = self.ratchet([], [self.refusal()])
+        self.assertEqual(status, 0, stdout + stderr)
+        self.assertIn("Producer refusals carried from the base pin: 1 (information)", stdout)
+        self.assertIn("the base pin produced it", stdout)
+        self.assertIn("Manifest audit ratchet passed: no new issues.", stdout)
+
+    def test_older_wording_carries_when_unchanged(self):
+        older = self.manifest(producer="f" * 40)
+        for root in (self.base_root, self.head_root):
+            self.write(root, older)
+        status, stdout, stderr = self.ratchet([self.PATH + self.FIELD + self.EXACT], [self.refusal()])
+        self.assertEqual(status, 0, stdout + stderr)
+        self.assertIn("the base refused it in the older wording", stdout)
+
+    def test_refusals_without_the_base_pin_evidence_stay_new(self):
+        cases = {
+            "producer newer than the base pin": (self.manifest(producer="f" * 40), None, []),
+            "fields disagree": (self.manifest(execution="f" * 40), None, []),
+            "producer block missing": (json.dumps({"validation_execution": {"axiom_encode": {"commit": self.BASE_PIN}}}).encode(), None, []),
+            "not JSON": (b"not json", None, []),
+            "no base pin": (self.manifest(), False, []),
+            "malformed base pin": (self.manifest(), self.BASE_PIN[:39], []),
+            "empty base pin and producer": (self.manifest(producer=""), "", []),
+            "short base pin and producer": (self.manifest(producer="c" * 39), "c" * 39, []),
+            "older wording for a different field": (self.manifest(producer="f" * 40), None,
+                                                    [self.PATH + " retirement" + self.EXACT]),
+        }
+        for label, (data, base_pin, base_issues) in cases.items():
+            with self.subTest(label):
+                for root in (self.base_root, self.head_root):
+                    self.write(root, data)
+                status, stdout, stderr = self.ratchet(base_issues, [self.refusal()], base_pin=base_pin)
+                self.assertEqual(status, 1, label + stdout)
+                self.assertIn("New manifest audit issues: 1", stderr)
+                self.assertNotIn("Producer refusals carried", stdout)
+
+    def test_changed_missing_or_linked_manifests_stay_new(self):
+        produced = self.manifest()
+        for label in ("changed", "missing at base", "missing at head", "symlink at head", "symlinked directory"):
+            with self.subTest(label):
+                for root in (self.base_root, self.head_root):
+                    if root.exists():
+                        subprocess.run(["rm", "-rf", str(root)], check=True)
+                if label != "missing at base":
+                    self.write(self.base_root, produced)
+                if label == "changed":
+                    self.write(self.head_root, produced + b"\n")
+                elif label == "symlink at head":
+                    target = self.write(self.root / "elsewhere", produced)
+                    link = self.head_root / self.PATH
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(target)
+                elif label == "symlinked directory":
+                    real = self.root / "real-manifests"
+                    self.write(real, produced, path=self.PATH.split("/", 2)[2])
+                    (self.head_root / ".axiom").mkdir(parents=True, exist_ok=True)
+                    (self.head_root / ".axiom/encoding-manifests").symlink_to(real)
+                elif label != "missing at head":
+                    self.write(self.head_root, produced)
+                status, stdout, stderr = self.ratchet([], [self.refusal()])
+                self.assertEqual(status, 1, label + stdout)
+                self.assertNotIn("Producer refusals carried", stdout)
+
+    def test_only_exact_producer_refusals_under_the_manifest_tree_carry(self):
+        produced = self.manifest()
+        for root in (self.base_root, self.head_root):
+            self.write(root, produced)
+            self.write(root, produced, path="zm/statutes/act.json")
+        for issue in (
+            self.refusal() + " ",
+            self.refusal() + "; also stale",
+            self.PATH + self.FIELD + self.EXACT + ": producer identity is malformed",
+            self.PATH + self.FIELD + self.EXACT,
+            self.PATH + self.ANCESTRY,
+            "zm/statutes/act.json" + self.FIELD + self.ANCESTRY,
+            ".axiom/encoding-manifests/../" + self.PATH + self.FIELD + self.ANCESTRY,
+            self.PATH + " has invalid source_attestation: bad root",
+        ):
+            with self.subTest(issue=issue):
+                status, stdout, stderr = self.ratchet([], [issue])
+                self.assertEqual(status, 1, issue + stdout)
+                self.assertNotIn("Producer refusals carried", stdout)
+
+    def test_other_head_issues_for_a_carried_manifest_still_fail(self):
+        for root in (self.base_root, self.head_root):
+            self.write(root, self.manifest())
+        other = self.PATH + " source_attestation cannot be resolved from the signed local corpus release"
+        status, stdout, stderr = self.ratchet([], [self.refusal(), other])
+        self.assertEqual(status, 1)
+        self.assertIn("Producer refusals carried from the base pin: 1 (information)", stdout)
+        self.assertIn("New manifest audit issues: 1", stderr)
+        self.assertIn("source_attestation", stderr)
+
+    def test_carry_code_sits_in_the_ratchet_once(self):
+        shell = step_source("Reject manual RuleSpec changes")
+        self.assertIn("producer-refusal-carry-start", heredoc(shell, "PYRATCHET"))
+        for step in workflow_steps():
+            if step.get("name") != "Reject manual RuleSpec changes":
+                self.assertNotIn("producer-refusal-carry-start", step.get("run", ""))
+        self.assertEqual(step_source("Reject manual RuleSpec changes").count("producer-refusal-carry-start"), 1)
+
+
 def audit_report(issues, *, status=None):
     return {"payload": {"passed": not issues, "issues": issues},
             "status": int(bool(issues)) if status is None else status}

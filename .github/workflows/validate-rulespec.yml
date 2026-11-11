@@ -5662,6 +5662,7 @@ jobs:
             "$RUNNER_TEMP/generated-guard-head.json" "$head_status" \
             "$BASE_RULESPEC_ROOT" "$GITHUB_WORKSPACE" "$BASE_DEPENDENCY_ROOT" "$AXIOM_DEPENDENCY_ROOT" <<'PYRATCHET'
           import json
+          import os
           from pathlib import Path
           import re
           import sys
@@ -5705,13 +5706,77 @@ jobs:
                   raise SystemExit("ManifestAuditError: guard execution failed or returned an inconsistent issue result")
               return {issue_key(issue, repo, dependencies) for issue in payload["issues"]}
 
+          # producer-refusal-carry-start
+          # axiom-encode's producer admission refuses a manifest whose signed
+          # producer is not the pin or a first-parent descendant of it. Before
+          # #1859 the encoder admitted the exact pin alone and wrote EXACT;
+          # later encoders append the reason. A forward pin change therefore
+          # refuses, at head, manifests that the base already refused in the
+          # older wording, or that the base pin itself produced. Both carry over
+          # when the manifest's bytes match at base and head. Every other head
+          # issue for that manifest still goes through the ratchet.
+          EXACT = " does not match the running pinned encoder"
+          ANCESTRY = EXACT + ": the pinned encoder commit is not an ancestor of the producer"
+          MANIFEST = re.compile(r"\.axiom/encoding-manifests(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)+\.json")
+
+          def manifest_bytes(root, relative):
+              path = Path(root)
+              for part in relative.split("/"):
+                  path = path / part
+                  if path.is_symlink():
+                      return None
+              try:
+                  return path.read_bytes() if path.is_file() else None
+              except OSError:
+                  return None
+
+          def produced_by(payload, pin):
+              if not isinstance(payload, dict):
+                  return False
+              git = payload.get("axiom_encode_git")
+              execution = payload.get("validation_execution")
+              encoder = execution.get("axiom_encode") if isinstance(execution, dict) else None
+              return (isinstance(git, dict) and git.get("commit") == pin
+                      and isinstance(encoder, dict) and encoder.get("commit") == pin)
+
+          def carried_refusal(key, before, base_root, head_root, base_pin):
+              if len(key) != 1 or key[0][0] != "literal" or not key[0][1].endswith(ANCESTRY):
+                  return None
+              stem = key[0][1][: -len(ANCESTRY)]
+              path, _, field = stem.partition(" ")
+              if MANIFEST.fullmatch(path) is None or not field:
+                  return None
+              data = manifest_bytes(head_root, path)
+              if data is None or data != manifest_bytes(base_root, path):
+                  return None
+              if (("literal", stem + EXACT),) in before:
+                  return "the base refused it in the older wording"
+              if re.fullmatch(r"[0-9a-f]{40}", base_pin) is None:
+                  return None
+              try:
+                  payload = json.loads(data)
+              except ValueError:
+                  return None
+              return "the base pin produced it" if produced_by(payload, base_pin) else None
+          # producer-refusal-carry-end
+
           before = issue_set(sys.argv[1], sys.argv[2], sys.argv[5], sys.argv[7])
           after = issue_set(sys.argv[3], sys.argv[4], sys.argv[6], sys.argv[8])
           inherited = after & before
-          added = after - before
+          base_pin = os.environ.get("BASE_ENCODER_REF", "")
+          carried = {}
+          for key in after - before:
+              reason = carried_refusal(key, before, sys.argv[5], sys.argv[6], base_pin)
+              if reason:
+                  carried[key] = reason
+          added = after - before - set(carried)
           print(f"Inherited manifest audit issues: {len(inherited)} (information)")
           for issue in sorted(inherited):
               print(f"  {issue!r}")
+          if carried:
+              print(f"Producer refusals carried from the base pin: {len(carried)} (information)")
+              for issue in sorted(carried):
+                  print(f"  {issue!r}: {carried[issue]}")
           if added:
               print(f"New manifest audit issues: {len(added)}", file=sys.stderr)
               for issue in sorted(added):
