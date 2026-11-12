@@ -1855,6 +1855,7 @@ def run_import_aware_selection(
                 "VALIDATION_SHARD": shard,
                 "REVALIDATE_SHARDS": json.dumps(revalidate),
                 "FULL_TARGETS": outputs.get("full-targets", "false"),
+                "DRIFT_TARGETS_VALID": outputs.get("drift-targets-valid", "false"),
             })
             selected_targets[shard] = (
                 target_outputs["mode"],

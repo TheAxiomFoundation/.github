@@ -2114,8 +2114,21 @@ jobs:
                               or any(ord(char) < 32 or ord(char) == 127 for char in path)
                               or any(part in {"", ".", ".."} for part in parts)
                               or not path.endswith((".yaml", ".yml"))
-                              or parts[0] not in shard_set):
+                              or parts[0] not in shard_set
+                              or parts[1] not in {"statutes", "regulations", "policies", "legislation"}
+                              or "programs" in parts):
                           raise ValueError(f"invalid drift target {path!r}")
+                      # Validate before narrowing the matrix. The target step
+                      # cannot restore shards that have already been omitted,
+                      # and it deliberately discards non-atomic program paths.
+                      module = re.sub(r"\.test\.(ya?ml)$", r".\1", path)
+                      for target in {path, module}:
+                          target_parts = target.split("/")
+                          if not os.path.isfile(target) or any(
+                              os.path.islink("/".join(target_parts[:length]))
+                              for length in range(1, len(target_parts) + 1)
+                          ):
+                              raise ValueError(f"missing or non-regular drift target {target!r}")
                       touched_drift.add(parts[0])
               except (ValueError, TypeError) as exc:
                   # drift-targets-valid stays false: every leg validates all

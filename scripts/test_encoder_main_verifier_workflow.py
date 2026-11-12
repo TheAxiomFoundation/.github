@@ -517,8 +517,7 @@ def test_shard_selection_applies_the_verifier_scope() -> None:
 
 def test_drift_targets_scope_a_dispatched_run() -> None:
     targets = ["us-ma/statutes/local.yaml", "us/regulations/independent.yml"]
-    with environment(DRIFT_TARGETS=json.dumps(targets), EVENT_NAME="workflow_dispatch",
-                     DRIFT_TARGETS_VALID="true"):
+    with environment(DRIFT_TARGETS=json.dumps(targets), EVENT_NAME="workflow_dispatch"):
         result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
     assert result["drift-targets-valid"] == "true"
     assert result["matrix"] == ["us-ma", "us"], result["matrix"]
@@ -530,9 +529,8 @@ def test_drift_targets_scope_a_dispatched_run() -> None:
 def test_invalid_drift_targets_run_everything() -> None:
     for targets in ('["../etc/passwd.yaml"]', '"us/statutes/local.yaml"', "not json", "[]",
                     '["xx/statutes/a.yaml"]', '["us/statutes/a\\nus/b.yaml"]'):
-        # The target step sees the selector's verdict through this output.
-        with environment(DRIFT_TARGETS=targets, EVENT_NAME="workflow_dispatch",
-                         DRIFT_TARGETS_VALID="false"):
+        # The integrated fixture passes the selector's verdict to the target step.
+        with environment(DRIFT_TARGETS=targets, EVENT_NAME="workflow_dispatch"):
             result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
         assert result.get("drift-targets-valid", "false") == "false", targets
         assert result["matrix"] == base.SELECTION_JURISDICTIONS, (targets, result["matrix"])
@@ -543,12 +541,70 @@ def test_invalid_drift_targets_run_everything() -> None:
 
 def test_missing_drift_target_runs_everything() -> None:
     targets = ["us-ma/statutes/local.yaml", "us-ma/statutes/missing.yaml"]
-    with environment(DRIFT_TARGETS=json.dumps(targets), EVENT_NAME="workflow_dispatch",
-                     DRIFT_TARGETS_VALID="true"):
+    for event in ("schedule", "workflow_dispatch"):
+        with environment(DRIFT_TARGETS=json.dumps(targets)):
+            result = base.run_import_aware_selection({}, enabled=False, event=event)
+        assert_full_drift_fallback(result)
+
+
+def assert_full_drift_fallback(result: dict) -> None:
+    assert result["drift-targets-valid"] == "false", result
+    assert result["matrix"] == base.SELECTION_JURISDICTIONS, result["matrix"]
+    for mode, modules, _companions in result["targets"].values():
+        assert mode == "full-drift-fallback", mode
+        assert modules
+
+
+def test_existing_nonatomic_drift_target_runs_everything() -> None:
+    for path in (
+        "us-ma/programs/demo.yaml",
+        "us-ma/manual/context.yaml",
+        "us-ma/statutes/nested/programs/demo.yaml",
+    ):
+        files = base.selection_files() | {path: "format: programspec/v1\n"}
+        with environment(DRIFT_TARGETS=json.dumps([path])):
+            result = base.run_import_aware_selection(
+                {}, files=files, enabled=False, event="workflow_dispatch",
+            )
+        assert_full_drift_fallback(result)
+
+
+def test_symlinked_drift_targets_run_everything() -> None:
+    for path, links in (
+        ("us-ma/statutes/linked.yaml", {
+            "us-ma/statutes/linked.yaml": "../../us/statutes/one.yaml",
+        }),
+        ("us-ma/statutes/alias/one.yaml", {
+            "us-ma/statutes/alias": "../../us/statutes",
+        }),
+    ):
+        with environment(DRIFT_TARGETS=json.dumps([path])):
+            result = base.run_import_aware_selection(
+                {}, base_symlinks=links, enabled=False, event="workflow_dispatch",
+            )
+        assert_full_drift_fallback(result)
+
+
+def test_drift_companion_selects_its_existing_module() -> None:
+    with environment(DRIFT_TARGETS=json.dumps(["us-ma/statutes/local.test.yaml"])):
         result = base.run_import_aware_selection({}, enabled=False, event="workflow_dispatch")
-    mode, modules, _companions = result["targets"]["us-ma"]
-    assert mode == "full-drift-fallback", mode
-    assert len(modules) > 1
+    assert result["drift-targets-valid"] == "true", result
+    assert result["matrix"] == ["us-ma"], result["matrix"]
+    assert result["targets"]["us-ma"] == (
+        "drift-targets",
+        ["us-ma/statutes/local.yaml"],
+        ["us-ma/statutes/local.test.yaml"],
+    )
+
+
+def test_drift_companion_without_a_module_runs_everything() -> None:
+    path = "us-ma/statutes/orphan.test.yaml"
+    with environment(DRIFT_TARGETS=json.dumps([path])):
+        result = base.run_import_aware_selection(
+            {}, files=base.selection_files() | {path: "[]\n"},
+            enabled=False, event="workflow_dispatch",
+        )
+    assert_full_drift_fallback(result)
 
 
 def test_pull_requests_ignore_drift_targets() -> None:
