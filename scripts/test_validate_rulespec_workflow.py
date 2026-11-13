@@ -6624,7 +6624,9 @@ def test_rollback_rewind_static_trust_and_comparison_wiring() -> None:
         assert parser["continue-on-error"] is True
         assert parser["working-directory"] == "${{ runner.temp }}"
         assert "python -I -m pip --isolated install" in parser["run"]
-        assert "--only-binary=:all: pyyaml==6.0.3" in parser["run"]
+        # Hash-pinned: test_locked_site_packages_workflow.py pins the requirement.
+        assert '--only-binary=:all: --no-deps --require-hashes -r "$requirements"' in parser["run"]
+        assert "pyyaml==6.0.3 \\\n" in parser["run"]
         assert steps.index(checkout) < steps.index(parser) < steps.index(resolver)
         if job_name != "rollback-proof":
             assert steps.index(resolver) < next(index for index, step in enumerate(steps)
