@@ -1855,6 +1855,7 @@ def run_import_aware_selection(
                 "VALIDATION_SHARD": shard,
                 "REVALIDATE_SHARDS": json.dumps(revalidate),
                 "FULL_TARGETS": outputs.get("full-targets", "false"),
+                "DRIFT_TARGETS_VALID": outputs.get("drift-targets-valid", "false"),
             })
             selected_targets[shard] = (
                 target_outputs["mode"],
@@ -7892,9 +7893,11 @@ def test_parallel_validation_workers_are_bounded_and_fail_closed() -> None:
     assert "validation-workers:" in workflow
     assert "default: 1" in workflow
     assert '[[ "$VALIDATION_WORKERS" =~ ^[1-4]$ ]]' in validate_step
-    assert 'if ! wait "$pid"; then' in validate_step
-    assert 'status=1' in validate_step
-    assert 'for log_path in "${logs[@]}"; do' in validate_step
+    # Each worker's exit status is kept, any failure fails the step, and
+    # every worker log is printed.
+    assert 'wait "$pid" || chunk_status=$?' in validate_step
+    assert 'if [ "$chunk_status" -ne 0 ]; then\n              status=1' in validate_step
+    assert 'cat "${logs[$worker]}"' in validate_step
     assert 'exit "$status"' in validate_step
 
 

@@ -25,6 +25,8 @@ jobs:
         run: python -m pip install --disable-pip-version-check pyyaml==6.0.3
       - name: Test validation-waiver bootstrap authorization
         run: python scripts/test_validate_rulespec_workflow.py
+      - name: Test the encoder-main verifier mode
+        run: python scripts/test_encoder_main_verifier_workflow.py
       - name: Test legacy oracle coverage overlay
         run: python scripts/test_legacy_oracle_coverage_workflow.py
       - name: Test protected composer verification

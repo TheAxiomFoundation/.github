@@ -176,6 +176,129 @@ operational budget rather than a guaranteed runtime bound. A timeout never
 admits a rewind: it fails the proof job, skips dependent validation, and makes
 the aggregate check fail.
 
+### Encoder-main verifier
+
+The `encoder-verifier` mode defaults to `pinned`, which keeps the existing
+behavior: `axiom_encode_ref` verifies every pull request. With `main`
+(axiom-encode#2091, #2093, #2095):
+
+- The `shards` job resolves official `TheAxiomFoundation/axiom-encode` `main`
+  once per run (`verifier_encode_ref`). Every matrix leg checks out, attests
+  and runs that exact commit. The guard step runs `axiom-encode
+  verifier-identity` and writes the verifier commit, version and producer
+  floor to the check summary.
+- `axiom_encode_ref` becomes the producer floor. The head guard passes
+  `--encoder-producer-floor <axiom_encode_ref>`: a signed producer is
+  admitted when it is the floor or a first-parent `main` descendant of it.
+  Moving the floor revokes every producer below it; the guard then fails for
+  their manifests until they are re-encoded.
+- A change of `axiom_encode_ref` alone is not a dependency bump. It runs the
+  first shard only (generated guard and whole-repository gates) with no
+  module targets.
+- A change of `known-validation-gaps.yaml` with, at most, the matching
+  `validation_waiver_set_sha256` in `.axiom/toolchain.toml` validates only the
+  modules whose waiver records changed (mode `changed-waiver-ledger`). The
+  waiver audit and generated guard still run on the whole repository.
+  Per-file waiver bindings (axiom-encode#2092) keep the signed manifests of
+  other files admissible.
+- Engine, composer, workflow and corpus pins stay full gates. A corpus pin
+  keeps today's behavior (changed-file mode for a corpus-only toolchain
+  change in the default selector, full targets with import-aware selection):
+  the workflow cannot yet derive the files that cite changed provisions, so
+  citing-file scoping is not done here.
+- The mode is protected configuration: `[workflow_toolchain] encoder_verifier
+  = "main"` in `.axiom/workflow-toolchain.toml`. The `encoder-verifier` input
+  must equal it (a pull request controls its own caller), and changing the key
+  is a full dependency change.
+- A change of the mode (`pinned` to `main`, or back) may also restate the
+  waiver ledger, because the new verifier computes other failure
+  fingerprints for files that are already waived. This is the one case where
+  `known-validation-gaps.yaml` may ride with a dependency change (#152 stays
+  as it is for every other pin change). The change may contain only
+  `.axiom/workflow-toolchain.toml`, the caller workflow, the ledger and the
+  matching `validation_waiver_set_sha256`. Three checks apply, and each one
+  fails closed:
+  - "Enforce validation waiver ratchet" rebuilds the head ledger from the
+    protected-base bytes. Only the `fingerprint` value of an `active` record
+    may change (to another `sha256:<64 hex>`), and an entry with an `active`
+    record and no `pending` record may be removed. Owner, issue, expiry,
+    `pending` records, order and comments stay byte-identical. No entry is
+    added. No other pin may move, except the hold and, on a switch to
+    `main`, the floor (forward only). A revert to `pinned` must keep
+    `axiom_encode_ref`, because that commit becomes the verifier.
+  - The supervised waiver audit runs with `--verifier-restate` under the
+    resolved verifier on the whole repository: each restated fingerprint
+    must equal the failure that the verifier observes, and each removed
+    file must pass. So the head ledger has one valid content. A verifier
+    without `--verifier-restate` (before axiom-encode#2101) fails the step.
+  - The generated guard runs on the whole repository for a configuration
+    change. There it applies the same record rule and refuses RuleSpec
+    files, manifests and receipts beside a restate. The ratchet and the
+    audit above do not depend on it.
+  - After a revert to `pinned`, the pinned `axiom_encode_ref` is the
+    verifier. A revert that restates the ledger thus needs a pin at or
+    after axiom-encode#2101; an older pin fails the audit step.
+
+  A restate does not add a waiver, and a file that fails with no waiver
+  still fails the change. It does re-approve the new failure of a file that
+  is already waived, with the same owner, issue and expiry: review the
+  restated failures. `pending` records cannot change, so do not switch the
+  mode while a waiver renewal is staged and not yet consumed. A ledger
+  layout that the rebuild cannot read (flow style, CRLF line ends) is
+  refused; reformat it in an ordinary ledger change first.
+- A floor-only change runs the head guard with `--all` twice, at the base
+  floor and at the new floor, and fails only on issues that are new at the
+  new floor (the ordinary guard of the pull request's own changes also
+  runs): producers below the new floor are revoked, and the repository's
+  standing issues stay inherited. With `run-generated-guard: false`,
+  floor-only and ledger scoping are off (full dependency bump and default
+  selection).
+- `[workflow_toolchain] encoder_verifier_hold = "<40-hex commit>"`
+  (optional, `main` mode only) verifies with that axiom-encode commit
+  instead of the `main` tip: a cheap way back when an encoder merge breaks
+  validation. "Authenticate dependency commits" checks in workflow shell,
+  before any verifier code runs, that the verifier (tip or hold) is on
+  first-parent `main` at or after the floor; "Record the encoder-main
+  verifier" records it. A change of only the hold (or of the hold and the
+  floor) is treated like a floor-only change: first shard, the ordinary
+  guard, and the guard ratchet with `--all`. It does not revalidate every
+  file under the new verifier, so dispatch a full drift run after a hold
+  change. With another pin it is a full dependency bump. A hold in `pinned`
+  mode, or a value that is not a full commit, fails. Remove the hold to
+  return to the `main` tip.
+- With `import-aware-selection`, a ledger-only change still selects the full
+  matrix: changed waiver records are global validation inputs there.
+- Every change that leaves `main` mode with another `axiom_encode_ref` (a
+  floor-only change, a floor move beside other pins, or a switch from
+  `pinned` to `main`) must move `axiom_encode_ref` forward on first-parent
+  `main`; lowering the floor fails, because it would re-admit revoked
+  producers.
+- Push runs compare with the previous `main` commit, not with the floor
+  change. So that a content pull request signed below a new floor cannot
+  merge after the floor pull request passed, require pull requests to be up
+  to date with `main` (or use a merge queue) before callers use `main` mode.
+- With `main`, every merge to axiom-encode `main` changes verification for
+  every caller in `main` mode at once; the check summary records which
+  verifier ran. Protect axiom-encode `main` (required review) before callers
+  opt in.
+- A full dependency bump (for example an engine pin) in `main` mode audits
+  the base with the base floor encoder and the head with encoder `main`, so
+  the comparison also shows every difference between the floor and `main`.
+- A drift target that does not exist gives a full run.
+- The validate step prints one `RULESPEC_VALIDATION_CHUNK files=N status=S
+  single=PATH|-` line after each worker's log, for callers that turn failures
+  into per-file issues (the validator prints no summary for a one-file chunk),
+  then one `RULESPEC_VALIDATION_CHUNKS total=N` line.
+- Any parse error in the scope step keeps the default selection.
+- `drift-targets` (JSON list of module paths) scopes a `schedule` or
+  `workflow_dispatch` run to those modules and their companions, for the
+  event-driven drift run of axiom-encode#2094. Pull requests ignore it. An
+  invalid list runs every target (`full-drift-fallback`).
+
+`main` needs an axiom-encode `main` that has `verifier-identity` and
+`--encoder-producer-floor` (axiom-encode#2101) and per-file waiver bindings
+(axiom-encode#2097).
+
 ### Import-aware PR selection
 
 The `import-aware-selection` input defaults to `false`. With automatic roots,
