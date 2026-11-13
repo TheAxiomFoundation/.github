@@ -1210,9 +1210,16 @@ jobs:
       - name: Reject unsupported tracked paths
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          # A merge group always names its base. Without it the diff below is
+          # skipped and paths the group deletes are never checked, so stop.
+          if [ "$EVENT_NAME" = "merge_group" ] && { [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; }; then
+            echo "UnsupportedTrackedPathBaseMissing: merge group base must be an exact commit" >&2
+            exit 1
+          fi
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -1257,7 +1264,7 @@ jobs:
       - name: Reject unmanifested RuleSpec content
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
           EVENT_NAME: ${{ github.event_name }}
           RUN_GENERATED_GUARD: ${{ inputs.run-generated-guard }}
           GUARD_PROGRAMS_ROOT: ${{ inputs.guard-programs-root }}
@@ -1299,6 +1306,13 @@ jobs:
           # manifest lists the file. Once one does, the content must match a
           # digest listed for it, unless one of those reads `deleted`. This
           # repository supplies no ProgramSpec manifest producer.
+          if [ "$EVENT_NAME" = "merge_group" ] && { [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; }; then
+            # A merge group is a change set against the queue's base
+            # (`merge_group.base_sha`). Never fall through to SCAN_MODE=none:
+            # that would pass every queued change without looking at it.
+            echo "UnmanifestedRuleSpecBaseMissing: merge group base must be an exact commit" >&2
+            exit 1
+          fi
           if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse --verify "$GITHUB_SHA^" >/dev/null 2>&1; then
               BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
@@ -4045,7 +4059,7 @@ jobs:
       - name: Verify immutable retired-schema freeze
         shell: bash
         env:
-          BASE_SHA: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.rollback_rewind.outputs.effective_base || (github.event.pull_request.base.sha || github.event.before) }}
+          BASE_SHA: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.rollback_rewind.outputs.effective_base || (github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before) }}
           BOOTSTRAP_SHA256: ${{ inputs.retired-schema-bootstrap-sha256 }}
           CALLER_REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
@@ -4147,6 +4161,12 @@ jobs:
 
           head_ref = os.environ["GITHUB_SHA"]
           base_ref = os.environ.get("BASE_SHA", "")
+          if os.environ.get("EVENT_NAME") == "merge_group" and (
+              not re.fullmatch(r"[0-9a-f]{40}", base_ref) or base_ref == "0" * 40
+          ):
+              # A merge group can hold several commits, so `HEAD^` is not its
+              # base. Compare against `merge_group.base_sha` or stop.
+              fail("merge group base must be an exact commit")
           if not base_ref or base_ref == "0000000000000000000000000000000000000000":
               base_ref = f"{head_ref}^"
 
@@ -5187,12 +5207,22 @@ jobs:
           MIGRATION_AUTHORIZED: ${{ steps.migration_authorization.outputs.authorized }}
           MIGRATION_CANDIDATE: ${{ steps.migration_authorization.outputs.candidate }}
           EFFECTIVE_BASE: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.rollback_rewind.outputs.effective_base || '' }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha || '' }}
         run: |
           set -euo pipefail
           unset PYTHONPATH PYTHONHOME PYTHONSTARTUP
           python -I /opt/axiom-dependency-integrity/check.py verify
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base_ref="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "merge_group" ]; then
+            # A merge group can hold several commits (several queued pull
+            # requests, or one rebased pull request), so `HEAD~1` is not its
+            # base and would hide every commit but the last from the ratchet.
+            base_ref="${MERGE_GROUP_BASE_SHA:-}"
+            if [[ ! "$base_ref" =~ ^[0-9a-f]{40}$ ]] || [ "$base_ref" = "0000000000000000000000000000000000000000" ]; then
+              echo "ValidationWaiverBaseMissing: merge group base must be an exact commit" >&2
+              exit 1
+            fi
           elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
             base_ref="${{ github.event.before }}"
           else
@@ -6357,7 +6387,7 @@ jobs:
             # its exact commit here. Checkout uses fetch-depth: 0.
             base_ref="$(git rev-parse --verify 'HEAD~1^{commit}')"
           fi
-          if [[ ! "$base_ref" =~ ^[0-9a-f]{40}$ ]]; then
+          if [[ ! "$base_ref" =~ ^[0-9a-f]{40}$ ]] || [ "$base_ref" = "0000000000000000000000000000000000000000" ]; then
             echo "GeneratedGuardBaseRef: base ref must be an exact 40-hex commit, got '$base_ref'" >&2
             exit 1
           fi
