@@ -6569,10 +6569,42 @@ jobs:
           head_status=0
           run_generated_guard /opt/axiom-verification "$GITHUB_WORKSPACE" "$AXIOM_DEPENDENCY_ROOT" "$GITHUB_SHA" --all --json \
             > "$RUNNER_TEMP/generated-guard-head.json" || head_status=$?
+          # producer-carry-gate-start
+          # The ratchet carries a head producer refusal over only when the pin
+          # moves forward to another encoder. It carries a manifest the base pin
+          # produced only when the base encoder predates axiom-encode #1859
+          # (630aa739): that base admits its own commit and no other, so no
+          # re-encode by another encoder commit passes under both pins. A later
+          # base admits a newer producer on main, so this path stays off there.
+          pin_moves_forward=0
+          git -C "$AXIOM_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+            "$BASE_ENCODER_REF" "$HEAD_ENCODER_REF" || pin_moves_forward=$?
+          case "$pin_moves_forward" in
+            0|1) ;;
+            *) echo "ManifestAuditError: encoder pin direction check failed (status $pin_moves_forward)" >&2; exit 1 ;;
+          esac
+          carry_base_contains_1859=0
+          git -C "$BASE_DEPENDENCY_ROOT/axiom-encode" merge-base --is-ancestor \
+            630aa73931e5aa87c51d25fe448e38dbcfaed50f "$BASE_ENCODER_REF" || carry_base_contains_1859=$?
+          case "$carry_base_contains_1859" in
+            0|1) ;;
+            *) echo "ManifestAuditError: base encoder #1859 ancestry check failed (status $carry_base_contains_1859)" >&2; exit 1 ;;
+          esac
+          PRODUCER_CARRY_OLDER_WORDING=false
+          PRODUCER_CARRY_BASE_PIN=false
+          if [ "$pin_moves_forward" = 0 ] && [ "$BASE_ENCODER_REF" != "$HEAD_ENCODER_REF" ]; then
+            PRODUCER_CARRY_OLDER_WORDING=true
+            if [ "$carry_base_contains_1859" = 1 ]; then
+              PRODUCER_CARRY_BASE_PIN=true
+            fi
+          fi
+          export PRODUCER_CARRY_OLDER_WORDING PRODUCER_CARRY_BASE_PIN
+          # producer-carry-gate-end
           python -I - "$RUNNER_TEMP/generated-guard-base.json" "$base_status" \
             "$RUNNER_TEMP/generated-guard-head.json" "$head_status" \
             "$BASE_RULESPEC_ROOT" "$GITHUB_WORKSPACE" "$BASE_DEPENDENCY_ROOT" "$AXIOM_DEPENDENCY_ROOT" <<'PYRATCHET'
           import json
+          import os
           from pathlib import Path
           import re
           import sys
@@ -6616,13 +6648,117 @@ jobs:
                   raise SystemExit("ManifestAuditError: guard execution failed or returned an inconsistent issue result")
               return {issue_key(issue, repo, dependencies) for issue in payload["issues"]}
 
+          # producer-refusal-carry-start
+          # axiom-encode #1859 admits a manifest whose signed producer is the
+          # pin or a first-parent descendant of it. It refuses a producer on
+          # first-parent main that does not descend from the pin with ANCESTRY;
+          # its other refusal reasons read differently and never carry. Earlier
+          # encoders admitted the exact pin alone and refused others with
+          # EXACT. A forward pin change from such an encoder therefore refuses,
+          # at head, manifests the base refused in the older wording, and
+          # manifests the base pin itself produced. Each carries over when the
+          # manifest keeps its bytes from base to head and the gate above
+          # enables its path. Every other head issue for the same manifest
+          # still goes through the ratchet.
+          EXACT = " does not match the running pinned encoder"
+          ANCESTRY = EXACT + ": the pinned encoder commit is not an ancestor of the producer"
+          MANIFEST = re.compile(r"\.axiom/encoding-manifests(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)+\.json")
+          # The producer contracts axiom-encode names in these refusals. True
+          # marks the one whose refusal reads validation_execution.axiom_encode,
+          # which axiom-encode also requires to match axiom_encode_git; the other
+          # six come from check_producer, which reads axiom_encode_git alone.
+          CONTRACTS = {
+              "validation_execution.axiom_encode": True,
+              "reviewed candidate promotion": False,
+              "exact dependent migration": False,
+              "retained successor migration": False,
+              "legacy replacement": False,
+              "path migration": False,
+              "retirement": False,
+          }
+
+          def manifest_bytes(root, relative):
+              path = Path(root)
+              for part in relative.split("/"):
+                  if part in ("", ".", ".."):
+                      return None
+                  path = path / part
+                  if path.is_symlink():
+                      return None
+              try:
+                  return path.read_bytes() if path.is_file() else None
+              except OSError:
+                  return None
+
+          def unique_keys(pairs):
+              keys = [key for key, _ in pairs]
+              if len(keys) != len(set(keys)):
+                  raise ValueError("duplicate JSON object key")
+              return dict(pairs)
+
+          def produced_by(data, pin, contract):
+              try:
+                  payload = json.loads(data, object_pairs_hook=unique_keys)
+              except (ValueError, RecursionError):
+                  return False
+              if not isinstance(payload, dict):
+                  return False
+              git = payload.get("axiom_encode_git")
+              if not isinstance(git, dict) or git.get("commit") != pin:
+                  return False
+              if not CONTRACTS[contract]:
+                  return git.get("dirty_tracked") is False
+              execution = payload.get("validation_execution")
+              encoder = execution.get("axiom_encode") if isinstance(execution, dict) else None
+              return isinstance(encoder, dict) and encoder.get("commit") == pin
+
+          def carried_refusal(key, before, base_root, head_root, base_pin, older_wording, base_pin_produced):
+              if len(key) != 1 or key[0][0] != "literal" or not key[0][1].endswith(ANCESTRY):
+                  return None
+              stem = key[0][1][: -len(ANCESTRY)]
+              path, _, contract = stem.partition(" ")
+              if MANIFEST.fullmatch(path) is None or contract not in CONTRACTS:
+                  return None
+              data = manifest_bytes(head_root, path)
+              if data is None or data != manifest_bytes(base_root, path):
+                  return None
+              if older_wording and (("literal", stem + EXACT),) in before:
+                  return "the base refused it in the older wording"
+              if (base_pin_produced and re.fullmatch(r"[0-9a-f]{40}", base_pin) is not None
+                      and produced_by(data, base_pin, contract)):
+                  return "the base pin produced it"
+              return None
+          # producer-refusal-carry-end
+
           before = issue_set(sys.argv[1], sys.argv[2], sys.argv[5], sys.argv[7])
           after = issue_set(sys.argv[3], sys.argv[4], sys.argv[6], sys.argv[8])
           inherited = after & before
-          added = after - before
+          base_pin = os.environ.get("BASE_ENCODER_REF", "")
+          older_wording = os.environ.get("PRODUCER_CARRY_OLDER_WORDING") == "true"
+          base_pin_produced = os.environ.get("PRODUCER_CARRY_BASE_PIN") == "true"
+          carried = {}
+          for key in after - before:
+              reason = carried_refusal(key, before, sys.argv[5], sys.argv[6], base_pin,
+                                       older_wording, base_pin_produced)
+              if reason:
+                  carried[key] = reason
+          added = after - before - set(carried)
           print(f"Inherited manifest audit issues: {len(inherited)} (information)")
           for issue in sorted(inherited):
               print(f"  {issue!r}")
+          if carried:
+              print(f"Producer refusals carried from the base pin: {len(carried)} (information)")
+              for issue in sorted(carried):
+                  print(f"  {issue!r}: {carried[issue]}")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  lines = [f"### Producer refusals carried from the base pin: {len(carried)}", ""]
+                  lines += [f"- {issue[0][1]} ({carried[issue]})" for issue in sorted(carried)]
+                  try:
+                      with open(summary, "a", encoding="utf-8") as handle:
+                          handle.write("\n".join(lines) + "\n\n")
+                  except OSError as error:
+                      print(f"::warning::Could not write the carried refusals to the step summary: {error}")
           if added:
               print(f"New manifest audit issues: {len(added)}", file=sys.stderr)
               for issue in sorted(added):
