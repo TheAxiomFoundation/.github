@@ -4,7 +4,7 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-17 — Merge pull request #2217 from TheAxiomFoundation/claude/az-snap-eligibility-join | 49 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | queued |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-17 — Merge pull request #2217 from TheAxiomFoundation/claude/az-snap-eligibility-join | 49 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | success |
 | [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-11-11 — Merge pull request #19 from TheAxiomFoundation/hub/repin-encoder-ffa8f3f1 | 1 | ng-rulespec-2026-07-22 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
 | [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-11-11 — Merge pull request #25 from TheAxiomFoundation/hub/repin-encoder-ffa8f3f1 | 1 | et-rulespec-2026-07-12 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
 | [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-11-11 — Merge pull request #26 from TheAxiomFoundation/hub/repin-encoder-ffa8f3f1 | 1 | rw-rulespec-2026-07-16 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
