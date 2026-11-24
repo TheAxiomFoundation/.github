@@ -1124,7 +1124,8 @@ class Pre1883AttestationProvisioningTests(unittest.TestCase):
         for step in workflow_steps():
             if step.get("name") in (BASE_PREPARATION_STEP, "Reject manual RuleSpec changes"):
                 self.assertEqual(step["env"]["BASE_ENCODER_REF"], "${{ needs.shards.outputs.base_axiom_encode_ref }}")
-                self.assertEqual(step["env"]["HEAD_ENCODER_REF"], "${{ needs.shards.outputs.axiom_encode_ref }}")
+                # The head runtime is the verifier: axiom_encode_ref, or encoder main.
+                self.assertEqual(step["env"]["HEAD_ENCODER_REF"], "${{ needs.shards.outputs.verifier_encode_ref }}")
 
 
 if __name__ == "__main__":
