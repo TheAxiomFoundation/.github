@@ -6786,6 +6786,57 @@ def test_merge_group_prechecks_scan_the_whole_group_or_fail_closed() -> None:
         assert run(paths, root, middle, head).returncode == 0
 
 
+def test_merge_group_runs_the_full_gate_and_reports_the_required_check() -> None:
+    import yaml
+
+    # A one-module change: a pull request validates one leg and that module.
+    # The merge group for the same change must validate every leg and every
+    # module, as a push to main does today, because the queue is the only full
+    # gate that runs before the merge.
+    files = selection_files()
+    change = {"us-fl/statutes/local.yaml": selection_module() + "# changed\n"}
+    scoped = run_import_aware_selection(change)
+    assert scoped["matrix"] == ["us-fl"], scoped["matrix"]
+    assert scoped["targets"]["us-fl"][0] == "changed", scoped["targets"]
+    group = run_import_aware_selection(change, event="merge_group")
+    pushed = run_import_aware_selection(change, event="push")
+    assert sorted(group["matrix"]) == sorted(SELECTION_JURISDICTIONS), group["matrix"]
+    assert group["matrix"] == pushed["matrix"]
+    assert group["targets"] == pushed["targets"]
+    for shard in SELECTION_JURISDICTIONS:
+        assert_full_leg(group, shard, files, mode="full-push")
+
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    jobs = workflow["jobs"]
+    steps = {step["name"]: step for step in jobs["validate"]["steps"]}
+    # The strict oracle-coverage step is the one a pull request skips. A merge
+    # group runs it, so unmapped outputs stop in the queue and not on main.
+    strict = steps["Validate PolicyEngine oracle coverage classification"]
+    assert strict["if"] == (
+        "${{ github.event_name != 'pull_request' "
+        "|| steps.validation_targets.outputs.mode == 'full-toolchain-bump' }}"
+    )
+    assert "--fail-on-unmapped" in strict["run"] and "--fail-on-untested-comparable" in strict["run"]
+    for name, step in steps.items():
+        condition = str(step.get("if", ""))
+        # No step may leave merge groups out while it runs on a push.
+        assert "merge_group" not in condition, (name, condition)
+        assert "github.event_name == 'push'" not in condition, (name, condition)
+    # The queue waits for the required context `validate / validate` (caller
+    # job `validate`, aggregate job named `validate`). It must report for every
+    # event and every matrix result, or a queued entry waits until the timeout.
+    complete = jobs["validate-complete"]
+    assert complete["name"] == "validate"
+    assert complete["if"] == "${{ always() }}"
+    assert complete["needs"] == "validate"
+    for name in ("shards", "rollback-proof", "validate", "validate-complete"):
+        assert "if" not in jobs[name] or name == "validate-complete", name
+    # A concurrency group would let a newer run cancel a merge-group run, and
+    # a cancelled required check removes the entry from the queue.
+    assert "concurrency" not in workflow
+    assert all("concurrency" not in job for job in jobs.values())
+
+
 def test_rollback_rewind_preserves_other_unsupported_event_comparison_bases() -> None:
     # Include a future event: support is an allow-list, so newly introduced
     # events must also retain their original gate-specific fallback behavior.
@@ -7059,6 +7110,7 @@ def run_rollback_rewind_tests() -> None:
         test_merge_group_comparison_bases_use_the_queue_base_or_fail_closed,
         test_merge_group_ratchet_and_freeze_read_the_queue_base_tree,
         test_merge_group_prechecks_scan_the_whole_group_or_fail_closed,
+        test_merge_group_runs_the_full_gate_and_reports_the_required_check,
         test_rollback_rewind_preserves_other_unsupported_event_comparison_bases,
         test_rollback_rewind_keeps_restored_waiver_expiry_enforced,
         test_rollback_rewind_static_trust_and_comparison_wiring,
