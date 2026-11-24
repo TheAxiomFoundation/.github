@@ -6805,32 +6805,43 @@ def test_merge_group_runs_the_full_gate_and_reports_the_required_check() -> None
     assert group["targets"] == pushed["targets"]
     for shard in SELECTION_JURISDICTIONS:
         assert_full_leg(group, shard, files, mode="full-push")
+    # A caller that does not pass import-aware-selection gets the same result.
+    default = run_import_aware_selection(change, event="merge_group", enabled=None)
+    assert default["matrix"] == group["matrix"] and default["targets"] == group["targets"]
 
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
-    steps = {step["name"]: step for step in jobs["validate"]["steps"]}
+    steps = {step.get("name"): step for step in jobs["validate"]["steps"]}
     # The strict oracle-coverage step is the one a pull request skips. A merge
     # group runs it, so unmapped outputs stop in the queue and not on main.
     strict = steps["Validate PolicyEngine oracle coverage classification"]
-    assert strict["if"] == (
+    strict_if = (
         "${{ github.event_name != 'pull_request' "
         "|| steps.validation_targets.outputs.mode == 'full-toolchain-bump' }}"
     )
+    changed_if = (
+        "${{ github.event_name == 'pull_request' "
+        "&& steps.validation_targets.outputs.mode != 'full-toolchain-bump' }}"
+    )
+    assert strict["if"] == strict_if
     assert "--fail-on-unmapped" in strict["run"] and "--fail-on-untested-comparable" in strict["run"]
-    for name, step in steps.items():
-        condition = str(step.get("if", ""))
-        # No step may leave merge groups out while it runs on a push.
-        assert "merge_group" not in condition, (name, condition)
-        assert "github.event_name == 'push'" not in condition, (name, condition)
+    # No step of any job may depend on the event or the ref, other than the
+    # strict step and the pull-request-only changed-file steps it replaces. A
+    # merge group runs on a `gh-readonly-queue/...` ref with its own event
+    # name, so any other such condition could skip a gate in the queue only.
+    for job_name, job in jobs.items():
+        for step in job.get("steps", []):
+            condition = str(step.get("if", ""))
+            if "github." in condition:
+                assert condition in (strict_if, changed_if), (job_name, step.get("name"), condition)
     # The queue waits for the required context `validate / validate` (caller
     # job `validate`, aggregate job named `validate`). It must report for every
     # event and every matrix result, or a queued entry waits until the timeout.
     complete = jobs["validate-complete"]
     assert complete["name"] == "validate"
     assert complete["if"] == "${{ always() }}"
-    assert complete["needs"] == "validate"
-    for name in ("shards", "rollback-proof", "validate", "validate-complete"):
-        assert "if" not in jobs[name] or name == "validate-complete", name
+    assert complete["needs"] in ("validate", ["validate"])
+    assert [name for name, job in jobs.items() if "if" in job] == ["validate-complete"]
     # A concurrency group would let a newer run cancel a merge-group run, and
     # a cancelled required check removes the entry from the queue.
     assert "concurrency" not in workflow
