@@ -356,6 +356,15 @@ def test_floor_beside_a_corpus_or_validator_pin_is_a_full_dependency_bump() -> N
     assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
 
 
+def test_floor_beside_a_composer_pin_is_a_full_dependency_bump() -> None:
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main",
+        pin_changes={"axiom_encode_ref": "9" * 40, "axiom_compose_ref": "5" * 40},
+    )
+    assert result.returncode == 0, result.stderr
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+
+
 def test_floor_beside_a_shared_validator_move_is_a_full_dependency_bump() -> None:
     result, bound = run_dependency_step(
         base_mode="main", head_mode="main", requested="main",
