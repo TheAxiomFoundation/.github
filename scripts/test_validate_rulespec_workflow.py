@@ -6829,11 +6829,26 @@ def test_merge_group_runs_the_full_gate_and_reports_the_required_check() -> None
     # strict step and the pull-request-only changed-file steps it replaces. A
     # merge group runs on a `gh-readonly-queue/...` ref with its own event
     # name, so any other such condition could skip a gate in the queue only.
+    # One more exception: the report-only upload of the incremental waiver
+    # shadow record (pull requests only). It never gates: `continue-on-error`
+    # keeps a failed upload out of the leg's result, and a merge group skips it.
+    shadow_upload_if = "${{ always() && github.event_name == 'pull_request' }}"
+    shadow_upload = steps["Upload incremental waiver shadow record"]
+    assert shadow_upload["if"] == shadow_upload_if
+    assert shadow_upload["continue-on-error"] is True
+    assert "run" not in shadow_upload
+    event_conditions = {
+        strict_if: None,
+        changed_if: None,
+        shadow_upload_if: ("validate", "Upload incremental waiver shadow record"),
+    }
     for job_name, job in jobs.items():
         for step in job.get("steps", []):
             condition = str(step.get("if", ""))
             if "github." in condition:
-                assert condition in (strict_if, changed_if), (job_name, step.get("name"), condition)
+                assert condition in event_conditions, (job_name, step.get("name"), condition)
+                only = event_conditions[condition]
+                assert only is None or only == (job_name, step.get("name")), (job_name, step.get("name"))
     # The queue waits for the required context `validate / validate` (caller
     # job `validate`, aggregate job named `validate`). It must report for every
     # event and every matrix result, or a queued entry waits until the timeout.
@@ -6841,7 +6856,28 @@ def test_merge_group_runs_the_full_gate_and_reports_the_required_check() -> None
     assert complete["name"] == "validate"
     assert complete["if"] == "${{ always() }}"
     assert complete["needs"] in ("validate", ["validate"])
-    assert [name for name, job in jobs.items() if "if" in job] == ["validate-complete"]
+    # The only other job with a condition is the report-only shadow collector.
+    # It runs on pull requests only, and the required check does not wait for
+    # it: no job needs it, so a merge group reports `validate / validate`
+    # with the collector skipped.
+    assert [name for name, job in jobs.items() if "if" in job] == ["validate-complete", "waiver-shadow"]
+    collector = jobs["waiver-shadow"]
+    assert collector["name"] == "waiver shadow"
+    assert collector["if"] == (
+        "${{ !cancelled() && github.event_name == 'pull_request' "
+        "&& needs.shards.result == 'success' }}"
+    )
+    for name, job in jobs.items():
+        needs = job.get("needs", [])
+        assert "waiver-shadow" not in ([needs] if isinstance(needs, str) else needs), name
+    # In the ratchet the shadow options are passed on pull requests only, so
+    # a merge group runs the same supervised audit as a push to main.
+    ratchet = steps["Enforce validation waiver ratchet"]["run"]
+    shadow = ratchet[ratchet.index("# waiver-shadow-start"):ratchet.index("# waiver-shadow-end")]
+    assert ratchet.count("--incremental-shadow-report") == 1
+    assert shadow.index('if [ "${EVENT_NAME:-}" = "pull_request" ]; then') < shadow.index(
+        "--incremental-shadow-report"
+    )
     # A concurrency group would let a newer run cancel a merge-group run, and
     # a cancelled required check removes the entry from the queue.
     assert "concurrency" not in workflow
