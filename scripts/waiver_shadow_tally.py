@@ -11,7 +11,12 @@ line from its log, and prints per-run rows and totals, so that "zero
 incremental_missed records over N complete runs" is a number:
 
     python scripts/waiver_shadow_tally.py --repo TheAxiomFoundation/rulespec-us \
-        --workflow repository-checks.yml --since 2026-12-01 --until 2026-12-15
+        --workflow repository-checks.yml --since 2026-12-01 --until 2026-12-15 \
+        --allowed-validator-sha <the .github commit rulespec-us pins>
+
+A run is evidence only if two checks made here, outside the run, also pass:
+the reusable validator it called (referenced_workflows[].sha) is an allowed
+pin, and its pull request's file list touches nothing under .github/.
 
 It only reads (gh api). A run counts as complete (evidence) only when the
 collector's conclusion is success, the run is trusted (the pull request
@@ -36,6 +41,7 @@ JOB_NAME = "validate / waiver shadow"
 # so the FIRST line that is exactly a tally line is the collector's own.
 TALLY = re.compile(r"^(?:\S+ )?WAIVER_SHADOW_TALLY (\{.*)$")
 RUNS_API_CAP = 1000
+VALIDATOR_PATH = re.compile(r"^TheAxiomFoundation/\.github/\.github/workflows/validate-rulespec\.ya?ml(@.*)?$")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -131,6 +137,7 @@ def collect(
     fetch_json: Callable[[list[str]], object] = gh_json,
     fetch_text: Callable[[str], str] = gh_text,
     warn: Callable[[str], None] = lambda message: print(message, file=sys.stderr),
+    allowed_validators: frozenset[str] = frozenset(),
 ) -> list[dict]:
     """Rows for every pull_request run, one UTC day per query.
 
@@ -151,14 +158,53 @@ def collect(
             if page == 1 and isinstance(total, int) and total >= RUNS_API_CAP:
                 warn(f"warning: {day} has {total} runs; the runs API returns at most {RUNS_API_CAP}, so this day is incomplete")
             for run in batch:
-                rows.append(run_row(repo, run, fetch_json, fetch_text))
+                rows.append(run_row(repo, run, fetch_json, fetch_text, allowed_validators))
             if len(batch) < 100 or page * 100 >= RUNS_API_CAP:
                 break
             page += 1
     return rows
 
 
-def run_row(repo, run, fetch_json, fetch_text) -> dict:
+def independent_trust(repo, run, fetch_json, allowed_validators) -> list[str]:
+    """Reasons this run is not evidence, checked by the tally itself.
+
+    The collector's own untrusted flag runs inside the PR's workflow run; these
+    two checks read the GitHub API from outside it: the reusable validator the
+    run really called (referenced_workflows[].sha) must be an allowed pin, and
+    the pull request's own file list must not touch .github/.
+    """
+
+    reasons = []
+    validators = [
+        item for item in run.get("referenced_workflows") or []
+        if isinstance(item, dict) and VALIDATOR_PATH.match(str(item.get("path", "")))
+    ]
+    if not validators:
+        reasons.append("no reusable validator in referenced_workflows")
+    for item in validators:
+        if item.get("sha") not in allowed_validators:
+            reasons.append(f"validator {item.get('sha')} is not an allowed pin")
+    numbers = [item.get("number") for item in run.get("pull_requests") or [] if isinstance(item, dict)]
+    if not numbers:
+        reasons.append("run names no pull request")
+    for number in numbers:
+        page = 1
+        while True:
+            files = fetch_json([f"repos/{repo}/pulls/{number}/files?per_page=100&page={page}"])
+            files = files if isinstance(files, list) else []
+            if any(str(item.get("filename", "")).startswith(".github/") for item in files if isinstance(item, dict)):
+                reasons.append(f"pull request #{number} changes .github/")
+                break
+            if len(files) < 100:
+                break
+            page += 1
+            if page > 30:  # the files API lists at most 3,000 files
+                reasons.append(f"pull request #{number} lists more than 3,000 files")
+                break
+    return reasons
+
+
+def run_row(repo, run, fetch_json, fetch_text, allowed_validators=frozenset()) -> dict:
     jobs = fetch_json([f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100&filter=latest"])
     job = next(
         (item for item in (jobs.get("jobs", []) if isinstance(jobs, dict) else []) if item.get("name") == JOB_NAME),
@@ -172,6 +218,10 @@ def run_row(repo, run, fetch_json, fetch_text) -> dict:
         except subprocess.CalledProcessError:
             tally = None
     conclusion_for_state = None if (job and conclusion in ("skipped", "cancelled")) else conclusion
+    distrust = independent_trust(repo, run, fetch_json, allowed_validators)
+    state = classify(conclusion_for_state, tally)
+    if distrust and state not in ("not-run", "no-tally"):
+        state = "untrusted"
     return {
         "run_id": run["id"],
         "pr": [item.get("number") for item in run.get("pull_requests") or []],
@@ -179,7 +229,8 @@ def run_row(repo, run, fetch_json, fetch_text) -> dict:
         "created_at": run.get("created_at"),
         "conclusion": conclusion,
         "tally": tally,
-        "state": classify(conclusion_for_state, tally),
+        "untrusted_reasons": distrust,
+        "state": state,
     }
 
 
@@ -190,11 +241,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--since", required=True, help="YYYY-MM-DD (UTC, inclusive)")
     parser.add_argument("--until", required=True, help="YYYY-MM-DD (UTC, inclusive)")
     parser.add_argument("--json", action="store_true", help="print rows and totals as JSON")
+    parser.add_argument(
+        "--allowed-validator-sha", action="append", default=[], required=True,
+        help="a TheAxiomFoundation/.github commit the caller may pin (repeat for each pin in the period)",
+    )
     args = parser.parse_args(argv)
     if not DATE.fullmatch(args.since) or not DATE.fullmatch(args.until):
         parser.error("--since and --until must be YYYY-MM-DD")
     try:
-        rows = collect(args.repo, args.workflow, args.since, args.until)
+        if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in args.allowed_validator_sha):
+            raise ValueError("--allowed-validator-sha must be a full commit SHA")
+        rows = collect(args.repo, args.workflow, args.since, args.until,
+                       allowed_validators=frozenset(args.allowed_validator_sha))
     except ValueError as error:
         parser.error(str(error))
     totals = summarize(rows)

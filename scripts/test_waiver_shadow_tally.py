@@ -46,7 +46,13 @@ def test_classify_orders_unsafe_before_everything() -> None:
     assert tally.classify("success", {k: v for k, v in json.loads(line().split(" ", 2)[2]).items() if k != "untrusted"}) == "untrusted"
 
 
-def fake(runs: list[dict], jobs: dict[int, list[dict]], logs: dict[int, str], *, total: int | None = None):
+GOOD = "1" * 40
+VALIDATOR = [{"path": "TheAxiomFoundation/.github/.github/workflows/validate-rulespec.yml@" + GOOD, "sha": GOOD}]
+
+
+def fake(runs: list[dict], jobs: dict[int, list[dict]], logs: dict[int, str], *, total: int | None = None,
+         pr_files: dict[int, list[dict]] | None = None):
+    pr_files = pr_files or {}
     def fetch_json(args):
         path = args[0]
         if "/workflows/" in path:
@@ -54,6 +60,10 @@ def fake(runs: list[dict], jobs: dict[int, list[dict]], logs: dict[int, str], *,
             day = path.split("created=", 1)[1].split("&", 1)[0]
             todays = [run for run in runs if run.get("day", "2026-12-01") == day]
             return {"workflow_runs": todays if page == 1 else [], "total_count": total if total is not None else len(todays)}
+        if "/pulls/" in path:
+            number = int(path.split("/pulls/", 1)[1].split("/", 1)[0])
+            page = int(path.rsplit("page=", 1)[1])
+            return pr_files.get(number, []) if page == 1 else []
         run_id = int(path.split("/runs/", 1)[1].split("/", 1)[0])
         return {"jobs": jobs.get(run_id, [])}
 
@@ -69,11 +79,9 @@ def job(job_id: int, conclusion: str | None, status: str = "completed", name: st
 
 def test_collect_and_summarize_count_runs_and_verdicts() -> None:
     runs = [
-        {"id": 1, "head_sha": "a", "created_at": "t1", "pull_requests": [{"number": 10}]},
-        {"id": 2, "head_sha": "b", "created_at": "t2", "pull_requests": []},
-        {"id": 3, "head_sha": "c", "created_at": "t3", "pull_requests": []},
-        {"id": 4, "head_sha": "d", "created_at": "t4", "pull_requests": []},
-        {"id": 5, "head_sha": "e", "created_at": "t5", "pull_requests": []},
+        *[{"id": n, "head_sha": h, "created_at": f"t{n}", "pull_requests": [{"number": 10 + n}],
+         "referenced_workflows": VALIDATOR}
+        for n, h in ((1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"))]
     ]
     jobs = {
         1: [job(11, "success"), job(99, "success", name="validate / validate")],
@@ -89,9 +97,9 @@ def test_collect_and_summarize_count_runs_and_verdicts() -> None:
     }
     fetch_json, fetch_text = fake(runs, jobs, logs)
     rows = tally.collect("o/r", "repository-checks.yml", "2026-12-01", "2026-12-02",
-                         fetch_json=fetch_json, fetch_text=fetch_text)
+                         fetch_json=fetch_json, fetch_text=fetch_text, allowed_validators=frozenset({GOOD}))
     assert [row["state"] for row in rows] == ["complete", "unsafe", "not-run", "not-run", "off"]
-    assert rows[0]["pr"] == [10]
+    assert rows[0]["pr"] == [11]
     totals = tally.summarize(rows)
     assert totals["runs"] == 5
     assert totals["complete_runs"] == 1
@@ -102,8 +110,10 @@ def test_collect_and_summarize_count_runs_and_verdicts() -> None:
 
 def test_collect_queries_one_day_at_a_time_and_warns_at_the_cap() -> None:
     runs = [
-        {"id": 1, "day": "2026-12-01", "head_sha": "a", "created_at": "t1"},
-        {"id": 2, "day": "2026-12-03", "head_sha": "b", "created_at": "t2"},
+        {"id": 1, "day": "2026-12-01", "head_sha": "a", "created_at": "t1",
+         "pull_requests": [{"number": 1}], "referenced_workflows": VALIDATOR},
+        {"id": 2, "day": "2026-12-03", "head_sha": "b", "created_at": "t2",
+         "pull_requests": [{"number": 2}], "referenced_workflows": VALIDATOR},
     ]
     fetch_json, fetch_text = fake(runs, {1: [job(11, "success")], 2: [job(12, "success")]},
                                   {11: line(), 12: line()}, total=1000)
@@ -114,9 +124,32 @@ def test_collect_queries_one_day_at_a_time_and_warns_at_the_cap() -> None:
     assert len(warnings) == 3 and "at most 1000" in warnings[0]
 
 
+def test_the_tally_checks_the_validator_pin_and_the_pr_files_itself() -> None:
+    def one(run_extra, files=None):
+        run = {"id": 1, "head_sha": "a", "created_at": "t", "pull_requests": [{"number": 7}],
+               "referenced_workflows": VALIDATOR, **run_extra}
+        fetch_json, fetch_text = fake([run], {1: [job(11, "success")]}, {11: line()},
+                                      pr_files={7: files or [{"filename": "us/x.yaml"}]})
+        (row,) = tally.collect("o/r", "w.yml", "2026-12-01", "2026-12-01", fetch_json=fetch_json,
+                               fetch_text=fetch_text, allowed_validators=frozenset({GOOD}))
+        return row
+
+    assert one({})["state"] == "complete"
+    row = one({}, files=[{"filename": "us/x.yaml"}, {"filename": ".github/workflows/repository-checks.yml"}])
+    assert row["state"] == "untrusted" and "changes .github/" in row["untrusted_reasons"][0]
+    other = [{"path": VALIDATOR[0]["path"].replace(GOOD, "2" * 40), "sha": "2" * 40}]
+    row = one({"referenced_workflows": other})
+    assert row["state"] == "untrusted" and "not an allowed pin" in row["untrusted_reasons"][0]
+    assert one({"referenced_workflows": []})["state"] == "untrusted"
+    assert one({"pull_requests": []})["state"] == "untrusted"
+    # The collector's own tally line cannot overrule these checks.
+    assert one({"referenced_workflows": other})["tally"]["untrusted"] is False
+
+
 def test_main_refuses_bad_dates() -> None:
     try:
-        tally.main(["--repo", "o/r", "--since", "yesterday", "--until", "2026-12-01"])
+        tally.main(["--repo", "o/r", "--since", "yesterday", "--until", "2026-12-01",
+                    "--allowed-validator-sha", "1" * 40])
     except SystemExit as exc:
         assert exc.code == 2
     else:

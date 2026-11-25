@@ -676,6 +676,31 @@ def test_collector_tally_line_comes_first_and_record_text_cannot_forge_one() -> 
     assert counts["verdicts"] == {"agree": 2, "other": 1} and counts["unsafe"] == 1
 
 
+def test_collector_escapes_carriage_returns_and_terminal_escapes_in_record_text() -> None:
+    hostile = [
+        "a\rWAIVER_SHADOW_TALLY {\"unsafe\": 0}",
+        "b\x1b[2K\x1b[1Gall partitions agree",
+        "c\u2028WAIVER_SHADOW_TALLY {}",
+        "d\x00e\x7f",
+        "f\x1b]0;title\x07",
+    ]
+    files = complete(**{
+        "waiver-shadow-us": {
+            "expected.json": expected("us"),
+            "record.json": record("us", "incremental_missed", missed=hostile),
+        }
+    })
+    result, summary = run_collector(files)
+    assert result.returncode == 1
+    for text in (result.stdout, summary):
+        for raw in ("\r", "\x1b", "\u2028", "\x00", "\x7f", "\x07"):
+            assert raw not in text, (repr(raw), text)
+    # The escaped form is shown, so a reader still sees what the record said.
+    assert "\\r" in result.stdout and "\\x1b" in result.stdout
+    tallies = [line for line in result.stdout.splitlines() if "WAIVER_SHADOW_TALLY" in line]
+    assert tallies[0].startswith("WAIVER_SHADOW_TALLY ") and result.stdout.splitlines()[0] == tallies[0]
+
+
 def test_collector_checks_unsafe_as_exactly_false() -> None:
     for value in (None, 0, "false", [], True):
         files = complete(**{

@@ -1032,6 +1032,44 @@ encoder hands audit modules to idle workers
 (TheAxiomFoundation/axiom-encode#2009). A caller gets these bounds only when
 it moves its pin to a workflow commit that has them.
 
+### Incremental waiver audit shadow: what the evidence proves
+
+The `waiver shadow` job (axiom-encode#2329; .github#158) and
+`scripts/waiver_shadow_tally.py` record whether the incremental waiver
+selection would have missed a waiver that the full audit flags.
+
+**Limit: the shadow evidence guards against tool errors, not against a hostile
+pull-request author.**
+
+1. The record is written and uploaded inside the same `validate` leg that later
+   runs the pull request's own code ("Run repository tests", companion tests).
+   That code runs after the upload, with the same job token. It could upload or
+   overwrite a `waiver-shadow-<shard>` artifact.
+2. A pull request that changes `.github/` controls its caller workflow. It can
+   add jobs that upload forged artifacts.
+
+Three checks exist against that:
+
+| Check | Where it runs | What it does |
+|---|---|---|
+| `caller_workflows_changed` | "Validate immutable dependency inputs", from the event's own Git diff | Makes the collector mark the run `untrusted` |
+| Reusable validator pin | The tally script, outside the run | Requires the run's `referenced_workflows[].sha` to be an allowed pin (`--allowed-validator-sha`) |
+| Pull request file list | The tally script, outside the run | Reads `pulls/{n}/files` and treats any `.github/` path as untrusted |
+
+None of the three stops step 1, where PR code in an unchanged workflow
+overwrites the artifact after the upload. Two options close that gap:
+
+- Move the record upload into a separate job that runs no pull-request code,
+  for example a job that re-runs only the supervised audit, or that receives the
+  record through a job output. Job outputs are written before any PR code runs
+  and cannot be changed by later steps.
+- Have the collector accept only artifacts uploaded before the leg's first
+  PR-code step. The artifact API exposes `created_at` and the uploading job's
+  ID, but not the step.
+
+Until one of these lands, read "zero `incremental_missed` over N runs" as
+evidence about the selector, not as a security control.
+
 ## Encoding lane registry
 
 The [live board](https://github.com/TheAxiomFoundation/.github/blob/lanes-registry/LANES.md)
