@@ -564,6 +564,7 @@ jobs:
       encoder_floor_only: ${{ steps.dependency_inputs.outputs.encoder_floor_only }}
       encoder_floor_changed: ${{ steps.dependency_inputs.outputs.encoder_floor_changed }}
       encoder_verifier: ${{ steps.dependency_inputs.outputs.encoder_verifier }}
+      caller_workflows_changed: ${{ steps.dependency_inputs.outputs.caller_workflows_changed }}
       verifier_encode_ref: ${{ steps.verifier_scope.outputs.verifier_encode_ref }}
       verifier_scope_drop: ${{ steps.verifier_scope.outputs.scope_drop }}
       verifier_scope_add: ${{ steps.verifier_scope.outputs.scope_add }}
@@ -929,6 +930,11 @@ jobs:
               return changed
 
           configuration = base
+          # Evidence integrity for the waiver shadow: a pull request that
+          # changes a workflow controls its caller and can upload forged
+          # waiver-shadow artifacts. Computed from the event's own Git diff
+          # (protected base to the validation commit), not from caller text.
+          caller_workflows_changed = False
           # Only a content-free update of the canonical configuration can test
           # proposed pins. Every other path keeps exact protected-base binding.
           # Release/waiver toolchain metadata may accompany that configuration;
@@ -941,6 +947,7 @@ jobs:
               changed = {os.fsdecode(path) for path in git(
                   "diff", "--name-only", "-z", "--no-renames", base, candidate,
               ).split(b"\0") if path}
+              caller_workflows_changed = any(path.startswith(".github/") for path in changed)
               configuration_paths = {TABLE_PATH, *CALLER_PATHS, ".axiom/toolchain.toml"}
               def verifier_restate_candidate():
                   # A change of the verifier mode moves the failure
@@ -1054,6 +1061,7 @@ jobs:
               output.write(f"encoder_floor_changed={str(encoder_floor_changed).lower()}\n")
               output.write(f"encoder_verifier={encoder_verifier}\n")
               output.write(f"encoder_verifier_hold={encoder_hold}\n")
+              output.write(f"caller_workflows_changed={str(caller_workflows_changed).lower()}\n")
           print("Effective dependency inputs match the protected workflow configuration.")
           PYPINS
 
@@ -4847,6 +4855,84 @@ jobs:
             exit 1
           fi
 
+      - name: Stage the waiver shadow preparation
+        shell: bash
+        # The waiver ratchet runs this script on pull requests before the
+        # audit (axiom-encode#2329). It is a separate file because one step
+        # script has a size limit. It leaves exactly one of two files next to
+        # expected.json in $RUNNER_TEMP/waiver-shadow: nothing yet (the
+        # verifier then writes record.json) or unavailable.json with the
+        # reason this leg runs no shadow. expected.json is written by the
+        # workflow, not by the verifier, so the "waiver shadow" job can bind
+        # the verifier's record to this leg's head and audit inputs. It
+        # prints the reason, or nothing when the shadow runs.
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/waiver-shadow-prepare.sh" <<'SHADOWPREP'
+          set -euo pipefail
+          audit_help="$1" partition_count="$2" comparison_base="$3" base_ref="$4"
+          protected_base="$5" changed_paths="$6" shard="$7"
+          shadow_dir="$RUNNER_TEMP/waiver-shadow"
+          rm -rf "$shadow_dir"
+          mkdir -p "$shadow_dir"
+          reason=""
+          if ! grep -qE -- '(^|[[:space:],])--incremental-shadow-report([[:space:]=,]|$)' "$audit_help" \
+            || ! grep -qE -- '(^|[[:space:],])--incremental-shadow-summary([[:space:]=,]|$)' "$audit_help"; then
+            reason="verifier-without-shadow"
+          elif [ "$partition_count" -eq 0 ]; then
+            reason="unpartitioned-audit"
+          elif [ "$comparison_base" != "$base_ref" ]; then
+            # docs/validation-waiver-audit-scope.md, precondition 6.
+            reason="comparison-base-differs-from-event-base"
+          fi
+          SHADOW_DIR="$shadow_dir" SHADOW_SHARD="$shard" \
+            SHADOW_ENCODER_PYPROJECT="${AXIOM_DEPENDENCY_ROOT:-/nonexistent}/axiom-encode/pyproject.toml" \
+            SHADOW_HEAD="$(git rev-parse --verify 'HEAD^{commit}')" \
+            SHADOW_BASE_SHA256="sha256:$(sha256sum "$protected_base" | cut -d ' ' -f 1)" \
+            SHADOW_CHANGED_SHA256="sha256:$(sha256sum "$changed_paths" | cut -d ' ' -f 1)" \
+            SHADOW_REASON="$reason" python -I - <<'PYSHADOW'
+          import json
+          import os
+          from pathlib import Path
+
+          directory = Path(os.environ["SHADOW_DIR"])
+          shard = os.environ["SHADOW_SHARD"]
+          expected = {
+              "schema": "validate-rulespec/waiver-shadow-expected/v1",
+              "partition": shard,
+              "head_commit": os.environ["SHADOW_HEAD"],
+              "protected_base_sha256": os.environ["SHADOW_BASE_SHA256"],
+              "changed_paths_sha256": os.environ["SHADOW_CHANGED_SHA256"],
+          }
+          (directory / "expected.json").write_text(json.dumps(expected, sort_keys=True) + "\n")
+          reason = os.environ["SHADOW_REASON"]
+          if reason:
+              # The collector accepts a run without a shadow only for a pinned
+              # verifier older than the shadow option (0.2.2395), so the marker
+              # names the verifier: version from the verifier checkout's
+              # pyproject.toml, mode from the protected toolchain.
+              try:
+                  import tomllib
+
+                  version = tomllib.loads(
+                      Path(os.environ["SHADOW_ENCODER_PYPROJECT"]).read_text(encoding="utf-8")
+                  )["project"]["version"]
+                  if not isinstance(version, str):
+                      version = None
+              except Exception:
+                  version = None
+              marker = {
+                  "schema": "validate-rulespec/waiver-shadow-unavailable/v1",
+                  "partition": shard,
+                  "reason": reason,
+                  "verifier_version": version,
+                  "verifier_mode": os.environ.get("SHADOW_VERIFIER_MODE") or None,
+              }
+              (directory / "unavailable.json").write_text(json.dumps(marker, sort_keys=True) + "\n")
+          PYSHADOW
+          printf '%s' "$reason"
+          SHADOWPREP
+
       - name: Stage the verifier restate check
         shell: bash
         # The waiver ratchet runs this check when one change switches the
@@ -5183,6 +5269,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SHADOW_SHARD: ${{ matrix.shard }}
+          SHADOW_VERIFIER_MODE: ${{ needs.shards.outputs.encoder_verifier }}
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           MIGRATION_AUTHORIZED: ${{ steps.migration_authorization.outputs.authorized }}
           MIGRATION_CANDIDATE: ${{ steps.migration_authorization.outputs.candidate }}
@@ -5582,6 +5670,32 @@ jobs:
             export AXIOM_ENCODE_WAIVER_AUDIT_WORKERS=1
             echo "Pinned encoder lacks audit partition flags; running the complete unpartitioned waiver audit on this shard."
           fi
+          # waiver-shadow-start
+          # Report-only shadow of the incremental waiver audit (axiom-encode
+          # #2329), pull requests only; see "Stage the waiver shadow
+          # preparation". The full audit, its output and its exit code do not
+          # change: a failed preparation only leaves a marker for the
+          # "waiver shadow" job and the audit runs as before.
+          shadow_args=()
+          if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+            shadow_reason="$(bash "$RUNNER_TEMP/waiver-shadow-prepare.sh" "$audit_help" \
+              "${#partition_args[@]}" "$comparison_base" "$base_ref" "$protected_base" \
+              "$audit_changed_paths" "${SHADOW_SHARD:-}")" || shadow_reason="prepare-failed"
+            if [ -z "$shadow_reason" ]; then
+              shadow_args=(
+                --incremental-shadow-report "$RUNNER_TEMP/waiver-shadow/record.json"
+                --incremental-shadow-summary "$GITHUB_STEP_SUMMARY"
+              )
+            else
+              if [ "$shadow_reason" = "prepare-failed" ]; then
+                mkdir -p "$RUNNER_TEMP/waiver-shadow" 2>/dev/null || true
+                printf '{"partition": "%s", "reason": "prepare-failed", "schema": "validate-rulespec/waiver-shadow-unavailable/v1"}\n' \
+                  "${SHADOW_SHARD:-}" > "$RUNNER_TEMP/waiver-shadow/unavailable.json" 2>/dev/null || true
+              fi
+              echo "Incremental waiver shadow not run on this leg: $shadow_reason"
+            fi
+          fi
+          # waiver-shadow-end
           run_waiver_audit \
             --json \
             --root "$GITHUB_WORKSPACE" \
@@ -5590,7 +5704,25 @@ jobs:
             --changed-paths "$audit_changed_paths" \
             "${partition_args[@]}" \
             "${restate_args[@]}" \
+            "${shadow_args[@]}" \
             --axiom-rules-engine-path "${AXIOM_DEPENDENCY_ROOT}/axiom-rules-engine"
+
+      - name: Upload incremental waiver shadow record
+        # Report only; never gates. One artifact per leg for the
+        # "waiver shadow" job. A leg that failed before the ratchet uploads
+        # nothing, and the collector reports that leg as missing.
+        # continue-on-error: an artifact-service failure or a name clash on a
+        # re-run must never turn the required leg red; the collector reports
+        # that leg as missing instead.
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: waiver-shadow-${{ matrix.shard }}
+          path: ${{ runner.temp }}/waiver-shadow/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
 
       - name: Prepare protected-base manifest audit
         if: ${{ needs.shards.outputs.dependency_pins_changed == 'true' && matrix.shard == needs.shards.outputs.first }}
@@ -7197,3 +7329,302 @@ jobs:
             exit 1
           fi
           echo "Validation matrix passed."
+
+  waiver-shadow:
+    permissions:
+      contents: read
+    # Report-only collector of the incremental waiver audit shadow
+    # (axiom-encode#2329, docs/validation-waiver-audit-scope.md). It is not
+    # part of `validate / validate`; a caller makes it gate only by adding
+    # `validate / waiver shadow` to its required checks. It requires exactly
+    # one record per matrix partition, bound to the leg's own inputs.
+    #   unsafe (fails): incremental_missed, inconclusive, any other verdict,
+    #     an unbound or malformed record, a duplicate, a foreign artifact;
+    #   missing (fails): a leg that was audited (validate succeeded) but has
+    #     no record, e.g. a failed upload;
+    #   incomplete (warning only): legs without a record while the validation
+    #     matrix itself failed; the required check is already red there;
+    #   off (notice, passes): every leg says its verifier has no shadow
+    #     option, and that verifier is pinned and older than 0.2.2395.
+    # It prints one `WAIVER_SHADOW_TALLY {json}` line for
+    # scripts/waiver_shadow_tally.py.
+    name: waiver shadow
+    needs: [shards, validate]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.shards.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download incremental waiver shadow records
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: waiver-shadow-*
+          path: ${{ runner.temp }}/waiver-shadow
+
+      - name: Check incremental waiver shadow records
+        shell: bash
+        env:
+          SHADOW_ROOT: ${{ runner.temp }}/waiver-shadow
+          SHADOW_MATRIX: ${{ needs.shards.outputs.matrix }}
+          SHADOW_HEAD: ${{ github.sha }}
+          SHADOW_VALIDATE_RESULT: ${{ needs.validate.result }}
+          SHADOW_WORKFLOWS_CHANGED: ${{ needs.shards.outputs.caller_workflows_changed }}
+        run: |
+          set -euo pipefail
+          # waiver-shadow-collector-start
+          python -I - <<'PYCOLLECT'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          RECORD_SCHEMA = "axiom-encode/validation-waiver-incremental-shadow/v1"
+          EXPECTED_SCHEMA = "validate-rulespec/waiver-shadow-expected/v1"
+          UNAVAILABLE_SCHEMA = "validate-rulespec/waiver-shadow-unavailable/v1"
+          SAFE = {"agree", "incremental_extra"}
+          FIRST_SHADOW_VERSION = (0, 2, 2395)
+          DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+          VERSION = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)")
+          ALLOWED = {"expected.json", "record.json", "unavailable.json"}
+
+          root = Path(os.environ["SHADOW_ROOT"])
+          head = os.environ["SHADOW_HEAD"]
+          validate_result = os.environ.get("SHADOW_VALIDATE_RESULT", "")
+          # Evidence integrity: a pull request that changes .github/ controls
+          # its caller workflow and could upload forged records. Its result
+          # still shows, but the tally does not count it as evidence. A
+          # missing flag counts as changed.
+          untrusted = os.environ.get("SHADOW_WORKFLOWS_CHANGED", "") != "false"
+
+          def safe(text):
+              # Record text is untrusted: no newline or control character may
+              # start a log line of its own (for example a forged tally line).
+              return "".join(ch if ch.isprintable() else ascii(ch)[1:-1] for ch in str(text))
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          unsafe = []
+          missing = []
+          rows = []
+          verdicts = {}
+          unavailable = {}
+
+          try:
+              matrix = json.loads(os.environ["SHADOW_MATRIX"])
+          except json.JSONDecodeError:
+              matrix = None
+          if (
+              not isinstance(matrix, list)
+              or not matrix
+              or not all(isinstance(item, str) and item for item in matrix)
+              or len(set(matrix)) != len(matrix)
+          ):
+              print("::error::Waiver shadow: the shard matrix is not a list of distinct names.")
+              sys.exit(1)
+
+          def load(path):
+              # Symlinks inside an artifact are refused before load() runs.
+              if not path.is_file():
+                  return None, "not a regular file"
+              try:
+                  value = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                  return None, f"unreadable ({exc.__class__.__name__})"
+              if not isinstance(value, dict):
+                  return None, "not a JSON object"
+              return value, None
+
+          def no_record(shard, why):
+              # A leg that never audited is incomplete when the matrix failed;
+              # after a successful matrix it is missing, which fails.
+              if validate_result == "success":
+                  missing.append(f"{shard}: missing ({why})")
+              else:
+                  missing.append(f"{shard}: incomplete (leg not audited; {why})")
+
+          if root.is_dir():
+              for entry in sorted(root.iterdir()):
+                  name = entry.name
+                  if entry.is_symlink() or not entry.is_dir() or not name.startswith("waiver-shadow-"):
+                      unsafe.append(f"unexpected artifact {name}")
+                      continue
+                  shard = name.removeprefix("waiver-shadow-")
+                  if shard not in matrix:
+                      unsafe.append(f"{shard}: artifact for a partition that is not in the matrix")
+
+          for shard in matrix:
+              directory = root / f"waiver-shadow-{shard}"
+              if directory.is_symlink() or not directory.is_dir():
+                  no_record(shard, "the leg uploaded no shadow artifact")
+                  continue
+              entries = list(directory.iterdir())
+              names = sorted(item.name for item in entries)
+              if set(names) - ALLOWED or any(item.is_symlink() for item in entries):
+                  unsafe.append(f"{shard}: unexpected files {sorted(set(names) - ALLOWED) or names}")
+                  continue
+              has_record = "record.json" in names
+              has_marker = "unavailable.json" in names
+              if has_record and has_marker:
+                  unsafe.append(f"{shard}: duplicate (both a record and an unavailable marker)")
+                  continue
+              if has_marker:
+                  marker, error = load(directory / "unavailable.json")
+                  if (
+                      marker is None
+                      or marker.get("schema") != UNAVAILABLE_SCHEMA
+                      or marker.get("partition") != shard
+                      or not isinstance(marker.get("reason"), str)
+                      or not marker["reason"]
+                  ):
+                      unsafe.append(f"{shard}: malformed unavailable marker")
+                      continue
+                  unavailable[shard] = marker
+                  continue
+              expected, error = load(directory / "expected.json")
+              if expected is None:
+                  if not has_record:
+                      no_record(shard, "no expected.json and no record")
+                  else:
+                      unsafe.append(f"{shard}: expected.json {error}")
+                  continue
+              if (
+                  expected.get("schema") != EXPECTED_SCHEMA
+                  or expected.get("partition") != shard
+                  or expected.get("head_commit") != head
+                  or not isinstance(expected.get("protected_base_sha256"), str)
+                  or DIGEST.fullmatch(expected["protected_base_sha256"]) is None
+                  or not isinstance(expected.get("changed_paths_sha256"), str)
+                  or DIGEST.fullmatch(expected["changed_paths_sha256"]) is None
+              ):
+                  unsafe.append(f"{shard}: expected.json does not describe this leg at {head}")
+                  continue
+              if not has_record:
+                  no_record(shard, "no record; the audit did not finish or was killed")
+                  continue
+              record, error = load(directory / "record.json")
+              if record is None:
+                  unsafe.append(f"{shard}: record {error}")
+                  continue
+              partition = record.get("partition")
+              binding = record.get("binding")
+              if record.get("schema") != RECORD_SCHEMA:
+                  unsafe.append(f"{shard}: record has schema {record.get('schema')!r}")
+                  continue
+              if (
+                  not isinstance(partition, dict)
+                  or partition.get("key") != shard
+                  or partition.get("count") != len(matrix)
+              ):
+                  unsafe.append(f"{shard}: unbound (record partition {partition!r}, expected {shard!r} of {len(matrix)})")
+                  continue
+              if (
+                  not isinstance(binding, dict)
+                  or binding.get("head_commit") != expected["head_commit"]
+                  or binding.get("protected_base_sha256") != expected["protected_base_sha256"]
+                  or binding.get("changed_paths_sha256") != expected["changed_paths_sha256"]
+                  or not isinstance(binding.get("encoder_version"), str)
+                  or VERSION.fullmatch(binding["encoder_version"]) is None
+              ):
+                  unsafe.append(f"{shard}: unbound (record binding does not match this leg's inputs)")
+                  continue
+              verdict = record.get("verdict")
+              known = verdict if verdict in ("agree", "incremental_extra", "incremental_missed", "inconclusive") else "other"
+              verdicts[known] = verdicts.get(known, 0) + 1
+              incremental = record.get("incremental") if isinstance(record.get("incremental"), dict) else {}
+              rows.append(safe(
+                  f"| {shard} | {verdict} | {incremental.get('scope', '-')} | "
+                  f"{incremental.get('fallback_reason', '-')} | {binding['encoder_version']} |"
+              ))
+              if verdict not in SAFE or record.get("unsafe") is not False:
+                  missed = record.get("missed") if isinstance(record.get("missed"), list) else []
+                  errors = record.get("errors") if isinstance(record.get("errors"), list) else []
+                  detail = "; ".join(str(item) for item in (missed or errors)[:5])
+                  unsafe.append(f"{shard}: {verdict} (unsafe){': ' + detail if detail else ''}")
+
+          def shadow_off_is_expected(marker):
+              # Only a pinned verifier older than the shadow option may run
+              # without a shadow. A newer or main-mode verifier whose flag
+              # detection broke must be red.
+              if marker.get("reason") != "verifier-without-shadow":
+                  return False
+              if marker.get("verifier_mode") != "pinned":
+                  return False
+              version = marker.get("verifier_version")
+              match = VERSION.fullmatch(version) if isinstance(version, str) else None
+              return match is not None and tuple(int(part) for part in match.groups()) < FIRST_SHADOW_VERSION
+
+          off = False
+          if unavailable:
+              bad = {shard: marker for shard, marker in unavailable.items() if not shadow_off_is_expected(marker)}
+              for shard, marker in sorted(bad.items()):
+                  unsafe.append(
+                      f"{shard}: no shadow ({marker.get('reason')}; verifier "
+                      f"{marker.get('verifier_mode')} {marker.get('verifier_version')})"
+                  )
+              if not bad and len(unavailable) == len(matrix):
+                  off = True
+              elif not bad:
+                  # One run resolves one verifier, so a partial shadow is a defect.
+                  unsafe.append(
+                      "mixed: some legs did not run the shadow: "
+                      + ", ".join(sorted(unavailable))
+                  )
+
+          unsafe = [safe(item) for item in unsafe]
+          missing = [safe(item) for item in missing]
+          incomplete = [item for item in missing if ": incomplete " in item]
+          failing_missing = [item for item in missing if ": missing " in item]
+          tally = {
+              "matrix": len(matrix),
+              "records": len(rows),
+              "verdicts": verdicts,
+              "unavailable": len(unavailable),
+              "off": off,
+              "unsafe": len(unsafe),
+              "missing": len(failing_missing),
+              "incomplete": len(incomplete),
+              "validate_result": validate_result,
+              "untrusted": untrusted,
+          }
+          print("WAIVER_SHADOW_TALLY " + json.dumps(tally, sort_keys=True))
+
+          lines = ["### Incremental waiver audit shadow (report only)", ""]
+          if untrusted:
+              lines += [
+                  "**Untrusted evidence:** this pull request changes `.github/`, so it controls its "
+                  "caller workflow; the tally does not count this run.",
+                  "",
+              ]
+          if off and not unsafe and not missing:
+              versions = sorted({str(marker.get("verifier_version")) for marker in unavailable.values()})
+              lines.append(
+                  f"Shadow off on all {len(matrix)} legs: pinned verifier {', '.join(versions)} "
+                  "has no shadow option."
+              )
+              print(f"::notice::Waiver shadow off: pinned verifier {', '.join(versions)} has no shadow option.")
+          else:
+              if rows:
+                  lines += ["| Partition | Verdict | Selection | Fallback | Verifier |", "|---|---|---|---|---|", *rows, ""]
+              if unsafe:
+                  lines.append(f"**Unsafe ({len(unsafe)}):**")
+                  lines += [f"- {problem}" for problem in unsafe]
+              if failing_missing:
+                  lines.append(f"**Missing ({len(failing_missing)}):**")
+                  lines += [f"- {problem}" for problem in failing_missing]
+              if incomplete:
+                  lines.append(f"Incomplete ({len(incomplete)}), validation matrix {validate_result}:")
+                  lines += [f"- {problem}" for problem in incomplete]
+              if not unsafe and not missing:
+                  lines.append(f"All {len(matrix)} partitions agree.")
+          text = "\n".join(lines) + "\n"
+          print(text)
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as handle:
+                  handle.write(text)
+          for problem in incomplete[:50]:
+              print(f"::warning::Waiver shadow: {problem}")
+          if unsafe or failing_missing:
+              for problem in (unsafe + failing_missing)[:50]:
+                  print(f"::error::Waiver shadow: {problem}")
+              sys.exit(1)
+          PYCOLLECT
+          # waiver-shadow-collector-end
