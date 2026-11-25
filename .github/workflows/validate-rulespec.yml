@@ -1025,13 +1025,15 @@ jobs:
           # (engine, corpus, composer, workflow) stays a full gate.
           # The floor is enforced by the generated guard; without the guard a
           # floor-only change keeps the full dependency bump.
-          # A change of the hold alone (or with the floor) is treated the same
-          # way: it changes only which encoder-main commit verifies.
+          # A change of the hold is NOT floor-only: it changes which encoder
+          # verifies every file and waiver, so it is a full dependency bump
+          # (every file, every waiver, the protected-base manifest audit) and
+          # a hold move cannot reach main without that full run.
           encoder_hold = verifier_hold(pins)
           encoder_floor_only = (
               encoder_verifier == "main"
               and bool(dependency_changes)
-              and set(dependency_changes) <= {"axiom_encode_ref", "encoder_verifier_hold"}
+              and set(dependency_changes) <= {"axiom_encode_ref"}
               and os.environ.get("RUN_GENERATED_GUARD") == "true"
           )
           dependency_pins_changed = bool(dependency_changes) and not encoder_floor_only
@@ -6434,7 +6436,7 @@ jobs:
           fi
 
           # encoder-floor-ratchet-start
-          # A floor or hold change (encoder-main mode, configuration only)
+          # A floor-only change (encoder-main mode, configuration only)
           # checks every manifest (--all) with the head verifier, once at the
           # base floor and once at the new floor. Only issues new at the new
           # floor fail: moving the floor revokes the producers below it, and

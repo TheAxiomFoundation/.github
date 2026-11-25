@@ -259,11 +259,11 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   validation. "Authenticate dependency commits" checks in workflow shell,
   before any verifier code runs, that the verifier (tip or hold) is on
   first-parent `main` at or after the floor; "Record the encoder-main
-  verifier" records it. A change of only the hold (or of the hold and the
-  floor) is treated like a floor-only change: first shard, the ordinary
-  guard, and the guard ratchet with `--all`. It does not revalidate every
-  file under the new verifier, so dispatch a full drift run after a hold
-  change. With another pin it is a full dependency bump. A hold in `pinned`
+  verifier" records it. A change of the hold (alone, with the floor or with
+  another pin) is a full dependency bump: every file and every waiver is
+  checked under the new verifier before the change can merge. Only a
+  floor-only change runs the first shard and the guard ratchet with `--all`,
+  because the floor changes no verifier. A hold in `pinned`
   mode, or a value that is not a full commit, fails. Remove the hold to
   return to the `main` tip.
 - With `import-aware-selection`, a ledger-only change still selects the full

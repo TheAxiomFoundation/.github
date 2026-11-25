@@ -293,17 +293,25 @@ def test_dependency_step_reports_a_floor_only_encoder_pin_change() -> None:
     assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
 
 
-def test_a_hold_change_is_an_encoder_only_change() -> None:
+def test_a_hold_change_is_a_full_dependency_bump() -> None:
+    # The hold picks the verifier of every file and waiver, so moving it must
+    # run everything before merge (a floor move changes no verifier).
     hold = {"encoder_verifier_hold": "7" * 40}
     result, bound = run_dependency_step(
         base_mode="main", head_mode="main", requested="main", pin_changes=hold,
     )
     assert result.returncode == 0, result.stderr
-    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("true", "false")
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
     assert bound["encoder_verifier_hold"] == "7" * 40
     result, bound = run_dependency_step(
         base_mode="main", head_mode="main", requested="main",
         pin_changes={**hold, "axiom_encode_ref": "9" * 40},
+    )
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+    # The floor alone stays floor-only.
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main",
+        pin_changes={"axiom_encode_ref": "9" * 40},
     )
     assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("true", "false")
     # With another pin it stays a full dependency bump.
