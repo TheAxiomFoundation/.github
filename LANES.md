@@ -4,20 +4,20 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-25 — Merge pull request #2388 from TheAxiomFoundation/claude/az-snap-program-scope-sync | 87 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | success |
-| [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-11-11 — Merge pull request #19 from TheAxiomFoundation/hub/repin-encoder-ffa8f3f1 | 1 | ng-rulespec-2026-07-22 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
-| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-11-11 — Merge pull request #25 from TheAxiomFoundation/hub/repin-encoder-ffa8f3f1 | 1 | et-rulespec-2026-07-12 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
-| [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-11-11 — Merge pull request #26 from TheAxiomFoundation/hub/repin-encoder-ffa8f3f1 | 1 | rw-rulespec-2026-07-16 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
-| [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-11-11 — Merge pull request #33 from TheAxiomFoundation/hub/repin-encoder-ffa8f3f1 | 2 | tz-rulespec-2026-07-21 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
-| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-08 — Merge pull request #137 from TheAxiomFoundation/nzhub/engine-89571cc2 | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
-| [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-11-07 — Rename Populace to Microcosm in prose and code (#139) | 3 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-05 — Point the UK CTR README at the release #538 bound (#539) | 39 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
-| [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-10-27 — Merge pull request #29 from TheAxiomFoundation/engine-pin/32bc1c12 | 2 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-10-27 — Merge pull request #26 from TheAxiomFoundation/engine-pin/32bc1c12 | 2 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-10-27 — Merge pull request #43 from TheAxiomFoundation/engine-pin/32bc1c12 | 2 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
-| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-10-27 — Merge pull request #107 from TheAxiomFoundation/engine-pin/32bc1c12 | 2 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
-| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-09-17 — License the corpus: CC BY 4.0 encodings + Apache-2.0 tooling (#225) | 180 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
-| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-07-23 — Merge pull request #22 from TheAxiomFoundation/ci/keyring-validate-pins | 7 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-11-25 — Merge pull request #34 from TheAxiomFoundation/waivers/renew-pending-2026-11 | 9 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | failure |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-25 — Relicense encodings under CC0 1.0 (#2405) | 105 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | queued |
+| [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-25 — Relicense encodings under CC0 1.0 (#547) | 39 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | failure |
+| [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-25 — Relicense under CC0 1.0 (#147) | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
+| [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-11-25 — Relicense encodings under CC0 1.0 (#148) | 3 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [tz](https://github.com/TheAxiomFoundation/rulespec-tz) | 2026-11-25 — Relicense encodings under CC0 1.0 (#34) | 2 | tz-rulespec-2026-07-21 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
+| [rw](https://github.com/TheAxiomFoundation/rulespec-rw) | 2026-11-25 — Relicense encodings under CC0 1.0 (#28) | 1 | rw-rulespec-2026-07-16 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
+| [ng](https://github.com/TheAxiomFoundation/rulespec-ng) | 2026-11-25 — Relicense encodings under CC0 1.0 (#21) | 1 | ng-rulespec-2026-07-22 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
+| [et](https://github.com/TheAxiomFoundation/rulespec-et) | 2026-11-25 — Relicense encodings under CC0 1.0 (#27) | 1 | et-rulespec-2026-07-12 | ffa8f3f1d7fef9e26a3d4d2ab0ebe78a40b546cb | success |
+| [ug](https://github.com/TheAxiomFoundation/rulespec-ug) | 2026-11-25 — Relicense encodings under CC0 1.0 (#29) | 2 | ug-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [zm](https://github.com/TheAxiomFoundation/rulespec-zm) | 2026-11-25 — Relicense encodings under CC0 1.0 (#33) | 2 | zm-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [gh](https://github.com/TheAxiomFoundation/rulespec-gh) | 2026-11-25 — Relicense encodings under CC0 1.0 (#46) | 2 | gh-rulespec-2026-07-12 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [dk](https://github.com/TheAxiomFoundation/rulespec-dk) | 2026-11-25 — Relicense encodings under CC0 1.0 (#229) | 180 | dk-rulespec-2026-08-07 | a4599841fa86d608236923c759558d1f21be9d09 | success |
+| [de](https://github.com/TheAxiomFoundation/rulespec-de) | 2026-11-25 — Relicense encodings under CC0 1.0 (#110) | 2 | de-rulespec-2026-09-15-kindergeld-priority-followup | 549458579b0b1868fc84ce3494bb150d89061b7c | success |
 
 <!-- curated:start -->
 ## Lane ownership and standing constraints (curated — edit by PR only)
