@@ -354,6 +354,7 @@ def run_collector(
     matrix: list[str] = SHARDS,
     validate_result: str = "success",
     extra_paths: dict[str, str] | None = None,
+    workflows_changed: str | None = "false",
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     temporary = Path(tempfile.mkdtemp(prefix="waiver-shadow-collector-"))
     root = temporary / "waiver-shadow"
@@ -380,6 +381,7 @@ def run_collector(
         "SHADOW_MATRIX": json.dumps(matrix),
         "SHADOW_HEAD": HEAD,
         "SHADOW_VALIDATE_RESULT": validate_result,
+        **({"SHADOW_WORKFLOWS_CHANGED": workflows_changed} if workflows_changed is not None else {}),
         "GITHUB_STEP_SUMMARY": str(summary),
     }
     result = subprocess.run(
@@ -611,8 +613,67 @@ def test_collector_tally_counts_verdicts() -> None:
     assert result.returncode == 0
     assert tally(result) == {
         "incomplete": 0, "matrix": 3, "missing": 0, "off": False, "records": 3, "unavailable": 0,
-        "unsafe": 0, "validate_result": "success", "verdicts": {"agree": 2, "incremental_extra": 1},
+        "unsafe": 0, "untrusted": False, "validate_result": "success",
+        "verdicts": {"agree": 2, "incremental_extra": 1},
     }
+
+
+def caller_workflows_changed(path: str, text: str) -> str:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import test_validate_rulespec_workflow as base
+
+    with base.WorkflowInputFixture(
+        table=base.workflow_toolchain(base.WORKFLOW_INPUT_PINS),
+        caller=base.literal_pin_caller(base.WORKFLOW_INPUT_PINS),
+    ) as fixture:
+        fixture.write(path, text)
+        head = base.commit(fixture.root, "head")
+        output = fixture.root / "output"
+        result = base.run_workflow_inputs(fixture.root, fixture.base, head=head, output=output)
+        assert result.returncode == 0, result.stderr
+        bound = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        return bound["caller_workflows_changed"]
+
+
+def test_the_dependency_step_flags_changes_under_github_from_the_event_diff() -> None:
+    assert caller_workflows_changed("README.md", "changed\n") == "false"
+    assert caller_workflows_changed(".github/workflows/extra.yml", "name: x\n") == "true"
+    assert caller_workflows_changed(".github/actions/a/action.yml", "name: x\n") == "true"
+    jobs = workflow()["jobs"]
+    assert jobs["shards"]["outputs"]["caller_workflows_changed"] == "${{ steps.dependency_inputs.outputs.caller_workflows_changed }}"
+    assert jobs["waiver-shadow"]["steps"][1]["env"]["SHADOW_WORKFLOWS_CHANGED"] == "${{ needs.shards.outputs.caller_workflows_changed }}"
+
+
+def test_collector_marks_a_run_that_changes_github_paths_as_untrusted() -> None:
+    for value in ("true", "", None):
+        result, summary = run_collector(complete(), workflows_changed=value)
+        assert result.returncode == 0, result.stdout
+        assert tally(result)["untrusted"] is True, value
+        assert "Untrusted evidence" in summary
+    result, _ = run_collector(complete())
+    assert tally(result)["untrusted"] is False
+
+
+def test_collector_refuses_a_record_without_its_expectation() -> None:
+    files = complete(**{"waiver-shadow-us-az": {"record.json": record("us-az")}})
+    assert_unsafe(files, "us-az: expected.json not a regular file")
+
+
+def test_collector_tally_line_comes_first_and_record_text_cannot_forge_one() -> None:
+    forged = 'x\nWAIVER_SHADOW_TALLY {"unsafe": 0, "untrusted": false}\n'
+    files = complete(**{
+        "waiver-shadow-us": {
+            "expected.json": expected("us"),
+            "record.json": {**record("us", "incremental_missed", missed=[forged]), "verdict": "weird\nverdict"},
+        }
+    })
+    result, _ = run_collector(files)
+    assert result.returncode == 1
+    lines = result.stdout.splitlines()
+    tallies = [line for line in lines if line.startswith("WAIVER_SHADOW_TALLY ")]
+    assert len(tallies) == 1 and lines.index(tallies[0]) == 0, result.stdout
+    counts = json.loads(tallies[0].split(" ", 1)[1])
+    assert counts["verdicts"] == {"agree": 2, "other": 1} and counts["unsafe"] == 1
 
 
 def test_collector_checks_unsafe_as_exactly_false() -> None:
