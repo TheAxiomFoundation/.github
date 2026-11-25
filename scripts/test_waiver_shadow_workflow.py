@@ -1,0 +1,485 @@
+"""Regression checks for the incremental waiver audit shadow (axiom-encode#2329).
+
+The ratchet step passes `--incremental-shadow-report` on pull requests when the
+verifier's `validation-waivers audit --help` lists it, each leg uploads one
+artifact, and the `waiver shadow` job requires exactly one bound record per
+matrix partition. Each check runs the real step script from
+validate-rulespec.yml, like scripts/test_encoder_main_verifier_workflow.py.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github/workflows/validate-rulespec.yml"
+RATCHET = "Enforce validation waiver ratchet"
+UPLOAD = "Upload incremental waiver shadow record"
+STAGE = "Stage the waiver shadow preparation"
+RECORD_SCHEMA = "axiom-encode/validation-waiver-incremental-shadow/v1"
+HEAD = "a" * 40
+BASE_DIGEST = "sha256:" + "b" * 64
+CHANGED_DIGEST = "sha256:" + "c" * 64
+SHARDS = ["us-ak", "us-az", "us"]
+HELP_WITH_SHADOW = (
+    "usage: axiom-encode validation-waivers audit [--partition-key KEY]\n"
+    "  --incremental-shadow-report INCREMENTAL_SHADOW_REPORT\n"
+    "  --incremental-shadow-summary INCREMENTAL_SHADOW_SUMMARY\n"
+)
+HELP_WITHOUT_SHADOW = "usage: axiom-encode validation-waivers audit [--partition-key KEY]\n"
+
+
+def workflow() -> dict:
+    return yaml.safe_load(WORKFLOW.read_text())
+
+
+def validate_step(name: str) -> dict:
+    steps = workflow()["jobs"]["validate"]["steps"]
+    return next(step for step in steps if step.get("name") == name)
+
+
+def between(text: str, start: str, end: str) -> str:
+    assert text.count(start) == 1 and text.count(end) == 1, (start, end)
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def bash() -> str:
+    # The shadow block needs only Bash 3.2 features; CI runs Bash 5.
+    return shutil.which("bash") or "/bin/bash"
+
+
+# Workflow shape -------------------------------------------------------------
+
+
+def test_the_ratchet_passes_the_shadow_only_through_the_probed_block() -> None:
+    step = validate_step(RATCHET)
+    run = step["run"]
+    block = between(run, "# waiver-shadow-start", "# waiver-shadow-end")
+    assert '[ "$EVENT_NAME" = "pull_request" ]' in block
+    assert "--incremental-shadow-report" in block and "--incremental-shadow-summary" in block
+    # The probe result of the same supervised verifier decides (staged script).
+    assert '"$audit_help"' in block
+    assert 'bash "$RUNNER_TEMP/waiver-shadow-prepare.sh"' in block
+    assert "${{" not in block
+    assert step["env"]["SHADOW_SHARD"] == "${{ matrix.shard }}"
+    # The scope stays full: the shadow never adds --scope.
+    assert "--scope" not in run
+    after = run.split("# waiver-shadow-end", 1)[1]
+    assert '"${shadow_args[@]}"' in after
+    assert after.index('"${restate_args[@]}"') < after.index('"${shadow_args[@]}"')
+    # The record lives outside the checkout and every audit input.
+    assert '"$RUNNER_TEMP/waiver-shadow/record.json"' in block
+    assert "GITHUB_WORKSPACE" not in block
+
+
+def test_the_preparation_is_staged_before_the_ratchet_without_expressions() -> None:
+    steps = workflow()["jobs"]["validate"]["steps"]
+    names = [step.get("name") for step in steps]
+    # Directly before the restate stage, which must stay next to the ratchet.
+    assert names.index(STAGE) == names.index("Stage the verifier restate check") - 1
+    assert names.index("Stage the verifier restate check") == names.index(RATCHET) - 1
+    stage = steps[names.index(STAGE)]
+    assert "if" not in stage
+    assert "${{" not in stage["run"]
+    assert 'shadow_dir="$RUNNER_TEMP/waiver-shadow"' in stage["run"]
+
+
+def test_each_leg_uploads_one_artifact_on_pull_requests_even_after_a_failure() -> None:
+    steps = workflow()["jobs"]["validate"]["steps"]
+    names = [step.get("name") for step in steps]
+    upload = steps[names.index(UPLOAD)]
+    assert names.index(UPLOAD) == names.index(RATCHET) + 1
+    assert upload["if"] == "${{ always() && github.event_name == 'pull_request' }}"
+    assert upload["uses"].startswith("actions/upload-artifact@")
+    assert len(upload["uses"].split("@", 1)[1].split()[0]) == 40
+    assert upload["with"]["name"] == "waiver-shadow-${{ matrix.shard }}"
+    assert upload["with"]["path"] == "${{ runner.temp }}/waiver-shadow/"
+
+
+def test_the_collector_is_separate_from_the_required_aggregate() -> None:
+    jobs = workflow()["jobs"]
+    collector = jobs["waiver-shadow"]
+    assert collector["name"] == "waiver shadow"
+    assert collector["needs"] == ["shards", "validate"]
+    assert "github.event_name == 'pull_request'" in collector["if"]
+    assert "always()" in collector["if"]
+    assert collector["permissions"] == {"contents": read_only()}
+    # `validate / validate` (the required context) does not wait for it.
+    assert jobs["validate-complete"]["needs"] == "validate"
+    assert jobs["validate-complete"]["name"] == "validate"
+    download = collector["steps"][0]
+    assert download["uses"].startswith("actions/download-artifact@")
+    assert download["with"]["pattern"] == "waiver-shadow-*"
+    check = collector["steps"][1]
+    assert check["env"]["SHADOW_MATRIX"] == "${{ needs.shards.outputs.matrix }}"
+    assert check["env"]["SHADOW_HEAD"] == "${{ github.sha }}"
+    assert "${{" not in check["run"]
+
+
+def read_only() -> str:
+    return "read"
+
+
+# Ratchet shadow block -------------------------------------------------------
+
+
+def run_shadow_block(
+    *,
+    event: str = "pull_request",
+    help_text: str = HELP_WITH_SHADOW,
+    partitioned: bool = True,
+    comparison_base: str = "1" * 40,
+    base_ref: str = "1" * 40,
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    stage = validate_step(STAGE)["run"]
+    block = between(
+        validate_step(RATCHET)["run"], "# waiver-shadow-start", "# waiver-shadow-end"
+    )
+    temporary = Path(tempfile.mkdtemp(prefix="waiver-shadow-block-"))
+    repo = temporary / "rulespec-us"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=T",
+         "commit", "-q", "--allow-empty", "-m", "head"],
+        check=True,
+    )
+    runner_temp = temporary / "runner-temp"
+    runner_temp.mkdir()
+    (runner_temp / "help.txt").write_text(help_text)
+    (runner_temp / "base.yaml").write_text("validate_failures: {}\n")
+    (runner_temp / "changed.txt").write_text("us-az/policies/x.yaml\n")
+    summary = temporary / "summary.md"
+    summary.write_text("")
+    partition = "partition_args=(--partition-key us-az --partition-keys-json '[]')" if partitioned else "partition_args=()"
+    script = stage + f"""
+set -euo pipefail
+audit_help="$RUNNER_TEMP/help.txt"
+protected_base="$RUNNER_TEMP/base.yaml"
+audit_changed_paths="$RUNNER_TEMP/changed.txt"
+comparison_base="{comparison_base}"
+base_ref="{base_ref}"
+{partition}
+{block}
+printf 'ARGS:'
+for arg in ${{shadow_args[@]+"${{shadow_args[@]}}"}}; do printf ' %s' "$arg"; done
+printf '\\n'
+"""
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(temporary),
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "EVENT_NAME": event,
+        "SHADOW_SHARD": "us-az",
+    }
+    result = subprocess.run(
+        [bash(), "-c", script], cwd=repo, env=env, capture_output=True, text=True
+    )
+    args_line = next(
+        (line for line in result.stdout.splitlines() if line.startswith("ARGS:")), "ARGS:"
+    )
+    return result, runner_temp / "waiver-shadow", args_line[len("ARGS:"):].split()
+
+
+def test_shadow_block_passes_the_flags_and_writes_the_expected_binding() -> None:
+    result, directory, args = run_shadow_block()
+    assert result.returncode == 0, result.stderr
+    assert args[0] == "--incremental-shadow-report"
+    assert args[1] == str(directory / "record.json")
+    assert args[2] == "--incremental-shadow-summary"
+    assert sorted(item.name for item in directory.iterdir()) == ["expected.json"]
+    expected = json.loads((directory / "expected.json").read_text())
+    head = subprocess.run(
+        ["git", "-C", str(directory.parent.parent / "rulespec-us"), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert expected == {
+        "schema": "validate-rulespec/waiver-shadow-expected/v1",
+        "partition": "us-az",
+        "head_commit": head,
+        "protected_base_sha256": "sha256:" + hashlib.sha256(b"validate_failures: {}\n").hexdigest(),
+        "changed_paths_sha256": "sha256:" + hashlib.sha256(b"us-az/policies/x.yaml\n").hexdigest(),
+    }
+
+
+def test_shadow_block_does_nothing_outside_pull_requests() -> None:
+    for event in ("push", "schedule", "workflow_dispatch", "merge_group"):
+        result, directory, args = run_shadow_block(event=event)
+        assert result.returncode == 0, result.stderr
+        assert args == []
+        assert not directory.exists()
+        assert (directory.parent / "waiver-shadow-prepare.sh").is_file()
+
+
+def assert_marker(reason: str, **options) -> None:
+    result, directory, args = run_shadow_block(**options)
+    assert result.returncode == 0, result.stderr
+    assert args == []
+    assert sorted(item.name for item in directory.iterdir()) == ["expected.json", "unavailable.json"]
+    marker = json.loads((directory / "unavailable.json").read_text())
+    assert marker == {
+        "schema": "validate-rulespec/waiver-shadow-unavailable/v1",
+        "partition": "us-az",
+        "reason": reason,
+    }
+
+
+def test_a_verifier_without_the_option_leaves_a_marker_not_a_flag() -> None:
+    assert_marker("verifier-without-shadow", help_text=HELP_WITHOUT_SHADOW)
+    # A help that names only one of the two options is not enough.
+    assert_marker(
+        "verifier-without-shadow",
+        help_text=HELP_WITHOUT_SHADOW + "  --incremental-shadow-report-old X\n",
+    )
+
+
+def test_an_unpartitioned_audit_or_another_comparison_base_leaves_a_marker() -> None:
+    assert_marker("unpartitioned-audit", partitioned=False)
+    assert_marker("comparison-base-differs-from-event-base", comparison_base="2" * 40)
+
+
+# Collector ------------------------------------------------------------------
+
+
+def collector_script() -> str:
+    run = workflow()["jobs"]["waiver-shadow"]["steps"][1]["run"]
+    return run
+
+
+def record(shard: str, verdict: str = "agree", **changes) -> dict:
+    value = {
+        "schema": RECORD_SCHEMA,
+        "report_only": True,
+        "verdict": verdict,
+        "unsafe": verdict not in ("agree", "incremental_extra"),
+        "missed": ["us/statutes/x.yaml"] if verdict == "incremental_missed" else [],
+        "extra": [],
+        "errors": ["the full audit did not complete"] if verdict == "inconclusive" else [],
+        "partition": {"key": shard, "count": len(SHARDS)},
+        "binding": {
+            "encoder_version": "0.2.2396",
+            "head_commit": HEAD,
+            "github_sha": None,
+            "protected_base_sha256": BASE_DIGEST,
+            "changed_paths_sha256": CHANGED_DIGEST,
+        },
+        "full": {"checked": 37, "flagged": 0, "success": True},
+        "incremental": {"scope": "incremental", "selected": 3, "unselected": 34, "flagged": 0},
+    }
+    value.update(changes)
+    return value
+
+
+def expected(shard: str, **changes) -> dict:
+    value = {
+        "schema": "validate-rulespec/waiver-shadow-expected/v1",
+        "partition": shard,
+        "head_commit": HEAD,
+        "protected_base_sha256": BASE_DIGEST,
+        "changed_paths_sha256": CHANGED_DIGEST,
+    }
+    value.update(changes)
+    return value
+
+
+def run_collector(
+    files: dict[str, dict[str, dict]],
+    *,
+    matrix: list[str] = SHARDS,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    temporary = Path(tempfile.mkdtemp(prefix="waiver-shadow-collector-"))
+    root = temporary / "waiver-shadow"
+    root.mkdir()
+    for artifact, contents in files.items():
+        directory = root / artifact
+        directory.mkdir()
+        for name, payload in contents.items():
+            (directory / name).write_text(json.dumps(payload))
+    summary = temporary / "summary.md"
+    summary.write_text("")
+    env = {
+        "PATH": os.environ["PATH"],
+        "SHADOW_ROOT": str(root),
+        "SHADOW_MATRIX": json.dumps(matrix),
+        "SHADOW_HEAD": HEAD,
+        "SHADOW_VALIDATE_RESULT": "success",
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    result = subprocess.run(
+        [bash(), "-c", collector_script()], env=env, capture_output=True, text=True
+    )
+    return result, summary.read_text()
+
+
+def complete(**overrides: dict[str, dict]) -> dict[str, dict[str, dict]]:
+    files = {
+        f"waiver-shadow-{shard}": {"expected.json": expected(shard), "record.json": record(shard)}
+        for shard in SHARDS
+    }
+    files.update(overrides)
+    return files
+
+
+def assert_unsafe(files: dict, needle: str, **options) -> None:
+    result, summary = run_collector(files, **options)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert needle in result.stdout, (needle, result.stdout)
+    assert needle in summary
+
+
+def test_collector_passes_when_every_partition_agrees() -> None:
+    result, summary = run_collector(complete())
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "All 3 partitions agree." in summary
+    assert "| us-az | agree | incremental | - | 0.2.2396 |" in summary
+
+
+def test_collector_accepts_incremental_extra_as_safe() -> None:
+    files = complete(**{
+        "waiver-shadow-us": {
+            "expected.json": expected("us"),
+            "record.json": record("us", "incremental_extra", extra=["us/statutes/y.yaml"]),
+        }
+    })
+    result, _ = run_collector(files)
+    assert result.returncode == 0, result.stdout
+
+
+def test_collector_fails_on_incremental_missed() -> None:
+    files = complete(**{
+        "waiver-shadow-us": {"expected.json": expected("us"), "record.json": record("us", "incremental_missed")}
+    })
+    assert_unsafe(files, "us: incremental_missed (unsafe): us/statutes/x.yaml")
+
+
+def test_collector_fails_on_inconclusive() -> None:
+    files = complete(**{
+        "waiver-shadow-us-az": {"expected.json": expected("us-az"), "record.json": record("us-az", "inconclusive")}
+    })
+    assert_unsafe(files, "us-az: inconclusive (unsafe)")
+    # The verdict alone decides: an inconclusive record is unsafe even if its
+    # `unsafe` field says otherwise.
+    for verdict in ("inconclusive", "incremental_missed", "unknown", None):
+        files = complete(**{
+            "waiver-shadow-us-az": {
+                "expected.json": expected("us-az"),
+                "record.json": {**record("us-az"), "verdict": verdict, "unsafe": False},
+            }
+        })
+        assert_unsafe(files, f"us-az: {verdict} (unsafe)")
+
+
+def test_collector_fails_on_a_record_that_claims_safe_but_is_marked_unsafe() -> None:
+    files = complete(**{
+        "waiver-shadow-us-az": {"expected.json": expected("us-az"), "record.json": record("us-az", unsafe=True)}
+    })
+    assert_unsafe(files, "us-az: agree (unsafe)")
+
+
+def test_collector_fails_on_a_missing_leg_or_a_leg_without_a_record() -> None:
+    files = complete()
+    del files["waiver-shadow-us-ak"]
+    assert_unsafe(files, "us-ak: missing (the leg uploaded no shadow artifact)")
+    files = complete(**{"waiver-shadow-us-ak": {"expected.json": expected("us-ak")}})
+    assert_unsafe(files, "us-ak: missing (no record")
+    assert_unsafe({}, "us-ak: missing")
+
+
+def test_collector_fails_on_a_duplicate_or_foreign_artifact() -> None:
+    files = complete(**{
+        "waiver-shadow-us-az": {
+            "expected.json": expected("us-az"),
+            "record.json": record("us-az"),
+            "unavailable.json": {
+                "schema": "validate-rulespec/waiver-shadow-unavailable/v1",
+                "partition": "us-az",
+                "reason": "verifier-without-shadow",
+            },
+        }
+    })
+    assert_unsafe(files, "us-az: duplicate")
+    files = complete(**{"waiver-shadow-us-zz": {"expected.json": expected("us-zz"), "record.json": record("us-zz")}})
+    assert_unsafe(files, "us-zz: artifact for a partition that is not in the matrix")
+    files = complete(**{
+        "waiver-shadow-us-az": {
+            "expected.json": expected("us-az"), "record.json": record("us-az"), "record-2.json": record("us-az"),
+        }
+    })
+    assert_unsafe(files, "us-az: unexpected files")
+
+
+def test_collector_fails_on_an_unbound_record() -> None:
+    cases = {
+        "partition key": record("us-az", partition={"key": "us-ak", "count": 3}),
+        "partition count": record("us-az", partition={"key": "us-az", "count": 52}),
+        "unpartitioned": record("us-az", partition={"key": None, "count": 1}),
+        "head": record("us-az", binding={**record("us-az")["binding"], "head_commit": "f" * 40}),
+        "no head": record("us-az", binding={**record("us-az")["binding"], "head_commit": None}),
+        "base ledger": record("us-az", binding={**record("us-az")["binding"], "protected_base_sha256": "sha256:" + "d" * 64}),
+        "changed paths": record("us-az", binding={**record("us-az")["binding"], "changed_paths_sha256": None}),
+        "no binding": {key: value for key, value in record("us-az").items() if key != "binding"},
+        "schema": record("us-az", schema="axiom-encode/validation-waiver-incremental-shadow/v0"),
+    }
+    for label, payload in cases.items():
+        files = complete(**{"waiver-shadow-us-az": {"expected.json": expected("us-az"), "record.json": payload}})
+        result, _ = run_collector(files)
+        assert result.returncode == 1, label
+        assert "us-az:" in result.stdout, (label, result.stdout)
+
+
+def test_collector_refuses_an_expectation_for_another_head() -> None:
+    files = complete(**{
+        "waiver-shadow-us-az": {"expected.json": expected("us-az", head_commit="e" * 40), "record.json": record("us-az")}
+    })
+    assert_unsafe(files, "us-az: expected.json does not describe this leg")
+
+
+def unavailable(shard: str, reason: str = "verifier-without-shadow") -> dict[str, dict]:
+    return {
+        "expected.json": expected(shard),
+        "unavailable.json": {
+            "schema": "validate-rulespec/waiver-shadow-unavailable/v1",
+            "partition": shard,
+            "reason": reason,
+        },
+    }
+
+
+def test_collector_passes_with_a_notice_when_the_verifier_has_no_shadow() -> None:
+    files = {f"waiver-shadow-{shard}": unavailable(shard) for shard in SHARDS}
+    result, summary = run_collector(files)
+    assert result.returncode == 0, result.stdout
+    assert "::notice::Waiver shadow off on every leg (verifier-without-shadow)." in result.stdout
+    assert "Shadow not run on any of 3 legs" in summary
+
+
+def test_collector_fails_when_only_some_legs_ran_the_shadow() -> None:
+    files = complete(**{"waiver-shadow-us": unavailable("us")})
+    assert_unsafe(files, "mixed: some legs did not run the shadow: us (verifier-without-shadow)")
+
+
+def test_collector_refuses_a_malformed_matrix() -> None:
+    for matrix in ([], ["us", "us"], [""]):
+        result, _ = run_collector(complete(), matrix=matrix)
+        assert result.returncode == 1, matrix
+
+
+def main() -> None:
+    for name, function in sorted(globals().items()):
+        if name.startswith("test_") and callable(function):
+            function()
+            print(f"{name}: ok")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
