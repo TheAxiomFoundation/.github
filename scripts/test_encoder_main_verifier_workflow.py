@@ -24,6 +24,8 @@ import test_validate_rulespec_workflow as base  # noqa: E402
 WORKFLOW = base.WORKFLOW
 MAIN_SHA = "9" * 40
 LEDGER = "known-validation-gaps.yaml"
+# main mode requires a hold; fixtures in main mode get this one unless a test sets its own.
+DEFAULT_HOLD = "6" * 40
 
 
 @contextmanager
@@ -237,10 +239,13 @@ def test_ledger_change_outside_validate_failures_keeps_default_selection() -> No
 
 def run_dependency_step(
     *, base_mode: str | None, head_mode: str | None, requested: str,
-    pin_changes: dict[str, str], guard: str = "true",
+    pin_changes: dict[str, str], guard: str = "true", head_hold: bool = True,
+    head_validator: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
-    def table(mode, pins):
+    def table(mode, pins, *, hold=True):
         extra = {"encoder_verifier": mode} if mode else {}
+        if mode == "main" and hold and "encoder_verifier_hold" not in pins:
+            extra["encoder_verifier_hold"] = DEFAULT_HOLD
         return base.workflow_toolchain({**pins, **extra})
 
     with base.WorkflowInputFixture(
@@ -256,8 +261,13 @@ def run_dependency_step(
             **base.WORKFLOW_INPUT_PINS,
             **{key: value for key, value in pin_changes.items() if key not in table_only},
         }
-        fixture.write(base.WORKFLOW_TOOLCHAIN, table(head_mode, {**proposed, **table_only}))
-        if not pin_changes and base_mode == head_mode:
+        fixture.write(base.WORKFLOW_TOOLCHAIN, table(head_mode, {**proposed, **table_only}, hold=head_hold))
+        if head_validator is not None:
+            fixture.write(
+                base.VALIDATION_CALLER,
+                base.literal_pin_caller(proposed).replace("@" + "a" * 40, "@" + head_validator),
+            )
+        if not pin_changes and base_mode == head_mode and head_hold:
             fixture.write("fixture.txt", "head\n")  # a commit with no pin change
         head = base.commit(fixture.root, "configuration change")
         output = fixture.root / "output"
@@ -320,12 +330,39 @@ def test_a_hold_change_is_a_full_dependency_bump() -> None:
         pin_changes={**hold, "axiom_rules_engine_ref": "4" * 40},
     )
     assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
-    # No hold: the output is empty.
+    # An unchanged hold is passed through (main mode always has one).
     result, bound = run_dependency_step(
         base_mode="main", head_mode="main", requested="main", pin_changes={},
     )
     assert result.returncode == 0, result.stderr
-    assert bound["encoder_verifier_hold"] == ""
+    assert bound["encoder_verifier_hold"] == DEFAULT_HOLD
+
+
+def test_main_mode_without_a_hold_fails_closed() -> None:
+    for base_mode in ("pinned", "main"):
+        result, _ = run_dependency_step(
+            base_mode=base_mode, head_mode="main", requested="main", pin_changes={}, head_hold=False,
+        )
+        assert result.returncode != 0, base_mode
+        assert 'encoder_verifier = "main" requires encoder_verifier_hold' in result.stderr, result.stderr
+
+
+def test_floor_beside_a_corpus_or_validator_pin_is_a_full_dependency_bump() -> None:
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main",
+        pin_changes={"axiom_encode_ref": "9" * 40, "axiom_corpus_ref": "3" * 40},
+    )
+    assert result.returncode == 0, result.stderr
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
+
+
+def test_floor_beside_a_shared_validator_move_is_a_full_dependency_bump() -> None:
+    result, bound = run_dependency_step(
+        base_mode="main", head_mode="main", requested="main",
+        pin_changes={"axiom_encode_ref": "9" * 40}, head_validator="b" * 40,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (bound["encoder_floor_only"], bound["dependency_pins_changed"]) == ("false", "true")
 
 
 def test_an_invalid_hold_fails_closed() -> None:
@@ -682,6 +719,50 @@ def test_forward_floor_check_survives_a_long_history() -> None:
         assert run_floor_direction_check(commits, commits - 2, commits // 2) == 1
 
 
+def test_forward_floor_check_refuses_a_floor_off_the_first_parent_chain() -> None:
+    """A floor merged from a side branch is an ancestor of main but not first-parent."""
+
+    workflow = WORKFLOW.read_text()
+    block = workflow[
+        workflow.index("            if [ \"${ENCODER_FLOOR_ONLY:-false}\" = \"true\" ] || "):
+        workflow.index("            fi\n          fi\n          # encoder-main-verifier-guard-end")
+    ]
+    with tempfile.TemporaryDirectory(prefix="floor-side-") as directory:
+        root = Path(directory)
+        history = root / "deps" / "axiom-encode"
+        history.mkdir(parents=True)
+        base.git(history, "init", "-q", "-b", "main")
+        base.git(history, "config", "user.email", "f@example.com")
+        base.git(history, "config", "user.name", "Fixture")
+        for n in range(3):
+            base.git(history, "commit", "-q", "--allow-empty", "-m", f"main {n}")
+        start = base.git(history, "rev-parse", "HEAD").strip()
+        base.git(history, "checkout", "-q", "-b", "side")
+        base.git(history, "commit", "-q", "--allow-empty", "-m", "side")
+        side = base.git(history, "rev-parse", "HEAD").strip()
+        base.git(history, "checkout", "-q", "main")
+        base.git(history, "commit", "-q", "--allow-empty", "-m", "main 3")
+        base.git(history, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+        base.git(history, "commit", "-q", "--allow-empty", "-m", "main 4")
+        base.git(history, "update-ref", "refs/remotes/origin/main", "refs/heads/main")
+        assert base.git(history, "merge-base", "--is-ancestor", side, "main") == ""
+        script = "set -euo pipefail\n" + block + "\n              echo forward\n            fi\n"
+        result = subprocess.run(
+            ["bash", "-c", script], cwd=root,
+            env={
+                **os.environ,
+                "ENCODER_FLOOR_ONLY": "true",
+                "ENCODER_FLOOR_CHANGED": "true",
+                "AXIOM_DEPENDENCY_ROOT": str(root / "deps"),
+                "BASE_ENCODER_REF": start,
+                "PRODUCER_FLOOR": side,
+            },
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode != 0, result.stdout
+        assert "forward" not in result.stdout
+
+
 def test_forward_floor_check_covers_full_bumps_and_mode_switches() -> None:
     # A floor move beside another pin, or a switch from pinned to main, is a
     # full dependency bump; it must still not lower the floor.
@@ -730,7 +811,10 @@ def run_restate_admission(
     """Run the dependency step on a change that also edits the waiver ledger."""
 
     def table(mode, pins):
-        return base.workflow_toolchain({**pins, **({"encoder_verifier": mode} if mode else {})})
+        extra = {"encoder_verifier": mode} if mode else {}
+        if mode == "main" and "encoder_verifier_hold" not in pins:
+            extra["encoder_verifier_hold"] = DEFAULT_HOLD
+        return base.workflow_toolchain({**pins, **extra})
 
     with base.WorkflowInputFixture(
         table=table(base_mode, base.WORKFLOW_INPUT_PINS),

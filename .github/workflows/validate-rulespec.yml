@@ -79,8 +79,9 @@ on:
         description: >-
           Which axiom-encode verifies a pull request (axiom-encode#2093).
           `pinned` (default) runs axiom_encode_ref, as before. `main` runs
-          official axiom-encode first-parent main, resolved once per run and
-          recorded in the check summary, and makes axiom_encode_ref the
+          the protected encoder_verifier_hold (required; an official
+          axiom-encode first-parent main commit) and records it in the check
+          summary, and makes axiom_encode_ref the
           producer floor (axiom-encode#2095). With `main`, an
           axiom_encode_ref-only change no longer forces full validation, and a
           waiver-ledger-only change validates only the files whose waiver
@@ -1013,6 +1014,11 @@ jobs:
           resolved["axiom_compose_ref"] = protected_pin("axiom_compose_ref") if compose else ""
           dependency_changes = dependency_ref_changes(protected_pin, pins, configuration)
           encoder_verifier = verifier_mode(pins)
+          if encoder_verifier == "main" and not verifier_hold(pins):
+              # The main tip would let every axiom-encode merge change the
+              # verifier of every file with no rules pull request. Verify
+              # with a reviewed hold; a hold move is a full dependency bump.
+              fail("[workflow_toolchain].encoder_verifier = \"main\" requires encoder_verifier_hold (a reviewed axiom-encode commit); the main tip is not accepted")
           requested_verifier = os.environ.get("ENCODER_VERIFIER") or "pinned"
           if requested_verifier not in ("pinned", "main"):
               fail("encoder-verifier must be pinned or main")
