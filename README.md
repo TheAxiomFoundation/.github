@@ -254,18 +254,19 @@ behavior: `axiom_encode_ref` verifies every pull request. With `main`
   floor-only and ledger scoping are off (full dependency bump and default
   selection).
 - `[workflow_toolchain] encoder_verifier_hold = "<40-hex commit>"`
-  (optional, `main` mode only) verifies with that axiom-encode commit
-  instead of the `main` tip: a cheap way back when an encoder merge breaks
-  validation. "Authenticate dependency commits" checks in workflow shell,
+  (**required** in `main` mode; refused in `pinned` mode) verifies with that
+  axiom-encode commit. The `main` tip is not accepted: it would let every
+  axiom-encode merge change the verifier of every file with no rules pull
+  request. "Authenticate dependency commits" checks in workflow shell,
   before any verifier code runs, that the verifier (tip or hold) is on
   first-parent `main` at or after the floor; "Record the encoder-main
-  verifier" records it. A change of only the hold (or of the hold and the
-  floor) is treated like a floor-only change: first shard, the ordinary
-  guard, and the guard ratchet with `--all`. It does not revalidate every
-  file under the new verifier, so dispatch a full drift run after a hold
-  change. With another pin it is a full dependency bump. A hold in `pinned`
-  mode, or a value that is not a full commit, fails. Remove the hold to
-  return to the `main` tip.
+  verifier" records it. A change of the hold (alone, with the floor or with
+  another pin) is a full dependency bump: every file and every waiver is
+  checked under the new verifier before the change can merge. Only a
+  floor-only change runs the first shard and the guard ratchet with `--all`,
+  because the floor changes no verifier. A hold in `pinned`
+  mode, a missing hold in `main` mode, or a value that is not a full
+  commit, fails.
 - With `import-aware-selection`, a ledger-only change still selects the full
   matrix: changed waiver records are global validation inputs there.
 - Every change that leaves `main` mode with another `axiom_encode_ref` (a
