@@ -4,8 +4,8 @@
 
 | Lane | Last main commit | Open PRs | Corpus release | Encoder ref | Repository Checks |
 | --- | --- | ---: | --- | --- | --- |
-| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-11-25 — Merge pull request #34 from TheAxiomFoundation/waivers/renew-pending-2026-11 | 9 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | failure |
-| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-25 — Relicense encodings under CC0 1.0 (#2405) | 105 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | queued |
+| [ca](https://github.com/TheAxiomFoundation/rulespec-ca) | 2026-11-25 — Merge pull request #33 from TheAxiomFoundation/relicense-cc0 | 7 | ca-rulespec-2026-07-21-oracle-complete-v2 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
+| [us](https://github.com/TheAxiomFoundation/rulespec-us) | 2026-11-25 — Relicense encodings under CC0 1.0 (#2405) | 188 | us-rulespec-2026-10-29-ecfr-section-text | ${{ | success |
 | [uk](https://github.com/TheAxiomFoundation/rulespec-uk) | 2026-11-25 — Relicense encodings under CC0 1.0 (#547) | 39 | uk-rulespec-2026-11-02-uc-retirement-pension-income | fa0da5e834214052cc8d9d381e25ff409dd1062f | failure |
 | [nz](https://github.com/TheAxiomFoundation/rulespec-nz) | 2026-11-25 — Relicense under CC0 1.0 (#147) | 1 | nz-rulespec-2026-10-23-amendment-markers | fa0da5e834214052cc8d9d381e25ff409dd1062f | success |
 | [be](https://github.com/TheAxiomFoundation/rulespec-be) | 2026-11-25 — Relicense encodings under CC0 1.0 (#148) | 3 | be-rulespec-2026-07-10 | b9d376684cfb5e86202daa3451b8fc716703ed19 | success |
